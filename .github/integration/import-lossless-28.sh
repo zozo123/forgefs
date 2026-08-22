@@ -182,7 +182,9 @@ fn read_import_file(path: &Path) -> Result<(Vec<u8>, bool)> {
     #[cfg(not(unix))]
     let exec = false;
 
-    let reserve = usize::try_from(before.len()).unwrap_or(usize::MAX).min(16 * 1024 * 1024);
+    let reserve = usize::try_from(before.len())
+        .unwrap_or(usize::MAX)
+        .min(16 * 1024 * 1024);
     let mut data = Vec::with_capacity(reserve);
     file.read_to_end(&mut data)?;
 
@@ -268,14 +270,29 @@ fn import_file_metadata_stable(before: &fs::Metadata, after: &fs::Metadata) -> b
 }
 '''
 s = replace_once(s, old_walk, new_walk, "import walk")
+old_is_exec = '''fn is_exec(p: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::metadata(p)?.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        Ok(false)
+    }
+}
+
+'''
+s = replace_once(s, old_is_exec, "", "obsolete is_exec helper")
 p.write_text(s)
 
 # Add a process-independent matrix of source representations the v1 model
 # cannot faithfully encode. Success must never mean silent loss.
 t = Path("crates/forge-api/tests/import_lossless.rs")
 t.write_text(r'''use forge_api::Forge;
-use tempfile::tempdir;
 use std::fs;
+use tempfile::tempdir;
 
 fn import_fails(source: &std::path::Path) {
     let dst = tempdir().unwrap();
@@ -342,7 +359,10 @@ fn import_rejects_a_regular_file_mutating_during_snapshot() {
     let writer_stop = Arc::clone(&stop);
     let writer_barrier = Arc::clone(&barrier);
     let writer = thread::spawn(move || {
-        let mut file = fs::OpenOptions::new().write(true).open(writer_path).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .unwrap();
         let mut byte = 1u8;
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&[byte]).unwrap();
@@ -363,7 +383,10 @@ fn import_rejects_a_regular_file_mutating_during_snapshot() {
     let result = forge.import_dir(&cap, source.path(), "heads/import");
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
-    assert!(result.is_err(), "a changing source file must never import successfully");
+    assert!(
+        result.is_err(),
+        "a changing source file must never import successfully"
+    );
 }
 ''')
 PY
