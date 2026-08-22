@@ -11,8 +11,11 @@ pub struct LocalBlobStore {
 
 impl LocalBlobStore {
     pub fn new(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(root.join("objects"))?;
-        fs::create_dir_all(root.join("tmp"))?;
+        let objects = root.join("objects");
+        let tmp = root.join("tmp");
+        ensure_dir_durable(&root, &objects)?;
+        ensure_dir_durable(&root, &tmp)?;
+        cleanup_tmp(&tmp)?;
         Ok(Self { root })
     }
 
@@ -33,12 +36,19 @@ impl LocalBlobStore {
             return Ok(id);
         }
 
-        let parent = dest
-            .parent()
-            .ok_or_else(|| Error::Internal("object path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
-        fs::create_dir_all(self.root.join("tmp"))?;
-        let tmp = self.root.join("tmp").join(ulid::Ulid::new().to_string());
+        // Create each shard one level at a time and fsync the parent that owns
+        // its new directory entry. Otherwise a power loss can retain the file
+        // fsync while losing a newly created shard path.
+        let (a, b) = id.shard_dirs();
+        let objects = self.root.join("objects");
+        let shard_a = objects.join(a);
+        let shard_b = shard_a.join(b);
+        ensure_dir_durable(&objects, &shard_a)?;
+        ensure_dir_durable(&shard_a, &shard_b)?;
+
+        let tmp_dir = self.root.join("tmp");
+        ensure_dir_durable(&self.root, &tmp_dir)?;
+        let tmp = tmp_dir.join(ulid::Ulid::new().to_string());
 
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -49,10 +59,9 @@ impl LocalBlobStore {
 
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
-                // Persist the new directory entry before we allow metadata to
-                // publish this OID. A file fsync alone is not sufficient for
-                // crash durability of the name.
-                sync_dir(parent)?;
+                // Persist the final directory entry before metadata can publish
+                // the OID. At this point every shard directory is durable too.
+                sync_dir(&shard_b)?;
                 let _ = fs::remove_file(&tmp);
                 Ok(id)
             }
@@ -95,6 +104,30 @@ impl LocalBlobStore {
     }
 }
 
+fn ensure_dir_durable(parent: &Path, child: &Path) -> Result<()> {
+    match fs::create_dir(child) {
+        Ok(()) => sync_dir(parent),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(Error::Io(e.to_string())),
+    }
+}
+
+fn cleanup_tmp(tmp: &Path) -> Result<()> {
+    let mut removed = false;
+    for entry in fs::read_dir(tmp)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_file() || ty.is_symlink() {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_dir(tmp)?;
+    }
+    Ok(())
+}
+
 fn sync_dir(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -103,6 +136,8 @@ fn sync_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -120,12 +155,38 @@ mod tests {
     }
 
     #[test]
-    fn leftover_tmp_ignored() {
+    fn stale_tmp_is_cleaned_on_open() {
         let d = tempdir().unwrap();
-        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
-        fs::write(d.path().join("tmp").join("junk"), b"nope").unwrap();
-        let id = s.put(b"ok").unwrap();
-        assert_eq!(s.get(id).unwrap(), b"ok");
+        fs::create_dir(d.path().join("tmp")).unwrap();
+        let junk = d.path().join("tmp/junk");
+        fs::write(&junk, b"partial").unwrap();
+        let _s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        assert!(!junk.exists());
+    }
+
+    #[test]
+    fn concurrent_same_object_writers_converge() {
+        let d = tempdir().unwrap();
+        let s = Arc::new(LocalBlobStore::new(d.path().to_path_buf()).unwrap());
+        let mut joins = Vec::new();
+        for _ in 0..32 {
+            let s = s.clone();
+            joins.push(thread::spawn(move || s.put(b"same durable object").unwrap()));
+        }
+        let ids: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(s.get(ids[0]).unwrap(), b"same durable object");
+    }
+
+    #[test]
+    fn published_object_survives_store_reopen() {
+        let d = tempdir().unwrap();
+        let id = {
+            let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+            s.put(b"durable").unwrap()
+        };
+        let reopened = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.get(id).unwrap(), b"durable");
     }
 
     #[test]
