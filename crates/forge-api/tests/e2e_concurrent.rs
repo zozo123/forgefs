@@ -118,6 +118,8 @@ fn e2e_stale_read_is_not_a_silent_success() {
     };
     f.merge(&integ, "main", &n2, None).unwrap();
     f.write(&bob, &b, "/notes.txt", b"hi", false).unwrap();
+
+    // The error is a visible correctness outcome and must increment exactly once.
     let before = f.api_stats();
     let err = f.checkin(&bob, &b, "/", "notes").unwrap_err();
     assert!(matches!(err, Error::StaleObservation { .. }), "{err:?}");
