@@ -28,44 +28,45 @@ jobs:
 
           p = Path('crates/forge-store/src/meta.rs')
           s = p.read_text()
-          old = '''    let expected = if name == "main" || name.starts_with("heads/") || name.starts_with("forks/") {
-              Some("commit")
-          } else if name.starts_with("conflicts/") {
-              Some("conflict")
-          } else if name.starts_with("tags/") {
-              Some("snapshot")
-          } else {
-              None
-          };'''
-          new = '''    if let Some(rest) = name.strip_prefix("inbox/") {
-              let mut parts = rest.split('/');
-              let agent = parts.next().unwrap_or_default();
-              let id = parts.next().unwrap_or_default();
-              if parts.next().is_some()
-                  || agent.is_empty()
-                  || sanitize_agent(agent) != agent
-                  || ulid::Ulid::from_string(id).is_err()
-              {
-                  return Err(Error::Invalid(format!("invalid inbox ref {name:?}")));
+          start = s.index('fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {')
+          end = s.index('\n}\n\nimpl Meta {', start) + 2
+          new_fn = '''fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
+              validate_ref_name(name)?;
+              if let Some(rest) = name.strip_prefix("inbox/") {
+                  let mut parts = rest.split('/');
+                  let agent = parts.next().unwrap_or_default();
+                  let id = parts.next().unwrap_or_default();
+                  if parts.next().is_some()
+                      || agent.is_empty()
+                      || sanitize_agent(agent) != agent
+                      || ulid::Ulid::from_string(id).is_err()
+                  {
+                      return Err(Error::Invalid(format!("invalid inbox ref {name:?}")));
+                  }
               }
-          }
-
-          let expected = if name == "main" || name.starts_with("heads/") {
-              Some("commit")
-          } else if name.starts_with("forks/inbox/") {
-              Some("snapshot")
-          } else if name.starts_with("forks/") {
-              Some("commit")
-          } else if name.starts_with("conflicts/") {
-              Some("conflict")
-          } else if name.starts_with("tags/") || name.starts_with("inbox/") {
-              Some("snapshot")
-          } else {
-              None
-          };'''
-          if old not in s:
-              raise SystemExit('validate_ref_kind marker drifted')
-          p.write_text(s.replace(old, new, 1))
+              let expected = if name == "main" || name.starts_with("heads/") {
+                  Some("commit")
+              } else if name.starts_with("forks/inbox/") {
+                  Some("snapshot")
+              } else if name.starts_with("forks/") {
+                  Some("commit")
+              } else if name.starts_with("conflicts/") {
+                  Some("conflict")
+              } else if name.starts_with("tags/") || name.starts_with("inbox/") {
+                  Some("snapshot")
+              } else {
+                  None
+              };
+              if let Some(expected) = expected {
+                  if kind != expected {
+                      return Err(Error::Invalid(format!(
+                          "ref {name} requires kind {expected}, got {kind}"
+                      )));
+                  }
+              }
+              Ok(())
+          }'''
+          p.write_text(s[:start] + new_fn + s[end:])
 
           p = Path('crates/forge-api/src/lib.rs')
           s = p.read_text()
@@ -81,8 +82,8 @@ jobs:
           }'''
           addition = marker + '''
 
-          /// Publish an immutable sealed snapshot to a recipient-owned inbox ref.
-          /// ForgeFS stores only the durable pointer; scheduling and messaging stay above the core.
+          /// Publish a sealed snapshot to a recipient-owned inbox ref.
+          /// ForgeFS stores only the durable pointer; scheduling stays above the core.
           pub fn inbox_push(&self, cap: &Cap, to: &str, snapshot: &str) -> Result<CasResult> {
               let recipient = sanitize_agent(to);
               if recipient != to || recipient == "anon" {
@@ -97,7 +98,7 @@ jobs:
               self.check(cap, Op::Write, Some(&name))?;
               self.store.meta.cas_ref(
                   &name,
-                  ObjectId([0; 32]),
+                  ObjectId::ZERO,
                   oid,
                   "snapshot",
                   cap.agent_id(),
@@ -106,7 +107,7 @@ jobs:
               )
           }
 
-          /// List only the calling agent's concrete inbox refs that its capability can read.
+          /// List only the calling agent's concrete inbox refs that its cap can read.
           pub fn inbox_list(&self, cap: &Cap) -> Result<Vec<RefRow>> {
               verify(&self.hmac_key, cap)?;
               let agent = sanitize_agent(cap.agent_id());
