@@ -1,0 +1,104 @@
+name: autopatch-api-metrics-101
+
+on:
+  push:
+    branches: [metrics/api-errors-101-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: metrics/api-errors-101-v2
+          persist-credentials: true
+      - name: Instrument stale/conflict outcomes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-api/src/lib.rs')
+          s = p.read_text()
+          s = s.replace(
+              'use std::path::{Path, PathBuf};\n',
+              'use std::path::{Path, PathBuf};\nuse std::sync::atomic::{AtomicU64, Ordering};\n'
+          )
+          marker = '''pub struct Forge {\n    store: Store,'''
+          replacement = '''#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]\npub struct ApiStats {\n    pub stale_observation: u64,\n    pub merge_conflict: u64,\n}\n\n#[derive(Debug, Default)]\nstruct ApiCounters {\n    stale_observation: AtomicU64,\n    merge_conflict: AtomicU64,\n}\n\npub struct Forge {\n    store: Store,'''
+          assert s.count(marker) == 1
+          s = s.replace(marker, replacement)
+          s = s.replace('    root: PathBuf,\n}', '    root: PathBuf,\n    stats: ApiCounters,\n}', 1)
+
+          # Both init/open constructors end with the same root field.
+          needle = '''            seal_pk: pk,\n            root,\n        })'''
+          repl = '''            seal_pk: pk,\n            root,\n            stats: ApiCounters::default(),\n        })'''
+          assert s.count(needle) == 1
+          s = s.replace(needle, repl)
+          needle = '''            seal_pk,\n            root,\n        })'''
+          repl = '''            seal_pk,\n            root,\n            stats: ApiCounters::default(),\n        })'''
+          assert s.count(needle) == 1
+          s = s.replace(needle, repl)
+
+          root_marker = '''    pub fn root(&self) -> &Path {\n        &self.root\n    }'''
+          root_repl = '''    pub fn root(&self) -> &Path {\n        &self.root\n    }\n\n    pub fn api_stats(&self) -> ApiStats {\n        ApiStats {\n            stale_observation: self.stats.stale_observation.load(Ordering::Relaxed),\n            merge_conflict: self.stats.merge_conflict.load(Ordering::Relaxed),\n        }\n    }'''
+          assert s.count(root_marker) == 1
+          s = s.replace(root_marker, root_repl)
+
+          stale = '''            if now != Some(obs.oid) {\n                return Err(Error::StaleObservation {'''
+          stale_repl = '''            if now != Some(obs.oid) {\n                self.stats.stale_observation.fetch_add(1, Ordering::Relaxed);\n                return Err(Error::StaleObservation {'''
+          assert s.count(stale) == 1
+          s = s.replace(stale, stale_repl)
+
+          # There are exactly two explicit merge-conflict exits: multiple bases and three-way conflict.
+          conflict = '                return Err(Error::MergeConflict(oid));'
+          assert s.count(conflict) == 2
+          s = s.replace(
+              conflict,
+              '                self.stats.merge_conflict.fetch_add(1, Ordering::Relaxed);\n' + conflict,
+          )
+          p.write_text(s)
+
+          p = Path('crates/forge-api/src/bench.rs')
+          s = p.read_text()
+          s = s.replace('use crate::Forge;', 'use crate::{ApiStats, Forge};')
+          s = s.replace(
+              '    pub store: Option<BlobStoreStats>,\n}',
+              '    pub store: Option<BlobStoreStats>,\n    pub api: Option<ApiStats>,\n}'
+          )
+          render_marker = '''        if let Some(stats) = self.store {\n            s.push_str(&format!(\n                "storage          puts={} fsync_file={} fsync_dir={}\\n",\n                stats.puts, stats.fsync_file, stats.fsync_dir\n            ));\n        }'''
+          render_repl = render_marker + '''\n        if let Some(stats) = self.api {\n            let wall_s = self\n                .private\n                .as_ref()\n                .map(|(_, d, _)| d.as_secs_f64())\n                .unwrap_or(0.0)\n                + self\n                    .shared\n                    .as_ref()\n                    .map(|(_, d, _, _)| d.as_secs_f64())\n                    .unwrap_or(0.0);\n            let rate = |n: u64| if wall_s > 0.0 { n as f64 / wall_s } else { 0.0 };\n            s.push_str(&format!(\n                "api outcomes     stale={} ({:.2}/s) conflict={} ({:.2}/s)\\n",\n                stats.stale_observation,\n                rate(stats.stale_observation),\n                stats.merge_conflict,\n                rate(stats.merge_conflict),\n            ));\n        }'''
+          assert s.count(render_marker) == 1
+          s = s.replace(render_marker, render_repl)
+          # Product run constructor already captures store immediately before return.
+          needle = '''        store: Some(store),\n    })'''
+          assert s.count(needle) == 1
+          s = s.replace(needle, '''        store: Some(store),\n        api: Some(forge.api_stats()),\n    })''')
+          p.write_text(s)
+
+          p = Path('crates/forge-api/src/soak.rs')
+          s = p.read_text()
+          needle = '''        store: Some(store),\n    })'''
+          assert s.count(needle) == 1
+          s = s.replace(needle, '''        store: Some(store),\n        api: Some(forge.api_stats()),\n    })''')
+          p.write_text(s)
+
+          p = Path('crates/forge-api/tests/e2e_concurrent.rs')
+          s = p.read_text()
+          needle = '''    let err = f.checkin(&bob, &b, "/", "notes").unwrap_err();\n    assert!(matches!(err, Error::StaleObservation { .. }), "{err:?}");\n}'''
+          repl = '''    let before = f.api_stats();\n    let err = f.checkin(&bob, &b, "/", "notes").unwrap_err();\n    assert!(matches!(err, Error::StaleObservation { .. }), "{err:?}");\n    let after = f.api_stats();\n    assert_eq!(after.stale_observation, before.stale_observation + 1);\n}'''
+          assert s.count(needle) == 1
+          p.write_text(s.replace(needle, repl))
+          PY
+
+          cargo fmt --all
+          git rm .github/workflows/autopatch-api-metrics-101.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-api/src/lib.rs crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs crates/forge-api/tests/e2e_concurrent.rs
+          git commit -m 'metrics: count stale observations and merge conflicts (#101)'
+          git push origin HEAD:metrics/api-errors-101-v2
