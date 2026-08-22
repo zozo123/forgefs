@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+git config user.name github-actions[bot]
+git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+git fetch origin main
+git merge --no-edit origin/main
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path('crates/forge-store/src/blob.rs')
+s = p.read_text()
+assert 'use std::fs::{self, OpenOptions};\n' in s
+s = s.replace('use std::fs::{self, OpenOptions};\n', 'use std::collections::BTreeSet;\nuse std::fs::{self, OpenOptions};\n')
+marker = '''#[derive(Clone, Debug)]\npub struct LocalBlobStore {\n    root: PathBuf,\n    stats: Arc<BlobStoreCounters>,\n}\n'''
+addition = marker + '''\n/// Checkin-scoped durable publication. Every object is file-fsynced before its\n/// immutable final name is linked. Final shard-directory barriers are deferred\n/// until `finish`; metadata CAS is allowed only after `finish` succeeds. A crash\n/// before CAS may leave durable orphan objects, which is safe.\npub struct PublishBatch<'a> {\n    store: &'a LocalBlobStore,\n    dirs: BTreeSet<PathBuf>,\n    new_puts: u64,\n}\n'''
+assert s.count(marker) == 1
+s = s.replace(marker, addition)
+
+start = s.index('    pub fn put(&self, bytes: &[u8]) -> Result<ObjectId> {')
+end = s.index('\n    fn verify_existing', start)
+s = s[:start] + '''    pub fn begin_batch(&self) -> PublishBatch<'_> {\n        PublishBatch {\n            store: self,\n            dirs: BTreeSet::new(),\n            new_puts: 0,\n        }\n    }\n\n    pub fn put(&self, bytes: &[u8]) -> Result<ObjectId> {\n        let mut batch = self.begin_batch();\n        let id = batch.put(bytes)?;\n        batch.finish()?;\n        Ok(id)\n    }\n''' + s[end:]
+
+impl_marker = '''impl crate::Store {\n    pub fn stats(&self) -> BlobStoreStats {'''
+batch_impl = '''impl PublishBatch<'_> {\n    pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {\n        let id = hash_bytes(bytes);\n        let dest = self.store.object_path(id);\n        if dest.exists() {\n            self.store.verify_existing(id, &dest)?;\n            return Ok(id);\n        }\n\n        let (a, b) = id.shard_dirs();\n        let objects = self.store.root.join("objects");\n        let shard_a = objects.join(a);\n        let shard_b = shard_a.join(b);\n        ensure_dir_durable(&objects, &shard_a, &self.store.stats)?;\n        ensure_dir_durable(&shard_a, &shard_b, &self.store.stats)?;\n\n        let tmp_dir = self.store.root.join("tmp");\n        ensure_dir_durable(&self.store.root, &tmp_dir, &self.store.stats)?;\n        let tmp = tmp_dir.join(ulid::Ulid::new().to_string());\n        {\n            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;\n            f.write_all(bytes)?;\n            f.sync_all()?;\n            self.store.stats.fsync_file.fetch_add(1, Ordering::Relaxed);\n        }\n\n        match fs::hard_link(&tmp, &dest) {\n            Ok(()) => {\n                self.dirs.insert(shard_b);\n                self.new_puts += 1;\n                let _ = fs::remove_file(&tmp);\n                Ok(id)\n            }\n            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() => {\n                let _ = fs::remove_file(&tmp);\n                self.store.verify_existing(id, &dest)?;\n                Ok(id)\n            }\n            Err(e) => {\n                let _ = fs::remove_file(&tmp);\n                Err(Error::Io(e.to_string()))\n            }\n        }\n    }\n\n    pub fn finish(self) -> Result<()> {\n        for dir in &self.dirs {\n            sync_dir_counted(dir, &self.store.stats)?;\n        }\n        self.store\n            .stats\n            .puts\n            .fetch_add(self.new_puts, Ordering::Relaxed);\n        Ok(())\n    }\n}\n\n'''
+assert s.count(impl_marker) == 1
+s = s.replace(impl_marker, batch_impl + impl_marker)
+
+test_marker = '''    #[test]\n    fn corrupt_existing_object_is_rejected() {'''
+test = '''    fn same_shard_pair() -> (Vec<u8>, Vec<u8>) {\n        let mut seen = std::collections::BTreeMap::new();\n        for i in 0..200_000u64 {\n            let bytes = format!("same-shard-{i}").into_bytes();\n            let id = hash_bytes(&bytes);\n            let shard = id.shard_dirs();\n            if let Some(first) = seen.insert(shard, bytes.clone()) {\n                if first != bytes {\n                    return (first, bytes);\n                }\n            }\n        }\n        panic!("failed to find deterministic shard collision");\n    }\n\n    #[test]\n    fn batch_coalesces_same_shard_directory_barrier() {\n        let d = tempdir().unwrap();\n        let (a, b) = same_shard_pair();\n\n        let serial = LocalBlobStore::new(d.path().join("serial")).unwrap();\n        let serial_before = serial.stats();\n        serial.put(&a).unwrap();\n        serial.put(&b).unwrap();\n        let serial_after = serial.stats();\n        let serial_dirs = serial_after.fsync_dir - serial_before.fsync_dir;\n\n        let batched = LocalBlobStore::new(d.path().join("batched")).unwrap();\n        let batch_before = batched.stats();\n        let mut batch = batched.begin_batch();\n        batch.put(&a).unwrap();\n        batch.put(&b).unwrap();\n        let mid = batched.stats();\n        assert_eq!(mid.puts, batch_before.puts);\n        batch.finish().unwrap();\n        let batch_after = batched.stats();\n        let batch_dirs = batch_after.fsync_dir - batch_before.fsync_dir;\n\n        assert_eq!(batch_after.puts - batch_before.puts, 2);\n        assert_eq!(batch_after.fsync_file - batch_before.fsync_file, 2);\n        assert_eq!(serial_dirs, batch_dirs + 1);\n    }\n\n'''
+assert s.count(test_marker) == 1
+s = s.replace(test_marker, test + test_marker)
+p.write_text(s)
+
+p = Path('crates/forge-store/src/lib.rs')
+s = p.read_text()
+assert 'pub use blob::LocalBlobStore;' in s
+s = s.replace('pub use blob::LocalBlobStore;', 'pub use blob::{LocalBlobStore, PublishBatch};')
+marker = '''pub struct Store {\n    pub blobs: LocalBlobStore,\n    pub meta: Meta,\n    trees: Mutex<LruCache<ObjectId, Arc<Tree>>>,\n    blob_cache: Mutex<LruCache<ObjectId, Arc<[u8]>>>,\n}\n'''
+addition = marker + '''\npub struct StorePublishBatch<'a> {\n    store: &'a Store,\n    objects: Mutex<PublishBatch<'a>>,\n}\n\nimpl StorePublishBatch<'_> {\n    pub fn put_commit(&self, commit: &Commit) -> Result<ObjectId> {\n        self.objects.lock().put(&commit.encode())\n    }\n\n    pub fn finish(self) -> Result<()> {\n        self.objects.into_inner().finish()\n    }\n}\n\nimpl TreeStore for StorePublishBatch<'_> {\n    fn get_tree(&self, id: ObjectId) -> Result<Tree> {\n        self.store.get_tree(id)\n    }\n\n    fn put_tree(&self, tree: &Tree) -> Result<ObjectId> {\n        let bytes = tree.encode()?;\n        let id = self.objects.lock().put(&bytes)?;\n        self.store.trees.lock().put(id, Arc::new(tree.clone()));\n        Ok(id)\n    }\n}\n'''
+assert s.count(marker) == 1
+s = s.replace(marker, addition)
+open_marker = '''impl Store {\n    pub fn open(root: &Path) -> Result<Self> {'''
+assert s.count(open_marker) == 1
+s = s.replace(open_marker, '''impl Store {\n    pub fn begin_publish_batch(&self) -> StorePublishBatch<'_> {\n        StorePublishBatch {\n            store: self,\n            objects: Mutex::new(self.blobs.begin_batch()),\n        }\n    }\n\n    pub fn open(root: &Path) -> Result<Self> {''')
+p.write_text(s)
+
+p = Path('crates/forge-api/src/lib.rs')
+s = p.read_text()
+old = '''        let new_tree = apply_overlay(Some(base_commit.tree), &ov, &self.store)?;\n        if new_tree == base_commit.tree && pin == row.oid {\n            self.store.meta.complete_noop_session(ns, &m.path, pin)?;\n            return Ok(CasResult::Noop {\n                name: ref_name,\n                oid: row.oid,\n            });\n        }\n        let commit = Commit {\n            tree: new_tree,\n            parents: vec![pin],\n            agent: cap.agent_id().into(),\n            msg: msg.into(),\n            ts: now_ms(),\n            landmark: false,\n        };\n        let cid = self.store.put_commit(&commit)?;'''
+new = '''        let batch = self.store.begin_publish_batch();\n        let new_tree = apply_overlay(Some(base_commit.tree), &ov, &batch)?;\n        if new_tree == base_commit.tree && pin == row.oid {\n            batch.finish()?;\n            self.store.meta.complete_noop_session(ns, &m.path, pin)?;\n            return Ok(CasResult::Noop {\n                name: ref_name,\n                oid: row.oid,\n            });\n        }\n        let commit = Commit {\n            tree: new_tree,\n            parents: vec![pin],\n            agent: cap.agent_id().into(),\n            msg: msg.into(),\n            ts: now_ms(),\n            landmark: false,\n        };\n        let cid = batch.put_commit(&commit)?;\n        // I4: metadata CAS is strictly after every referenced object's file and\n        // containing directory entry is durable. Orphans before CAS are safe.\n        batch.finish()?;'''
+assert s.count(old) == 1
+p.write_text(s.replace(old, new))
+PY
+
+cargo fmt --all
+cargo test --locked -p forge-store --all-targets
+cargo test --locked -p forge-api --all-targets
+cargo check --locked --workspace --all-targets
+rm -f .github/workflows/autopatch-batch-102.yml .github/worker-trigger-102
+git rm -f .github/swarm-worker.sh || true
+git add -A
+git commit -m 'perf: batch checkin directory durability barriers (#102)'
+git push origin HEAD:perf/durability-batch-102
