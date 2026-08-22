@@ -1,0 +1,107 @@
+name: autopatch-schema-105
+
+on:
+  push:
+    branches: [storage/schema-versioning]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: storage/schema-versioning
+          persist-credentials: true
+      - name: Patch schema migration gate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+
+          old_schema_end = '''CREATE TABLE IF NOT EXISTS cap_root (\n  id INTEGER PRIMARY KEY CHECK(id=1),\n  hmac_key BLOB NOT NULL DEFAULT X'',\n  seal_pub BLOB NOT NULL\n);\n"#;'''
+          new_schema_end = '''CREATE TABLE IF NOT EXISTS cap_root (\n  id INTEGER PRIMARY KEY CHECK(id=1),\n  hmac_key BLOB NOT NULL DEFAULT X'',\n  seal_pub BLOB NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS schema_migrations (\n  version INTEGER PRIMARY KEY,\n  applied_ms INTEGER NOT NULL\n);\n"#;\n\nconst CURRENT_SCHEMA_VERSION: i64 = 1;'''
+          assert s.count(old_schema_end) == 1
+          s = s.replace(old_schema_end, new_schema_end)
+
+          marker = '''fn validate_ref_name(name: &str) -> Result<()> {'''
+          helpers = '''fn schema_version(conn: &Connection) -> Result<i64> {\n    let exists: i64 = conn\n        .query_row(\n            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",\n            [],\n            |r| r.get(0),\n        )\n        .map_err(map_sql)?;\n    if exists == 0 {\n        return Ok(0);\n    }\n    conn.query_row(\n        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",\n        [],\n        |r| r.get(0),\n    )\n    .map_err(map_sql)\n}\n\nfn migrate(conn: &mut Connection, from: i64) -> Result<()> {\n    if from > CURRENT_SCHEMA_VERSION {\n        return Err(Error::Invalid(format!(\n            "metadata schema version {from} is newer than supported {CURRENT_SCHEMA_VERSION}"\n        )));\n    }\n    if from == CURRENT_SCHEMA_VERSION {\n        return Ok(());\n    }\n    if from != 0 {\n        return Err(Error::Invalid(format!(\n            "unsupported metadata schema migration {from} -> {CURRENT_SCHEMA_VERSION}"\n        )));\n    }\n\n    let tx = conn\n        .transaction_with_behavior(TransactionBehavior::Immediate)\n        .map_err(map_sql)?;\n    tx.execute(\n        "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, ?2)",\n        params![CURRENT_SCHEMA_VERSION, now_ms() as i64],\n    )\n    .map_err(map_sql)?;\n    tx.commit().map_err(map_sql)\n}\n\n'''
+          assert s.count(marker) == 1
+          s = s.replace(marker, helpers + marker)
+
+          old_open = '''    pub fn open(path: &Path) -> Result<Self> {\n        let conn = Connection::open(path).map_err(map_sql)?;\n        conn.execute_batch(SCHEMA).map_err(map_sql)?;'''
+          new_open = '''    pub fn open(path: &Path) -> Result<Self> {\n        let mut conn = Connection::open(path).map_err(map_sql)?;\n        let version = schema_version(&conn)?;\n        if version > CURRENT_SCHEMA_VERSION {\n            return Err(Error::Invalid(format!(\n                "metadata schema version {version} is newer than supported {CURRENT_SCHEMA_VERSION}"\n            )));\n        }\n        conn.execute_batch(SCHEMA).map_err(map_sql)?;\n        migrate(&mut conn, version)?;'''
+          assert s.count(old_open) == 1
+          s = s.replace(old_open, new_open)
+          p.write_text(s)
+          PY
+
+          cat > crates/forge-store/tests/schema_migrations.rs <<'RS'
+          use forge_store::Meta;
+          use forge_types::Error;
+          use rusqlite::Connection;
+          use tempfile::tempdir;
+
+          #[test]
+          fn fresh_metadata_records_schema_v1() {
+              let d = tempdir().unwrap();
+              let path = d.path().join("meta.sqlite");
+              let meta = Meta::open(&path).unwrap();
+              drop(meta);
+
+              let conn = Connection::open(&path).unwrap();
+              let versions: Vec<i64> = conn
+                  .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                  .unwrap()
+                  .query_map([], |r| r.get(0))
+                  .unwrap()
+                  .collect::<Result<_, _>>()
+                  .unwrap();
+              assert_eq!(versions, vec![1]);
+          }
+
+          #[test]
+          fn newer_metadata_schema_fails_closed() {
+              let d = tempdir().unwrap();
+              let path = d.path().join("meta.sqlite");
+              let meta = Meta::open(&path).unwrap();
+              drop(meta);
+
+              let conn = Connection::open(&path).unwrap();
+              conn.execute(
+                  "INSERT INTO schema_migrations (version, applied_ms) VALUES (2, 0)",
+                  [],
+              )
+              .unwrap();
+              drop(conn);
+
+              let err = Meta::open(&path).err().expect("v1 code must reject v2 metadata");
+              assert!(matches!(err, Error::Invalid(_)), "unexpected error: {err}");
+          }
+
+          #[test]
+          fn reopening_current_schema_is_idempotent() {
+              let d = tempdir().unwrap();
+              let path = d.path().join("meta.sqlite");
+              drop(Meta::open(&path).unwrap());
+              drop(Meta::open(&path).unwrap());
+
+              let conn = Connection::open(&path).unwrap();
+              let n: i64 = conn
+                  .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+                  .unwrap();
+              assert_eq!(n, 1);
+          }
+          RS
+
+          git rm .github/workflows/autopatch-schema-105.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-store/src/meta.rs crates/forge-store/tests/schema_migrations.rs
+          git commit -m 'storage: add linear metadata schema migration gate (#105)'
+          git push origin HEAD:storage/schema-versioning
