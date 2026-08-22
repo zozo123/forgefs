@@ -13,8 +13,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use forge_cap::{attenuate, mint_integrator, mint_root, verify, Cap, Op};
 use forge_core::cbor::{encode_map_sorted, encode_text};
 use forge_core::tree::{apply_overlay, split_path};
-use forge_core::{hash_bytes, now_ms, Commit, Snapshot, Tree};
-use forge_merge::{lca, three_way, MergeOutcome};
+use forge_core::{hash_bytes, now_ms, Blob, Commit, Conflict, Snapshot, Tree};
+use forge_merge::{merge_bases, three_way, MergeOutcome};
 use forge_ns::{
     longest_mount, ls as ns_ls, normalize_abs, overlay_map, parse_spec, rel_of, resolve, Mode,
     Mount, Resolved, Spec,
@@ -26,7 +26,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct Forge {
-    pub store: Store,
+    store: Store,
     hmac_key: [u8; 32],
     seal_seed: [u8; 32],
     seal_pk: [u8; 32],
@@ -42,7 +42,7 @@ impl Forge {
                 root.display()
             )));
         }
-        fs::create_dir_all(root.join("keys"))?;
+        secure_key_dir(&root.join("keys"))?;
         fs::create_dir_all(root.join("objects"))?;
         fs::create_dir_all(root.join("tmp"))?;
         fs::write(root.join("VERSION"), b"1\n")?;
@@ -72,6 +72,7 @@ impl Forge {
             root.join("keys/integrator.cap"),
             integ.to_token().as_bytes(),
         )?;
+        sync_dir(&root.join("keys"))?;
 
         let empty = store.empty_tree_id()?;
         let commit = Commit {
@@ -113,6 +114,7 @@ impl Forge {
                 }
             }
         }
+        validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
         let store = Store::open(&root)?;
@@ -538,10 +540,36 @@ impl Forge {
             }
             t
         } else {
-            let base = lca(&self.store, into_row.oid, theirs_oid)?;
-            let base_tree = match base {
-                Some(id) => self.store.get_commit(id).ok().map(|c| c.tree),
-                None => None,
+            let bases = merge_bases(&self.store, into_row.oid, theirs_oid)?;
+            if bases.len() > 1 {
+                let base_trees = bases
+                    .iter()
+                    .map(|id| self.store.get_commit(*id).map(|c| c.tree))
+                    .collect::<Result<Vec<_>>>()?;
+                let conflict = Conflict {
+                    bases: base_trees,
+                    ours: ours_c.tree,
+                    theirs: theirs_c.tree,
+                    paths: vec![],
+                    causal: vec![into_row.oid, theirs_oid],
+                };
+                let oid = self.store.put_conflict(&conflict)?;
+                let name = format!("conflicts/{into}/{}", ulid::Ulid::new());
+                self.store.meta.insert_ref(
+                    &name,
+                    oid,
+                    "conflict",
+                    false,
+                    false,
+                    cap.agent_id(),
+                    "multiple-merge-bases",
+                )?;
+                return Err(Error::MergeConflict(oid));
+            }
+            let base_tree = match bases.as_slice() {
+                [id] => Some(self.store.get_commit(*id)?.tree),
+                [] => None,
+                _ => unreachable!("multiple bases handled above"),
             };
             match three_way(&self.store, base_tree, ours_c.tree, theirs_c.tree)? {
                 MergeOutcome::Tree(t) => t,
@@ -640,29 +668,51 @@ impl Forge {
     }
 
     pub fn verify_tag(&self, cap: &Cap, tag: &str) -> Result<ObjectId> {
-        self.check(cap, Op::Read, Some(&format!("tags/{tag}")))?;
-        let (snap_oid, _c, tree) = self
+        let tag_ref_name = format!("tags/{tag}");
+        self.check(cap, Op::Read, Some(&tag_ref_name))?;
+        let tag_ref = self
+            .store
+            .meta
+            .get_ref(&tag_ref_name)?
+            .ok_or_else(|| Error::NotFound(format!("ref {tag_ref_name}")))?;
+        let (snap_oid, commit_oid, tree_oid) = self
             .store
             .meta
             .get_seal(tag)?
             .ok_or_else(|| Error::NotFound(format!("tag {tag}")))?;
-        let snap = self.store.get_snapshot(snap_oid)?;
+        if tag_ref.oid != snap_oid
+            || tag_ref.kind != "snapshot"
+            || !tag_ref.protected
+            || !tag_ref.sealed
+        {
+            return Err(Error::Corrupt("sealed tag ref metadata mismatch".into()));
+        }
+
+        let snap = Snapshot::decode(&self.store.get_raw_verified(snap_oid)?)?;
         if snap.pk != self.seal_pk {
             return Err(Error::Corrupt(
-                "snapshot key is not this forge's seal key".into(),
+                "snapshot key is not this forge's trusted seal key".into(),
             ));
         }
-        if snap.tree != tree {
-            return Err(Error::Corrupt("seal table tree mismatch".into()));
+        if snap.tag != tag {
+            return Err(Error::Corrupt("snapshot tag mismatch".into()));
         }
-        let unsigned = snap.encode_unsigned();
-        let h = hash_bytes(&unsigned);
-        let pk = VerifyingKey::from_bytes(&snap.pk).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let sig = Signature::from_bytes(&snap.sig);
-        pk.verify(h.as_bytes(), &sig)
+        if snap.commit != commit_oid || snap.tree != tree_oid {
+            return Err(Error::Corrupt("seal table snapshot mismatch".into()));
+        }
+        let commit = Commit::decode(&self.store.get_raw_verified(commit_oid)?)?;
+        if commit.tree != tree_oid {
+            return Err(Error::Corrupt("sealed commit tree mismatch".into()));
+        }
+        Blob::decode(&self.store.get_raw_verified(snap.prov)?)?;
+
+        let h = hash_bytes(&snap.encode_unsigned());
+        let pk =
+            VerifyingKey::from_bytes(&self.seal_pk).map_err(|e| Error::Corrupt(e.to_string()))?;
+        pk.verify(h.as_bytes(), &Signature::from_bytes(&snap.sig))
             .map_err(|_| Error::Corrupt("snapshot signature".into()))?;
-        let walked = self.store.reachable_oids_verified(snap.tree)?;
-        if !walked.contains(&snap.tree) {
+        let walked = self.store.reachable_oids_verified(tree_oid)?;
+        if !walked.contains(&tree_oid) {
             return Err(Error::Corrupt("tree walk".into()));
         }
         Ok(snap_oid)
@@ -887,15 +937,64 @@ pub fn find_forge(start: &Path) -> Result<PathBuf> {
     )))
 }
 
-fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
-    let mut f = fs::File::create(&path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
+fn secure_key_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    Ok(())
+}
+
+fn validate_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(Error::Denied(format!(
+                "key directory {} must be mode 0700, got {mode:04o}",
+                path.display()
+            )));
+        }
+        for name in ["root.secret", "seal.ed25519", "root.cap", "integrator.cap"] {
+            let secret = path.join(name);
+            let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(Error::Denied(format!(
+                    "secret {} must be mode 0600, got {mode:04o}",
+                    secret.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        opts.open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
