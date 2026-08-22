@@ -1,0 +1,256 @@
+name: p0-meta-pr-patcher
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  patch:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'forgefs/p0-meta-final' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+          if 'fn validate_ref_name(name: &str)' in s:
+              raise SystemExit('metadata hardening already applied')
+
+          anchor = '''fn map_sql(e: rusqlite::Error) -> Error {
+              let s = e.to_string();
+              if s.contains("database is locked") || s.contains("busy") {
+                  Error::Busy(s)
+              } else {
+                  Error::Sqlite(s)
+              }
+          }
+          '''
+          helpers = anchor + '''
+          fn validate_ref_name(name: &str) -> Result<()> {
+              if name.is_empty() || name.len() > 512 || name.starts_with('/') || name.ends_with('/') {
+                  return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+              }
+              if name.chars().any(|c| c.is_control() || c == '\\\\' || c == ':') {
+                  return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+              }
+              if name.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+                  return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+              }
+              Ok(())
+          }
+
+          fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
+              validate_ref_name(name)?;
+              let expected = if name == "main" || name.starts_with("heads/") || name.starts_with("forks/") {
+                  Some("commit")
+              } else if name.starts_with("conflicts/") {
+                  Some("conflict")
+              } else if name.starts_with("tags/") {
+                  Some("snapshot")
+              } else {
+                  None
+              };
+              if let Some(expected) = expected {
+                  if kind != expected {
+                      return Err(Error::Invalid(format!(
+                          "ref {name} requires kind {expected}, got {kind}"
+                      )));
+                  }
+              }
+              Ok(())
+          }
+          '''
+          if s.count(anchor) != 1:
+              raise SystemExit('map_sql anchor mismatch')
+          s = s.replace(anchor, helpers, 1)
+
+          old = '''    pub fn insert_ref(
+              &self,
+              name: &str,
+              oid: ObjectId,
+              kind: &str,
+              protected: bool,
+              sealed: bool,
+              agent_id: &str,
+              reason: &str,
+          ) -> Result<()> {
+              let conn = self.write.lock();
+              let ts = now_ms() as i64;
+              conn.execute(
+                  "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+                  params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
+              )
+              .map_err(map_sql)?;
+              conn.execute(
+                  "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+                  params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
+              )
+              .map_err(map_sql)?;
+              Ok(())
+          }
+          '''
+          new = '''    pub fn insert_ref(
+              &self,
+              name: &str,
+              oid: ObjectId,
+              kind: &str,
+              protected: bool,
+              sealed: bool,
+              agent_id: &str,
+              reason: &str,
+          ) -> Result<()> {
+              validate_ref_kind(name, kind)?;
+              if name.starts_with("tags/") {
+                  return Err(Error::Denied("tags may only be created by seal".into()));
+              }
+              let mut conn = self.write.lock();
+              let tx = conn
+                  .transaction_with_behavior(TransactionBehavior::Immediate)
+                  .map_err(map_sql)?;
+              let ts = now_ms() as i64;
+              tx.execute(
+                  "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+                  params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
+              )
+              .map_err(map_sql)?;
+              tx.execute(
+                  "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+                  params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
+              )
+              .map_err(map_sql)?;
+              tx.commit().map_err(map_sql)?;
+              Ok(())
+          }
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('insert_ref anchor mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''    ) -> Result<CasResult> {
+              let mut conn = self.write.lock();
+          '''
+          new = '''    ) -> Result<CasResult> {
+              validate_ref_kind(name, kind)?;
+              if name.starts_with("tags/") {
+                  return Err(Error::Denied("sealed tags cannot be updated through CAS".into()));
+              }
+              let mut conn = self.write.lock();
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('cas_ref start anchor mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''        let (oid_b, _k, prot, sealed) = row.unwrap();
+              let current = oid_from_blob(oid_b)?;
+          '''
+          new = '''        let (oid_b, current_kind, prot, sealed) = row.unwrap();
+              if current_kind != kind {
+                  return Err(Error::Invalid(format!(
+                      "ref {name} kind is immutable: {current_kind} != {kind}"
+                  )));
+              }
+              let current = oid_from_blob(oid_b)?;
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('cas kind anchor mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''        let fork = format!(
+                  "forks/{}/{}/{}",
+                  name,
+                  sanitize_agent(fork_agent),
+                  ulid::Ulid::new()
+              );
+              tx.execute(
+          '''
+          new = '''        let fork = format!(
+                  "forks/{}/{}/{}",
+                  name,
+                  sanitize_agent(fork_agent),
+                  ulid::Ulid::new()
+              );
+              validate_ref_kind(&fork, kind)?;
+              tx.execute(
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('fork anchor mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''        let tag_ref = format!("tags/{tag}");
+              tx.execute(
+          '''
+          new = '''        let tag_ref = format!("tags/{tag}");
+              validate_ref_kind(&tag_ref, "snapshot")?;
+              tx.execute(
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('seal anchor mismatch')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          Path('crates/forge-store/tests/meta_invariants.rs').write_text(r'''use forge_store::Meta;
+          use forge_types::{Error, ObjectId};
+          use rusqlite::Connection;
+          use tempfile::tempdir;
+
+          fn oid(n: u8) -> ObjectId { ObjectId([n; 32]) }
+
+          #[test]
+          fn ref_and_reflog_publish_atomically() {
+              let d = tempdir().unwrap();
+              let db = d.path().join("m.sqlite");
+              let meta = Meta::open(&db).unwrap();
+              let conn = Connection::open(&db).unwrap();
+              conn.execute_batch("CREATE TRIGGER fail_reflog BEFORE INSERT ON reflog BEGIN SELECT RAISE(FAIL, 'boom'); END;").unwrap();
+              assert!(meta.insert_ref("heads/a", oid(1), "commit", false, false, "a", "test").is_err());
+              assert!(meta.get_ref("heads/a").unwrap().is_none());
+          }
+
+          #[test]
+          fn reserved_ref_names_are_typed_and_generic_tags_are_forbidden() {
+              let d = tempdir().unwrap();
+              let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
+              assert!(matches!(meta.insert_ref("heads/a", oid(1), "tree", false, false, "a", "x"), Err(Error::Invalid(_))));
+              assert!(matches!(meta.insert_ref("conflicts/x", oid(2), "commit", false, false, "a", "x"), Err(Error::Invalid(_))));
+              assert!(matches!(meta.insert_ref("tags/fake", oid(3), "snapshot", true, true, "a", "x"), Err(Error::Denied(_))));
+              assert!(meta.insert_ref("heads/a", oid(4), "commit", false, false, "a", "x").is_ok());
+          }
+
+          #[test]
+          fn malformed_ref_names_and_kind_changes_are_rejected() {
+              let d = tempdir().unwrap();
+              let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
+              for bad in ["", "/abs", "a/", "a//b", "a/./b", "a/../b", "a:b", "a\\b"] {
+                  assert!(matches!(meta.insert_ref(bad, oid(1), "commit", false, false, "a", "x"), Err(Error::Invalid(_))), "{bad:?}");
+              }
+              meta.insert_ref("heads/a", oid(1), "commit", false, false, "a", "x").unwrap();
+              let err = meta.cas_ref("heads/a", oid(1), oid(2), "tree", "a", "a", false).unwrap_err();
+              assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+          }
+          ''')
+          PY
+          cargo fmt --all
+          cargo test -p forge-store --all-targets --locked
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-store/src/meta.rs crates/forge-store/tests/meta_invariants.rs
+          git commit -m 'P0: enforce atomic typed ref metadata'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
