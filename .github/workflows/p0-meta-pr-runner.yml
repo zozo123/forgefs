@@ -26,25 +26,20 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path('crates/forge-store/src/meta.rs')
           s = p.read_text()
           if 'fn validate_ref_name(name: &str)' in s:
               raise SystemExit('already applied')
-          anchor = '''fn map_sql(e: rusqlite::Error) -> Error {
-              let s = e.to_string();
-              if s.contains("database is locked") || s.contains("busy") {
-                  Error::Busy(s)
-              } else {
-                  Error::Sqlite(s)
-              }
-          }
-          '''
-          helpers = anchor + '''
+
+          map_end = s.index('\n\nimpl Meta {')
+          helpers = r'''
+
           fn validate_ref_name(name: &str) -> Result<()> {
               if name.is_empty() || name.len() > 512 || name.starts_with('/') || name.ends_with('/') {
                   return Err(Error::Invalid(format!("invalid ref name {name:?}")));
               }
-              if name.chars().any(|c| c.is_control() || c == '\\\\' || c == ':') {
+              if name.chars().any(|c| c.is_control() || c == '\\' || c == ':') {
                   return Err(Error::Invalid(format!("invalid ref name {name:?}")));
               }
               if name.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
@@ -72,35 +67,12 @@ jobs:
               Ok(())
           }
           '''
-          if s.count(anchor) != 1: raise SystemExit('map_sql anchor mismatch')
-          s = s.replace(anchor, helpers, 1)
+          s = s[:map_end] + helpers + s[map_end:]
 
-          old = '''    pub fn insert_ref(
-              &self,
-              name: &str,
-              oid: ObjectId,
-              kind: &str,
-              protected: bool,
-              sealed: bool,
-              agent_id: &str,
-              reason: &str,
-          ) -> Result<()> {
-              let conn = self.write.lock();
-              let ts = now_ms() as i64;
-              conn.execute(
-                  "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
-                  params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
-              )
-              .map_err(map_sql)?;
-              conn.execute(
-                  "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-                  params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
-              )
-              .map_err(map_sql)?;
-              Ok(())
-          }
-          '''
-          new = '''    pub fn insert_ref(
+          start = s.index('    #[allow(clippy::too_many_arguments)]\n    pub fn insert_ref(')
+          end = s.index('\n    pub fn update_mount_spec(', start)
+          insert_ref = r'''    #[allow(clippy::too_many_arguments)]
+          pub fn insert_ref(
               &self,
               name: &str,
               oid: ObjectId,
@@ -115,106 +87,93 @@ jobs:
                   return Err(Error::Denied("tags may only be created by seal".into()));
               }
               let mut conn = self.write.lock();
-              let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sql)?;
+              let tx = conn
+                  .transaction_with_behavior(TransactionBehavior::Immediate)
+                  .map_err(map_sql)?;
               let ts = now_ms() as i64;
               tx.execute(
                   "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
                   params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
-              ).map_err(map_sql)?;
+              )
+              .map_err(map_sql)?;
               tx.execute(
                   "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
                   params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
-              ).map_err(map_sql)?;
+              )
+              .map_err(map_sql)?;
               tx.commit().map_err(map_sql)?;
               Ok(())
           }
           '''
-          if s.count(old) != 1: raise SystemExit('insert_ref anchor mismatch')
-          s = s.replace(old, new, 1)
+          s = s[:start] + insert_ref + s[end:]
 
-          old = '''    ) -> Result<CasResult> {
-              let mut conn = self.write.lock();
-          '''
-          new = '''    ) -> Result<CasResult> {
-              validate_ref_kind(name, kind)?;
+          cas = s.index('    pub fn cas_ref(')
+          conn = s.index('        let mut conn = self.write.lock();', cas)
+          s = s[:conn] + '''        validate_ref_kind(name, kind)?;
               if name.starts_with("tags/") {
                   return Err(Error::Denied("sealed tags cannot be updated through CAS".into()));
               }
-              let mut conn = self.write.lock();
-          '''
-          if s.count(old) != 1: raise SystemExit('cas start mismatch')
-          s = s.replace(old, new, 1)
+          ''' + s[conn:]
 
-          old = '''        let (oid_b, _k, prot, sealed) = row.unwrap();
-              let current = oid_from_blob(oid_b)?;
-          '''
+          old = '        let (oid_b, _k, prot, sealed) = row.unwrap();\n        let current = oid_from_blob(oid_b)?;'
           new = '''        let (oid_b, current_kind, prot, sealed) = row.unwrap();
               if current_kind != kind {
-                  return Err(Error::Invalid(format!("ref {name} kind is immutable: {current_kind} != {kind}")));
+                  return Err(Error::Invalid(format!(
+                      "ref {name} kind is immutable: {current_kind} != {kind}"
+                  )));
               }
-              let current = oid_from_blob(oid_b)?;
-          '''
-          if s.count(old) != 1: raise SystemExit('cas kind mismatch')
+              let current = oid_from_blob(oid_b)?;'''
+          if old not in s:
+              raise SystemExit('cas current-kind anchor missing')
           s = s.replace(old, new, 1)
 
-          old = '''        let fork = format!(
-                  "forks/{}/{}/{}",
-                  name,
-                  sanitize_agent(fork_agent),
-                  ulid::Ulid::new()
-              );
-              tx.execute(
-          '''
-          new = '''        let fork = format!(
-                  "forks/{}/{}/{}",
-                  name,
-                  sanitize_agent(fork_agent),
-                  ulid::Ulid::new()
-              );
-              validate_ref_kind(&fork, kind)?;
-              tx.execute(
-          '''
-          if s.count(old) != 1: raise SystemExit('fork mismatch')
-          s = s.replace(old, new, 1)
+          fork = s.index('        let fork = format!(', cas)
+          fork_end = s.index('        );', fork) + len('        );')
+          s = s[:fork_end] + '\n        validate_ref_kind(&fork, kind)?;' + s[fork_end:]
 
-          old = '''        let tag_ref = format!("tags/{tag}");
-              tx.execute(
-          '''
-          new = '''        let tag_ref = format!("tags/{tag}");
-              validate_ref_kind(&tag_ref, "snapshot")?;
-              tx.execute(
-          '''
-          if s.count(old) != 1: raise SystemExit('seal mismatch')
-          s = s.replace(old, new, 1)
+          seal = s.index('    pub fn commit_seal(')
+          tag_line = '        let tag_ref = format!("tags/{tag}");'
+          tag = s.index(tag_line, seal) + len(tag_line)
+          s = s[:tag] + '\n        validate_ref_kind(&tag_ref, "snapshot")?;' + s[tag:]
           p.write_text(s)
 
           Path('crates/forge-store/tests/meta_invariants.rs').write_text(r'''use forge_store::Meta;
           use forge_types::{Error, ObjectId};
           use rusqlite::Connection;
           use tempfile::tempdir;
+
           fn oid(n: u8) -> ObjectId { ObjectId([n; 32]) }
+
           #[test]
           fn ref_and_reflog_publish_atomically() {
-              let d=tempdir().unwrap(); let db=d.path().join("m.sqlite"); let meta=Meta::open(&db).unwrap();
-              Connection::open(&db).unwrap().execute_batch("CREATE TRIGGER fail_reflog BEFORE INSERT ON reflog BEGIN SELECT RAISE(FAIL, 'boom'); END;").unwrap();
-              assert!(meta.insert_ref("heads/a",oid(1),"commit",false,false,"a","test").is_err());
+              let d = tempdir().unwrap();
+              let db = d.path().join("m.sqlite");
+              let meta = Meta::open(&db).unwrap();
+              Connection::open(&db).unwrap().execute_batch(
+                  "CREATE TRIGGER fail_reflog BEFORE INSERT ON reflog BEGIN SELECT RAISE(FAIL, 'boom'); END;"
+              ).unwrap();
+              assert!(meta.insert_ref("heads/a", oid(1), "commit", false, false, "a", "test").is_err());
               assert!(meta.get_ref("heads/a").unwrap().is_none());
           }
+
           #[test]
           fn reserved_names_are_typed_and_tags_are_seal_only() {
-              let d=tempdir().unwrap(); let meta=Meta::open(&d.path().join("m.sqlite")).unwrap();
-              assert!(matches!(meta.insert_ref("heads/a",oid(1),"tree",false,false,"a","x"),Err(Error::Invalid(_))));
-              assert!(matches!(meta.insert_ref("conflicts/x",oid(2),"commit",false,false,"a","x"),Err(Error::Invalid(_))));
-              assert!(matches!(meta.insert_ref("tags/fake",oid(3),"snapshot",true,true,"a","x"),Err(Error::Denied(_))));
+              let d = tempdir().unwrap();
+              let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
+              assert!(matches!(meta.insert_ref("heads/a", oid(1), "tree", false, false, "a", "x"), Err(Error::Invalid(_))));
+              assert!(matches!(meta.insert_ref("conflicts/x", oid(2), "commit", false, false, "a", "x"), Err(Error::Invalid(_))));
+              assert!(matches!(meta.insert_ref("tags/fake", oid(3), "snapshot", true, true, "a", "x"), Err(Error::Denied(_))));
           }
+
           #[test]
           fn malformed_names_and_kind_changes_fail() {
-              let d=tempdir().unwrap(); let meta=Meta::open(&d.path().join("m.sqlite")).unwrap();
-              for bad in ["","/abs","a/","a//b","a/./b","a/../b","a:b","a\\b"] {
-                  assert!(matches!(meta.insert_ref(bad,oid(1),"commit",false,false,"a","x"),Err(Error::Invalid(_))),"{bad:?}");
+              let d = tempdir().unwrap();
+              let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
+              for bad in ["", "/abs", "a/", "a//b", "a/./b", "a/../b", "a:b", "a\\b"] {
+                  assert!(matches!(meta.insert_ref(bad, oid(1), "commit", false, false, "a", "x"), Err(Error::Invalid(_))), "{bad:?}");
               }
-              meta.insert_ref("heads/a",oid(1),"commit",false,false,"a","x").unwrap();
-              assert!(matches!(meta.cas_ref("heads/a",oid(1),oid(2),"tree","a","a",false),Err(Error::Invalid(_))));
+              meta.insert_ref("heads/a", oid(1), "commit", false, false, "a", "x").unwrap();
+              assert!(matches!(meta.cas_ref("heads/a", oid(1), oid(2), "tree", "a", "a", false), Err(Error::Invalid(_))));
           }
           ''')
           PY
