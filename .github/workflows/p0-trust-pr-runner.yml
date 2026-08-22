@@ -1,0 +1,332 @@
+name: p0-trust-pr-runner
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  patch:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'forgefs/p0-trust-final' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply trust P0
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-api/src/lib.rs')
+          s = p.read_text()
+          if 'fn validate_key_permissions(path: &Path)' in s:
+              raise SystemExit('already applied')
+
+          s = s.replace(
+              'use forge_core::{hash_bytes, now_ms, Commit, Snapshot, Tree};',
+              'use forge_core::{hash_bytes, now_ms, Blob, Commit, Conflict, Snapshot, Tree};',
+              1,
+          )
+          s = s.replace(
+              'use forge_merge::{lca, three_way, MergeOutcome};',
+              'use forge_merge::{merge_bases, three_way, MergeOutcome};',
+              1,
+          )
+          if '    pub store: Store,' not in s:
+              raise SystemExit('Forge.store anchor missing')
+          s = s.replace('    pub store: Store,', '    store: Store,', 1)
+
+          if '        fs::create_dir_all(root.join("keys"))?;' not in s:
+              raise SystemExit('keys dir anchor missing')
+          s = s.replace(
+              '        fs::create_dir_all(root.join("keys"))?;',
+              '        secure_key_dir(&root.join("keys"))?;',
+              1,
+          )
+
+          cap_write = '''        write_secret(
+              root.join("keys/integrator.cap"),
+              integ.to_token().as_bytes(),
+          )?;'''
+          if cap_write not in s:
+              raise SystemExit('integrator key anchor missing')
+          s = s.replace(cap_write, cap_write + '\n        sync_dir(&root.join("keys"))?;', 1)
+
+          open_anchor = '        let hmac = read32(&root.join("keys/root.secret"))?;'
+          if open_anchor not in s:
+              raise SystemExit('open key anchor missing')
+          s = s.replace(
+              open_anchor,
+              '        validate_key_permissions(&root.join("keys"))?;\n' + open_anchor,
+              1,
+          )
+
+          merge_start = s.index('            let base = lca(&self.store, into_row.oid, theirs_oid)?;')
+          merge_end = s.index('            match three_way(&self.store, base_tree, ours_c.tree, theirs_c.tree)? {', merge_start)
+          merge_end += len('            match three_way(&self.store, base_tree, ours_c.tree, theirs_c.tree)? {')
+          merge_prefix = '''            let bases = merge_bases(&self.store, into_row.oid, theirs_oid)?;
+              if bases.len() > 1 {
+                  let base_trees = bases
+                      .iter()
+                      .map(|id| self.store.get_commit(*id).map(|c| c.tree))
+                      .collect::<Result<Vec<_>>>()?;
+                  let conflict = Conflict {
+                      bases: base_trees,
+                      ours: ours_c.tree,
+                      theirs: theirs_c.tree,
+                      paths: vec![],
+                      causal: vec![into_row.oid, theirs_oid],
+                  };
+                  let oid = self.store.put_conflict(&conflict)?;
+                  let name = format!("conflicts/{into}/{}", ulid::Ulid::new());
+                  self.store.meta.insert_ref(
+                      &name,
+                      oid,
+                      "conflict",
+                      false,
+                      false,
+                      cap.agent_id(),
+                      "multiple-merge-bases",
+                  )?;
+                  return Err(Error::MergeConflict(oid));
+              }
+              let base_tree = match bases.as_slice() {
+                  [id] => Some(self.store.get_commit(*id)?.tree),
+                  [] => None,
+                  _ => unreachable!("multiple bases handled above"),
+              };
+              match three_way(&self.store, base_tree, ours_c.tree, theirs_c.tree)? {'''
+          s = s[:merge_start] + merge_prefix + s[merge_end:]
+
+          verify_start = s.index('    pub fn verify_tag(&self, cap: &Cap, tag: &str) -> Result<ObjectId> {')
+          verify_end = s.index('\n    pub fn export_tar(', verify_start)
+          verify = '''    pub fn verify_tag(&self, cap: &Cap, tag: &str) -> Result<ObjectId> {
+              let tag_ref_name = format!("tags/{tag}");
+              self.check(cap, Op::Read, Some(&tag_ref_name))?;
+              let tag_ref = self
+                  .store
+                  .meta
+                  .get_ref(&tag_ref_name)?
+                  .ok_or_else(|| Error::NotFound(format!("ref {tag_ref_name}")))?;
+              let (snap_oid, commit_oid, tree_oid) = self
+                  .store
+                  .meta
+                  .get_seal(tag)?
+                  .ok_or_else(|| Error::NotFound(format!("tag {tag}")))?;
+              if tag_ref.oid != snap_oid
+                  || tag_ref.kind != "snapshot"
+                  || !tag_ref.protected
+                  || !tag_ref.sealed
+              {
+                  return Err(Error::Corrupt("sealed tag ref metadata mismatch".into()));
+              }
+
+              let snap = Snapshot::decode(&self.store.get_raw_verified(snap_oid)?)?;
+              if snap.pk != self.seal_pk {
+                  return Err(Error::Corrupt(
+                      "snapshot key is not this forge's trusted seal key".into(),
+                  ));
+              }
+              if snap.tag != tag {
+                  return Err(Error::Corrupt("snapshot tag mismatch".into()));
+              }
+              if snap.commit != commit_oid || snap.tree != tree_oid {
+                  return Err(Error::Corrupt("seal table snapshot mismatch".into()));
+              }
+
+              let commit = Commit::decode(&self.store.get_raw_verified(commit_oid)?)?;
+              if commit.tree != tree_oid {
+                  return Err(Error::Corrupt("sealed commit tree mismatch".into()));
+              }
+              Blob::decode(&self.store.get_raw_verified(snap.prov)?)?;
+
+              let unsigned = snap.encode_unsigned();
+              let h = hash_bytes(&unsigned);
+              let pk = VerifyingKey::from_bytes(&self.seal_pk)
+                  .map_err(|e| Error::Corrupt(e.to_string()))?;
+              let sig = Signature::from_bytes(&snap.sig);
+              pk.verify(h.as_bytes(), &sig)
+                  .map_err(|_| Error::Corrupt("snapshot signature".into()))?;
+              let walked = self.store.reachable_oids_verified(tree_oid)?;
+              if !walked.contains(&tree_oid) {
+                  return Err(Error::Corrupt("tree walk".into()));
+              }
+              Ok(snap_oid)
+          }
+          '''
+          s = s[:verify_start] + verify + s[verify_end:]
+
+          ws = s.index('fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {')
+          we = s.index('\nfn read32(', ws)
+          secret_helpers = '''fn secure_key_dir(path: &Path) -> Result<()> {
+              fs::create_dir_all(path)?;
+              #[cfg(unix)]
+              {
+                  use std::os::unix::fs::PermissionsExt;
+                  fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+              }
+              Ok(())
+          }
+
+          fn validate_key_permissions(path: &Path) -> Result<()> {
+              #[cfg(unix)]
+              {
+                  use std::os::unix::fs::PermissionsExt;
+                  let dir_mode = fs::metadata(path)?.permissions().mode() & 0o777;
+                  if dir_mode != 0o700 {
+                      return Err(Error::Denied(format!(
+                          "key directory {} must be mode 0700, got {dir_mode:04o}",
+                          path.display()
+                      )));
+                  }
+                  for name in ["root.secret", "seal.ed25519", "root.cap", "integrator.cap"] {
+                      let secret = path.join(name);
+                      let mode = fs::metadata(&secret)?.permissions().mode() & 0o777;
+                      if mode != 0o600 {
+                          return Err(Error::Denied(format!(
+                              "secret {} must be mode 0600, got {mode:04o}",
+                              secret.display()
+                          )));
+                      }
+                  }
+              }
+              Ok(())
+          }
+
+          fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
+              #[cfg(unix)]
+              let mut f = {
+                  use std::os::unix::fs::OpenOptionsExt;
+                  let mut opts = fs::OpenOptions::new();
+                  opts.write(true).create_new(true).mode(0o600);
+                  opts.open(&path)?
+              };
+              #[cfg(not(unix))]
+              let mut f = fs::OpenOptions::new()
+                  .write(true)
+                  .create_new(true)
+                  .open(&path)?;
+              f.write_all(bytes)?;
+              f.sync_all()?;
+              Ok(())
+          }
+
+          fn sync_dir(path: &Path) -> Result<()> {
+              #[cfg(unix)]
+              fs::File::open(path)?.sync_all()?;
+              #[cfg(not(unix))]
+              let _ = path;
+              Ok(())
+          }
+          '''
+          s = s[:ws] + secret_helpers + s[we:]
+          p.write_text(s)
+
+          Path('crates/forge-api/tests/trust_boundary.rs').write_text(r'''use ed25519_dalek::{Signer, SigningKey};
+          use forge_api::Forge;
+          use forge_core::{hash_bytes, Commit, Snapshot, Tree, TreeEntry};
+          use forge_store::Store;
+          use forge_types::{EntryKind, Error};
+          use tempfile::tempdir;
+
+          fn root_store(dir: &std::path::Path) -> Store { Store::open(&dir.join(".forge")).unwrap() }
+          fn signing_key(dir: &std::path::Path) -> SigningKey {
+              let bytes = std::fs::read(dir.join(".forge/keys/seal.ed25519")).unwrap();
+              SigningKey::from_bytes(&bytes.try_into().unwrap())
+          }
+          fn sign_snapshot(sk: &SigningKey, snap: &mut Snapshot) {
+              let h = hash_bytes(&snap.encode_unsigned());
+              snap.sig = sk.sign(h.as_bytes()).to_bytes();
+          }
+          fn tree(store: &Store, name: &str, data: &[u8]) -> forge_types::ObjectId {
+              let blob = store.put_blob_data(data).unwrap();
+              store.put_tree(&Tree::new(vec![TreeEntry { name: name.into(), kind: EntryKind::Blob, id: blob, exec: false }]).unwrap()).unwrap()
+          }
+          fn commit(store: &Store, tree: forge_types::ObjectId, parents: Vec<forge_types::ObjectId>, n: u64) -> forge_types::ObjectId {
+              store.put_commit(&Commit { tree, parents, agent: "test".into(), msg: format!("c{n}"), ts: n, landmark: false }).unwrap()
+          }
+
+          #[test]
+          fn criss_cross_is_an_explicit_conflict() {
+              let d = tempdir().unwrap();
+              let f = Forge::init(d.path()).unwrap();
+              let root = f.root_cap().unwrap();
+              let s = root_store(d.path());
+              let r = commit(&s, tree(&s, "root", b"0"), vec![], 1);
+              let a1 = commit(&s, tree(&s, "a", b"a"), vec![r], 2);
+              let b1 = commit(&s, tree(&s, "b", b"b"), vec![r], 3);
+              let a2 = commit(&s, tree(&s, "a2", b"a2"), vec![a1, b1], 4);
+              let b2 = commit(&s, tree(&s, "b2", b"b2"), vec![b1, a1], 5);
+              s.meta.insert_ref("criss/a", a2, "commit", false, false, "test", "test").unwrap();
+              s.meta.insert_ref("criss/b", b2, "commit", false, false, "test", "test").unwrap();
+              let Error::MergeConflict(oid) = f.merge(&root, "criss/a", "criss/b", None).unwrap_err() else { panic!("expected conflict") };
+              let c = s.get_conflict(oid).unwrap();
+              assert_eq!(c.bases.len(), 2);
+              assert_eq!(c.causal, vec![a2, b2]);
+          }
+
+          #[test]
+          fn verify_rejects_seal_table_and_provenance_mismatch() {
+              let d = tempdir().unwrap();
+              let f = Forge::init(d.path()).unwrap();
+              let root = f.root_cap().unwrap();
+              let s = root_store(d.path());
+              let main = s.meta.get_ref("main").unwrap().unwrap();
+              let mc = s.get_commit(main.oid).unwrap();
+              let sk = signing_key(d.path());
+              let other = commit(&s, mc.tree, vec![main.oid], 9);
+              let mut snap = Snapshot { tree: mc.tree, commit: main.oid, tag: "bad".into(), ts: 10, prov: mc.tree, pk: sk.verifying_key().to_bytes(), sig: [0; 64] };
+              sign_snapshot(&sk, &mut snap);
+              let oid = s.put_snapshot(&snap).unwrap();
+              s.meta.commit_seal("bad", oid, other, mc.tree, "test").unwrap();
+              assert!(matches!(f.verify_tag(&root, "bad"), Err(Error::Corrupt(_))));
+          }
+
+          #[test]
+          fn verification_bypasses_cached_snapshot_bytes() {
+              let d = tempdir().unwrap();
+              let f = Forge::init(d.path()).unwrap();
+              let root = f.root_cap().unwrap();
+              let oid = f.seal(&root, "main", "cache-check").unwrap();
+              f.verify_tag(&root, "cache-check").unwrap();
+              let s = root_store(d.path());
+              std::fs::write(s.blobs.object_path(oid), b"tampered").unwrap();
+              assert!(matches!(f.verify_tag(&root, "cache-check"), Err(Error::Corrupt(_)) | Err(Error::NotFound(_))));
+          }
+
+          #[cfg(unix)]
+          #[test]
+          fn key_material_is_private_and_open_rejects_loose_secret() {
+              use std::os::unix::fs::PermissionsExt;
+              let d = tempdir().unwrap();
+              drop(Forge::init(d.path()).unwrap());
+              let keys = d.path().join(".forge/keys");
+              assert_eq!(std::fs::metadata(&keys).unwrap().permissions().mode() & 0o777, 0o700);
+              for name in ["root.secret", "seal.ed25519", "root.cap", "integrator.cap"] {
+                  assert_eq!(std::fs::metadata(keys.join(name)).unwrap().permissions().mode() & 0o777, 0o600);
+              }
+              let secret = keys.join("root.secret");
+              std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+              assert!(matches!(Forge::open(d.path()), Err(Error::Denied(_))));
+          }
+          ''')
+          PY
+          cargo fmt --all
+          cargo test -p forge-api --test trust_boundary --locked
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-api/src/lib.rs crates/forge-api/tests/trust_boundary.rs
+          git commit -m 'P0: close Forge API trust boundary'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
