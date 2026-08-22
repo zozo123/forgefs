@@ -2,6 +2,8 @@ use forge_store::Meta;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
+// Mutable metadata may carry only public trust material; minting authority stays
+// in the protected key directory and must never be recoverable from SQLite.
 #[test]
 fn mutable_sqlite_never_retains_capability_minting_secret() {
     let d = tempdir().unwrap();
