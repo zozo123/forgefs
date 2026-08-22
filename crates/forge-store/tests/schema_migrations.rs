@@ -41,9 +41,16 @@ fn legacy_unversioned_database_migrates_without_losing_rows() {
 
     let conn = Connection::open(&path).unwrap();
     let hmac_len: i64 = conn
-        .query_row("SELECT length(hmac_key) FROM cap_root WHERE id=1", [], |r| r.get(0))
+        .query_row(
+            "SELECT length(hmac_key) FROM cap_root WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(hmac_len, 0, "legacy root HMAC material must be scrubbed during migration");
+    assert_eq!(
+        hmac_len, 0,
+        "legacy root HMAC material must be scrubbed during migration"
+    );
 }
 
 #[test]
