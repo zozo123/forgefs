@@ -248,11 +248,27 @@ fn validate_ref_name(name: &str) -> Result<()> {
 
 fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
     validate_ref_name(name)?;
-    let expected = if name == "main" || name.starts_with("heads/") || name.starts_with("forks/") {
+    if let Some(rest) = name.strip_prefix("inbox/") {
+        let mut parts = rest.split('/');
+        let agent = parts.next().unwrap_or_default();
+        let id = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || agent.is_empty()
+            || sanitize_agent(agent) != agent
+            || ulid::Ulid::from_string(id).is_err()
+        {
+            return Err(Error::Invalid(format!("invalid inbox ref {name:?}")));
+        }
+    }
+    let expected = if name == "main" || name.starts_with("heads/") {
+        Some("commit")
+    } else if name.starts_with("forks/inbox/") {
+        Some("snapshot")
+    } else if name.starts_with("forks/") {
         Some("commit")
     } else if name.starts_with("conflicts/") {
         Some("conflict")
-    } else if name.starts_with("tags/") {
+    } else if name.starts_with("tags/") || name.starts_with("inbox/") {
         Some("snapshot")
     } else {
         None
