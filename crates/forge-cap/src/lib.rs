@@ -5,7 +5,7 @@
 use forge_types::{hex_decode, hex_encode, Error, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -55,8 +55,11 @@ pub struct Cap {
     pub caveats: Vec<String>,
     pub sig: [u8; 32],
     pub ops: HashSet<Op>,
-    /// Positive reference caveats. Each inner set is OR; all sets are ANDed.
+    /// Positive global reference caveats. Each inner set is OR; all sets are ANDed.
     pub ref_sets: Vec<Vec<String>>,
+    /// Operation-specific positive reference caveats. These are additionally
+    /// ANDed with the global reference caveats for that operation.
+    pub op_ref_sets: HashMap<Op, Vec<Vec<String>>>,
     pub ref_not: Vec<String>,
     pub time_le: Option<u64>,
     pub agent: Option<String>,
@@ -103,8 +106,18 @@ impl Cap {
                 return Err(Error::Denied(format!("cap excludes ref {name}")));
             }
             for allowed_set in &self.ref_sets {
-                if !allowed_set.iter().any(|g| ref_matches(g, name)) {
+                if !matches_any(allowed_set, name) {
                     return Err(Error::Denied(format!("cap does not cover ref {name}")));
+                }
+            }
+            if let Some(scoped_sets) = self.op_ref_sets.get(&op) {
+                for allowed_set in scoped_sets {
+                    if !matches_any(allowed_set, name) {
+                        return Err(Error::Denied(format!(
+                            "cap does not allow {} on ref {name}",
+                            op.as_str()
+                        )));
+                    }
                 }
             }
         }
@@ -114,6 +127,10 @@ impl Cap {
     pub fn agent_id(&self) -> &str {
         self.agent.as_deref().unwrap_or("anon")
     }
+}
+
+fn matches_any(globs: &[String], name: &str) -> bool {
+    globs.iter().any(|g| ref_matches(g, name))
 }
 
 pub fn ref_matches(glob: &str, name: &str) -> bool {
@@ -173,10 +190,24 @@ fn sign_chain(root: &[u8], loc: &str, id: &str, caveats: &[String]) -> [u8; 32] 
 struct ParsedCaveats {
     ops: HashSet<Op>,
     ref_sets: Vec<Vec<String>>,
+    op_ref_sets: HashMap<Op, Vec<Vec<String>>>,
     ref_not: Vec<String>,
     time_le: Option<u64>,
     agent: Option<String>,
     agent_conflict: bool,
+}
+
+fn parse_ref_set(rest: &str, kind: &str) -> Result<Vec<String>> {
+    let set: Vec<String> = rest
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if set.is_empty() {
+        return Err(Error::Cap(format!("empty {kind} caveat")));
+    }
+    Ok(set)
 }
 
 fn parse_caveats(caveats: &[String]) -> Result<ParsedCaveats> {
@@ -185,6 +216,7 @@ fn parse_caveats(caveats: &[String]) -> Result<ParsedCaveats> {
     }
     let mut ops: Option<HashSet<Op>> = None;
     let mut ref_sets = Vec::new();
+    let mut op_ref_sets: HashMap<Op, Vec<Vec<String>>> = HashMap::new();
     let mut nots = Vec::new();
     let mut time_le: Option<u64> = None;
     let mut agent: Option<String> = None;
@@ -204,22 +236,20 @@ fn parse_caveats(caveats: &[String]) -> Result<ParsedCaveats> {
                 None => set,
                 Some(prev) => prev.intersection(&set).copied().collect(),
             });
+        } else if let Some(rest) = c.strip_prefix("allow=") {
+            let (op_s, refs) = rest
+                .split_once(':')
+                .ok_or_else(|| Error::Cap("allow caveat needs allow=<op>:<refs>".into()))?;
+            let op = Op::parse(op_s.trim())?;
+            let set = parse_ref_set(refs, "allow")?;
+            op_ref_sets.entry(op).or_default().push(set);
         } else if let Some(rest) = c.strip_prefix("ref!=") {
             if rest.is_empty() {
                 return Err(Error::Cap("empty ref!= caveat".into()));
             }
             nots.push(rest.to_string());
         } else if let Some(rest) = c.strip_prefix("ref=") {
-            let set: Vec<String> = rest
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            if set.is_empty() {
-                return Err(Error::Cap("empty ref= caveat".into()));
-            }
-            ref_sets.push(set);
+            ref_sets.push(parse_ref_set(rest, "ref=")?);
         } else if let Some(rest) = c.strip_prefix("time<=") {
             let t = rest
                 .parse::<u64>()
@@ -242,6 +272,7 @@ fn parse_caveats(caveats: &[String]) -> Result<ParsedCaveats> {
     Ok(ParsedCaveats {
         ops: ops.unwrap_or_default(),
         ref_sets,
+        op_ref_sets,
         ref_not: nots,
         time_le,
         agent,
@@ -258,6 +289,7 @@ fn cap_from_parts(loc: String, id: String, caveats: Vec<String>, sig: [u8; 32]) 
         sig,
         ops: parsed.ops,
         ref_sets: parsed.ref_sets,
+        op_ref_sets: parsed.op_ref_sets,
         ref_not: parsed.ref_not,
         time_le: parsed.time_le,
         agent: parsed.agent,
@@ -370,7 +402,9 @@ pub fn mint_integrator(root: &[u8]) -> Result<Cap> {
         "integrator",
         vec![
             "ops=read,merge,seal,grant".into(),
-            "ref=main,tags/*".into(),
+            "allow=read:main,heads/agents/*,forks/*,tags/*".into(),
+            "allow=merge:main".into(),
+            "allow=seal:main,tags/*".into(),
         ],
     )
 }
@@ -435,6 +469,46 @@ mod tests {
     }
 
     #[test]
+    fn operation_scopes_are_not_a_cartesian_product() {
+        let key = [8u8; 32];
+        let c = mint(
+            &key,
+            "forge",
+            "scoped",
+            vec![
+                "ops=read,merge,seal".into(),
+                "allow=read:heads/*,main,tags/*".into(),
+                "allow=merge:main".into(),
+                "allow=seal:main,tags/*".into(),
+            ],
+        )
+        .unwrap();
+        c.allows(Op::Read, Some("heads/alice/1"), 0).unwrap();
+        c.allows(Op::Merge, Some("main"), 0).unwrap();
+        c.allows(Op::Seal, Some("tags/v1"), 0).unwrap();
+        assert!(c.allows(Op::Merge, Some("heads/alice/1"), 0).is_err());
+        assert!(c.allows(Op::Seal, Some("heads/alice/1"), 0).is_err());
+    }
+
+    #[test]
+    fn operation_scope_attenuation_only_shrinks() {
+        let key = [9u8; 32];
+        let broad = mint(
+            &key,
+            "forge",
+            "scoped",
+            vec!["ops=read".into(), "allow=read:heads/*,main".into()],
+        )
+        .unwrap();
+        let narrow = attenuate_holder(&broad, vec!["allow=read:heads/alice/*".into()]).unwrap();
+        narrow
+            .allows(Op::Read, Some("heads/alice/1"), 0)
+            .unwrap();
+        assert!(narrow.allows(Op::Read, Some("heads/bob/1"), 0).is_err());
+        assert!(narrow.allows(Op::Read, Some("main"), 0).is_err());
+    }
+
+    #[test]
     fn time_can_only_shrink() {
         let key = [4u8; 32];
         let c = mint(
@@ -467,12 +541,21 @@ mod tests {
     }
 
     #[test]
-    fn integrator_covers_main_and_tags() {
+    fn integrator_has_asymmetric_authority() {
         let key = [1u8; 32];
         let c = mint_integrator(&key).unwrap();
+        c.allows(Op::Read, Some("heads/agents/alice/1"), 0)
+            .unwrap();
+        c.allows(Op::Read, Some("forks/main/alice/1"), 0).unwrap();
+        c.allows(Op::Merge, Some("main"), 0).unwrap();
         c.allows(Op::Seal, Some("main"), 0).unwrap();
         c.allows(Op::Seal, Some("tags/v1.0"), 0).unwrap();
-        assert!(c.allows(Op::Seal, Some("heads/x"), 0).is_err());
+        assert!(c
+            .allows(Op::Merge, Some("heads/agents/alice/1"), 0)
+            .is_err());
+        assert!(c
+            .allows(Op::Seal, Some("heads/agents/alice/1"), 0)
+            .is_err());
         assert!(c.allows(Op::Write, Some("main"), 0).is_err());
     }
 
