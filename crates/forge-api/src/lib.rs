@@ -233,32 +233,15 @@ impl Forge {
 
     pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
         self.check_spec_read(cap, from)?;
-        let (cid, commit) = self.peel_commit(from)?;
+        let (cid, _) = self.peel_commit(from)?;
         let ns_id = ulid::Ulid::new().to_string();
         let agent = sanitize_agent(cap.agent_id());
         let live = format!("heads/agents/{agent}/{ns_id}");
         self.check(cap, Op::Branch, Some(&live))?;
+        let mount_main = cap.allows(Op::Read, Some("main"), now_ms()).is_ok();
         self.store
             .meta
-            .insert_namespace(&ns_id, cap.agent_id(), cid, &live)?;
-        self.store.meta.insert_ref(
-            &live,
-            cid,
-            "commit",
-            false,
-            false,
-            cap.agent_id(),
-            "session",
-        )?;
-        self.store
-            .meta
-            .insert_mount(&ns_id, "/", &format!("ref:{live}"), "rw")?;
-        if cap.allows(Op::Read, Some("main"), now_ms()).is_ok() {
-            self.store
-                .meta
-                .insert_mount(&ns_id, "/main", "ref:main", "ro")?;
-        }
-        let _ = commit;
+            .create_session(&ns_id, cap.agent_id(), cid, &live, mount_main)?;
         Ok(ns_id)
     }
 
@@ -427,6 +410,7 @@ impl Forge {
         self.check_observations(ns, &m.path, &ov, pin, &mounts)?;
         let new_tree = apply_overlay(Some(base_commit.tree), &ov, &self.store)?;
         if new_tree == base_commit.tree && pin == row.oid {
+            self.store.meta.complete_noop_session(ns, &m.path, pin)?;
             return Ok(CasResult::Noop {
                 name: ref_name,
                 oid: row.oid,
@@ -443,32 +427,15 @@ impl Forge {
         let cid = self.store.put_commit(&commit)?;
         self.store
             .record_intros(Some(base_commit.tree), new_tree, cid, cap.agent_id())?;
-        let result = self.store.meta.cas_ref(
+        let result = self.store.meta.cas_ref_session(
             &ref_name,
             pin,
             cid,
-            "commit",
             cap.agent_id(),
             cap.agent_id(),
-            false,
+            ns,
+            &m.path,
         )?;
-        match &result {
-            CasResult::Updated { .. } | CasResult::Forked { .. } => {
-                self.store.meta.overlay_clear(ns, &m.path)?;
-            }
-            CasResult::Noop { .. } => {}
-        }
-        if let CasResult::Forked { fork, ours, .. } = &result {
-            self.store
-                .meta
-                .update_mount_spec(ns, &m.path, &format!("ref:{fork}"))?;
-            self.store.meta.set_pin(ns, *ours)?;
-            self.store.meta.observations_clear(ns)?;
-        }
-        if let CasResult::Updated { oid, .. } = &result {
-            self.store.meta.set_pin(ns, *oid)?;
-            self.store.meta.observations_clear(ns)?;
-        }
         Ok(result)
     }
 

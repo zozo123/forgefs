@@ -135,7 +135,9 @@ impl Store {
         commit: ObjectId,
         agent: &str,
     ) -> Result<()> {
-        self.intro_walk(old, new, ObjectType::Tree, commit, agent)
+        let mut oids = Vec::new();
+        self.intro_walk(old, new, ObjectType::Tree, &mut oids)?;
+        self.meta.intro_insert_many(&oids, commit, agent)
     }
 
     fn intro_walk(
@@ -143,8 +145,7 @@ impl Store {
         old: Option<ObjectId>,
         new: ObjectId,
         expected: ObjectType,
-        commit: ObjectId,
-        agent: &str,
+        oids: &mut Vec<ObjectId>,
     ) -> Result<()> {
         if old == Some(new) {
             return Ok(());
@@ -159,7 +160,7 @@ impl Store {
                 actual.as_str()
             )));
         }
-        self.meta.intro_insert(new, commit, agent)?;
+        oids.push(new);
 
         match actual {
             ObjectType::Blob => {
@@ -193,7 +194,7 @@ impl Store {
                         EntryKind::Blob => ObjectType::Blob,
                         EntryKind::Tree => ObjectType::Tree,
                     };
-                    self.intro_walk(old_id, e.id, expected, commit, agent)?;
+                    self.intro_walk(old_id, e.id, expected, oids)?;
                 }
             }
             other => {
