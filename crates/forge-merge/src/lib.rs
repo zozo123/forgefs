@@ -15,7 +15,9 @@ fn ancestor_map(store: &Store, start: ObjectId) -> Result<HashMap<ObjectId, Vec<
             continue;
         }
         if out.len() >= MAX_ANCESTRY_COMMITS {
-            return Err(Error::Invalid("commit ancestry exceeds safety limit".into()));
+            return Err(Error::Invalid(
+                "commit ancestry exceeds safety limit".into(),
+            ));
         }
         let commit = store.get_commit(id)?;
         stack.extend(commit.parents.iter().copied());
@@ -36,7 +38,11 @@ pub fn merge_bases(store: &Store, a: ObjectId, b: ObjectId) -> Result<Vec<Object
 
     let am = ancestor_map(store, a)?;
     let bm = ancestor_map(store, b)?;
-    let common: HashSet<ObjectId> = am.keys().filter(|id| bm.contains_key(id)).copied().collect();
+    let common: HashSet<ObjectId> = am
+        .keys()
+        .filter(|id| bm.contains_key(id))
+        .copied()
+        .collect();
     if common.is_empty() {
         return Ok(Vec::new());
     }
