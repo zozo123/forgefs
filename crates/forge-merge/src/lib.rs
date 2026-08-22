@@ -2,43 +2,98 @@
 
 use forge_core::{Conflict, ConflictPath, Tree};
 use forge_store::Store;
-use forge_types::{EntryKind, ObjectId, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
+use forge_types::{EntryKind, Error, ObjectId, Result};
+use std::collections::{HashMap, HashSet};
 
-pub fn lca(store: &Store, a: ObjectId, b: ObjectId) -> Result<Option<ObjectId>> {
+const MAX_ANCESTRY_COMMITS: usize = 1_000_000;
+
+fn ancestor_map(store: &Store, start: ObjectId) -> Result<HashMap<ObjectId, Vec<ObjectId>>> {
+    let mut out = HashMap::new();
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if out.contains_key(&id) {
+            continue;
+        }
+        if out.len() >= MAX_ANCESTRY_COMMITS {
+            return Err(Error::Invalid(
+                "commit ancestry exceeds safety limit".into(),
+            ));
+        }
+        let commit = store.get_commit(id)?;
+        stack.extend(commit.parents.iter().copied());
+        out.insert(id, commit.parents);
+    }
+    Ok(out)
+}
+
+/// Return all best common ancestors, sorted by object id for deterministic output.
+/// A best common ancestor is a common ancestor that is not itself an ancestor
+/// of another common ancestor.
+pub fn merge_bases(store: &Store, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> {
     if a == b {
-        return Ok(Some(a));
+        // Validate that the object really is a commit before accepting it as a base.
+        store.get_commit(a)?;
+        return Ok(vec![a]);
     }
-    let mut seen = HashSet::new();
-    let mut q = VecDeque::new();
-    q.push_back(a);
-    while let Some(id) = q.pop_front() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Ok(c) = store.get_commit(id) {
-            for p in c.parents {
-                q.push_back(p);
+
+    let am = ancestor_map(store, a)?;
+    let bm = ancestor_map(store, b)?;
+    let common: HashSet<ObjectId> = am
+        .keys()
+        .filter(|id| bm.contains_key(id))
+        .copied()
+        .collect();
+    if common.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Any common node reachable by following parents from another common node
+    // is older than that node and therefore cannot be a best merge base.
+    let mut dominated = HashSet::new();
+    for &candidate in &common {
+        let mut stack = am
+            .get(&candidate)
+            .cloned()
+            .ok_or_else(|| Error::Corrupt("common ancestor missing from ancestry map".into()))?;
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if common.contains(&id) {
+                dominated.insert(id);
+            }
+            if let Some(parents) = am.get(&id) {
+                stack.extend(parents.iter().copied());
             }
         }
     }
-    let mut q = VecDeque::new();
-    q.push_back(b);
-    let mut seen_b = HashSet::new();
-    while let Some(id) = q.pop_front() {
-        if !seen_b.insert(id) {
-            continue;
-        }
-        if seen.contains(&id) {
-            return Ok(Some(id));
-        }
-        if let Ok(c) = store.get_commit(id) {
-            for p in c.parents {
-                q.push_back(p);
-            }
-        }
+
+    let mut bases: Vec<_> = common
+        .into_iter()
+        .filter(|id| !dominated.contains(id))
+        .collect();
+    bases.sort_by(|x, y| x.as_bytes().cmp(y.as_bytes()));
+    Ok(bases)
+}
+
+/// Compatibility helper for callers that require one merge base.
+/// Multiple best bases are a first-class condition and must not be collapsed
+/// by traversal order; callers should use `merge_bases` if they can represent it.
+pub fn lca(store: &Store, a: ObjectId, b: ObjectId) -> Result<Option<ObjectId>> {
+    let bases = merge_bases(store, a, b)?;
+    match bases.as_slice() {
+        [] => Ok(None),
+        [base] => Ok(Some(*base)),
+        _ => Err(Error::Invalid(format!(
+            "multiple best merge bases: {}",
+            bases
+                .iter()
+                .map(ObjectId::hex)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))),
     }
-    Ok(None)
 }
 
 #[derive(Clone, Debug)]
@@ -195,19 +250,7 @@ pub fn commit_parent_map(
     store: &Store,
     start: ObjectId,
 ) -> Result<HashMap<ObjectId, Vec<ObjectId>>> {
-    let mut m = HashMap::new();
-    let mut q = vec![start];
-    let mut seen = HashSet::new();
-    while let Some(id) = q.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Ok(c) = store.get_commit(id) {
-            m.insert(id, c.parents.clone());
-            q.extend(c.parents);
-        }
-    }
-    Ok(m)
+    ancestor_map(store, start)
 }
 
 #[cfg(test)]
