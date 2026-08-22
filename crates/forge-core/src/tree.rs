@@ -49,7 +49,10 @@ impl Tree {
     }
 
     pub fn get(&self, name: &str) -> Option<&TreeEntry> {
-        self.entries.iter().find(|e| e.name == name)
+        self.entries
+            .binary_search_by(|e| e.name.as_bytes().cmp(name.as_bytes()))
+            .ok()
+            .map(|i| &self.entries[i])
     }
 
     pub fn as_map(&self) -> BTreeMap<String, TreeEntry> {
@@ -290,5 +293,35 @@ mod apply_tests {
         let t = store.get_tree(root).unwrap();
         let names: Vec<_> = t.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["dir", "dir2"]);
+    }
+
+    #[test]
+    fn sorted_tree_get_finds_hits_and_misses() {
+        let tree = Tree::new(vec![
+            TreeEntry {
+                name: "zeta".into(),
+                kind: EntryKind::Blob,
+                id: ObjectId([1u8; 32]),
+                exec: false,
+            },
+            TreeEntry {
+                name: "alpha".into(),
+                kind: EntryKind::Blob,
+                id: ObjectId([2u8; 32]),
+                exec: false,
+            },
+            TreeEntry {
+                name: "middle".into(),
+                kind: EntryKind::Blob,
+                id: ObjectId([3u8; 32]),
+                exec: false,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(tree.get("alpha").unwrap().id, ObjectId([2u8; 32]));
+        assert_eq!(tree.get("middle").unwrap().id, ObjectId([3u8; 32]));
+        assert_eq!(tree.get("zeta").unwrap().id, ObjectId([1u8; 32]));
+        assert!(tree.get("absent").is_none());
     }
 }
