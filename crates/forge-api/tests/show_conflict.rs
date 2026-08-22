@@ -67,6 +67,8 @@ fn show_conflict_exposes_both_sides_and_typed_path_oids() {
         panic!("expected conflict: {err:?}");
     };
     let conflict = s.get_conflict(oid).unwrap();
+
+    // Raw object inspection is explicit (`oid:`) and remains root/full-read only.
     let rendered = forge.show(&root, &format!("oid:{}", oid.hex())).unwrap();
 
     assert!(rendered.contains(&format!("conflict {oid}")));
