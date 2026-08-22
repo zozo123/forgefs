@@ -2,6 +2,7 @@ use forge_api::Forge;
 use forge_types::CasResult;
 use tempfile::tempdir;
 
+// Inbox tests are capability-boundary regressions, not only happy-path API tests.
 #[test]
 fn sealed_snapshot_can_be_published_to_recipient_inbox() {
     let d = tempdir().unwrap();
