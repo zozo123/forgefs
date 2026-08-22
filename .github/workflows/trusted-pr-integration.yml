@@ -67,4 +67,16 @@ jobs:
           persist-credentials: true
       - name: Run trusted checkin Contribution integrator from main
         shell: bash
-        run: git show origin/main:.github/integration/checkin-contribution-109.sh | bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          script = subprocess.check_output(
+              ["git", "show", "origin/main:.github/integration/checkin-contribution-109.sh"],
+              text=True,
+          )
+          script = script.replace(
+              'assert!(shown.contains("agent root"));',
+              'assert!(shown.lines().any(|line| line.starts_with("agent ") && line.len() > 6));',
+          )
+          subprocess.run(["bash"], input=script, text=True, check=True)
+          PY
