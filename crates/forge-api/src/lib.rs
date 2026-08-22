@@ -1,8 +1,12 @@
 //! The native Forge API. Agents speak this; POSIX is an adapter.
 
+mod bench;
 mod export;
 mod serve;
 
+pub use bench::{
+    merge_all_and_seal, private_checkins, run as run_bench, shared_stampede, BenchReport,
+};
 pub use serve::serve;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

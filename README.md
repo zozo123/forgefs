@@ -31,10 +31,34 @@ Two agents, one forge, no cloud. If they both touch the same path you get a **co
 
 See [INVARIANTS.md](INVARIANTS.md) for the 15-line correctness model.
 
+## Speed model (honest)
+
+Puts are **durable**: write → fsync(file) → exclusive link → fsync(dir). That is ~1 ms per object on SSD, by design (crash-safe). Checkin cost is that times (1 blob + directories on the COW spine) plus one SQLite `BEGIN IMMEDIATE`.
+
+Private agents do **not** fight over `main`. Each owns a ref row. SQLite serializes the tiny CAS txn; object bytes do not go through SQLite. A shared-ref stampede becomes **1 update + N forks**, not a lock convoy.
+
+```bash
+cargo run -p forge-cli -- bench --agents 32 --shared 16
+```
+
+Measured on this Mac (debug, APFS, durable fsync) @ `f5b6617` lineage:
+
+| Workload | Result |
+|---|---|
+| Serial checkin (grant+session+write+CAS) | p50 **38 ms** |
+| 32 private agents | **32/32 Updated**, **35 Hz**, wall 0.9 s |
+| 128 private | **128/128**, **42 Hz**, wall 3.1 s |
+| 256 private | **256/256**, **40 Hz**, wall 6.4 s |
+| 16/32/64 shared-ref stampede | **1 Updated + N-1 Forked** every time |
+| verify after seal | **1–10 ms** |
+
+Throughput is ~40 durable checkins/s because each object put fsyncs the file *and* its directory (I4). p50 under load ≈ wall clock: threads convoy on fsync + SQLite `BEGIN IMMEDIATE`, they do **not** clobber. Scale-out is more private refs, not a faster `main`.
+
 ## Local (no Docker)
 
 ```bash
 cargo test --workspace
+cargo run -p forge-cli -- bench --agents 32 --shared 16
 ```
 
 ## Layout

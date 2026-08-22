@@ -119,6 +119,13 @@ enum Cmd {
     Show {
         spec: String,
     },
+    /// Timed concurrent checkin / shared-ref stampede / merge+seal+verify.
+    Bench {
+        #[arg(long, default_value_t = 32)]
+        agents: usize,
+        #[arg(long, default_value_t = 16)]
+        shared: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +149,17 @@ fn main() -> ExitCode {
 fn run() -> forge_types::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Bench { agents, shared } => {
+            let dir = cli.dir.clone().unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("forge-bench-{}", std::process::id()))
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            eprintln!("forge bench dir={}", dir.display());
+            let report = forge_api::run_bench(&dir, agents, shared)?;
+            print!("{}", report.render());
+            Ok(())
+        }
         Cmd::Init { dir } => {
             let dir = dir
                 .or(cli.dir.clone())
@@ -305,7 +323,7 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
         Cmd::Show { spec } => {
             println!("{}", f.show(cap, &spec)?);
         }
-        Cmd::Init { .. } | Cmd::Serve { .. } => unreachable!(),
+        Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Bench { .. } => unreachable!(),
     }
     Ok(())
 }
