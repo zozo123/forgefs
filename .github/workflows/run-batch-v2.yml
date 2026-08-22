@@ -1,16 +1,15 @@
 name: run-batch-v2
 
 on:
-  push:
-    branches: [perf/durability-batch-102-v2]
-    paths:
-      - .github/workflows/run-batch-v2.yml
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   generate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -39,4 +38,3 @@ jobs:
           p.write_text(s)
           PY
           bash /tmp/batch-worker.sh
-# retrigger
