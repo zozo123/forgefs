@@ -138,6 +138,46 @@ fn map_sql(e: rusqlite::Error) -> Error {
     }
 }
 
+fn validate_ref_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 512 || name.starts_with('/') || name.ends_with('/') {
+        return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '\\' || c == ':')
+    {
+        return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+    }
+    if name
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+    }
+    Ok(())
+}
+
+fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
+    validate_ref_name(name)?;
+    let expected = if name == "main" || name.starts_with("heads/") || name.starts_with("forks/") {
+        Some("commit")
+    } else if name.starts_with("conflicts/") {
+        Some("conflict")
+    } else if name.starts_with("tags/") {
+        Some("snapshot")
+    } else {
+        None
+    };
+    if let Some(expected) = expected {
+        if kind != expected {
+            return Err(Error::Invalid(format!(
+                "ref {name} requires kind {expected}, got {kind}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Meta {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(map_sql)?;
@@ -215,18 +255,26 @@ impl Meta {
         agent_id: &str,
         reason: &str,
     ) -> Result<()> {
-        let conn = self.write.lock();
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied("tags may only be created by seal".into()));
+        }
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
         let ts = now_ms() as i64;
-        conn.execute(
-            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
-        )
-        .map_err(map_sql)?;
-        conn.execute(
-            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-            params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
-        )
-        .map_err(map_sql)?;
+        tx.execute(
+        "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
+    )
+    .map_err(map_sql)?;
+        tx.execute(
+        "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+        params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
+    )
+    .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
         Ok(())
     }
 
@@ -254,6 +302,12 @@ impl Meta {
         fork_agent: &str,
         allow_protected: bool,
     ) -> Result<CasResult> {
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied(
+                "sealed tags cannot be updated through CAS".into(),
+            ));
+        }
         let mut conn = self.write.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -294,7 +348,12 @@ impl Meta {
             });
         }
 
-        let (oid_b, _k, prot, sealed) = row.unwrap();
+        let (oid_b, current_kind, prot, sealed) = row.unwrap();
+        if current_kind != kind {
+            return Err(Error::Invalid(format!(
+                "ref {name} kind is immutable: {current_kind} != {kind}"
+            )));
+        }
         let current = oid_from_blob(oid_b)?;
         if sealed != 0 {
             return Err(Error::Sealed(name.to_string()));
@@ -344,6 +403,7 @@ impl Meta {
             sanitize_agent(fork_agent),
             ulid::Ulid::new()
         );
+        validate_ref_kind(&fork, kind)?;
         tx.execute(
             "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
             params![fork, new.as_bytes().as_slice(), kind, ts],
@@ -650,6 +710,7 @@ impl Meta {
             .map_err(map_sql)?;
         let ts = now_ms() as i64;
         let tag_ref = format!("tags/{tag}");
+        validate_ref_kind(&tag_ref, "snapshot")?;
         tx.execute(
             "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'snapshot',1,1,?3)",
             params![tag_ref, snap.as_bytes().as_slice(), ts],
