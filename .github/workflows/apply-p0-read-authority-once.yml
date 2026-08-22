@@ -1,0 +1,74 @@
+name: apply-p0-read-authority-once
+
+on:
+  push:
+    branches:
+      - forgefs/p0-read-authority
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch authority invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/forge-api/src/lib.rs")
+          s = path.read_text()
+
+          old = '''    pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
+              self.check(cap, Op::Read, Some(from))?;
+              let (cid, commit) = self.peel_commit(from)?;
+              let ns_id = ulid::Ulid::new().to_string();
+              let agent = sanitize_agent(cap.agent_id());
+              let live = format!("heads/agents/{agent}/{ns_id}");
+          '''
+          new = '''    pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
+              self.check_spec_read(cap, from)?;
+              let (cid, commit) = self.peel_commit(from)?;
+              let ns_id = ulid::Ulid::new().to_string();
+              let agent = sanitize_agent(cap.agent_id());
+              let live = format!("heads/agents/{agent}/{ns_id}");
+              self.check(cap, Op::Branch, Some(&live))?;
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("session_open patch anchor not unique")
+          s = s.replace(old, new, 1)
+
+          old = '''    pub fn show(&self, cap: &Cap, spec: &str) -> Result<String> {
+              self.check(cap, Op::Read, None)?;
+              let oid = if spec.len() == 64 {
+                  ObjectId::from_hex(spec).unwrap_or(self.resolve_spec_oid(spec)?)
+              } else {
+                  self.resolve_spec_oid(spec)?
+              };
+          '''
+          new = '''    pub fn show(&self, cap: &Cap, spec: &str) -> Result<String> {
+              self.check_spec_read(cap, spec)?;
+              let oid = self.resolve_spec_oid(spec)?;
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("show patch anchor not unique")
+          s = s.replace(old, new, 1)
+
+          path.write_text(s)
+          PY
+      - name: Format and targeted tests
+        run: |
+          cargo fmt --all
+          cargo test -p forge-api --test p0_read_authority --locked
+      - name: Commit patch and remove workflow
+        run: |
+          rm .github/workflows/apply-p0-read-authority-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-api/src/lib.rs crates/forge-api/tests/p0_read_authority.rs .github/workflows/apply-p0-read-authority-once.yml
+          git commit -m "Enforce read authority and session creation rights"
+          git push
