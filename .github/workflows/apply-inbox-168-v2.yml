@@ -201,3 +201,4 @@ jobs:
           git add crates/forge-api/src/lib.rs crates/forge-store/src/meta.rs crates/forge-api/tests/inbox_refs.rs
           git commit -m "agents: add capability-scoped snapshot inbox refs"
           git push origin HEAD:agents/inbox-111-v2
+# retrigger
