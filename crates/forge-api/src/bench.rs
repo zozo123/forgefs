@@ -9,7 +9,7 @@
 //! Private refs do not contend on `main`. Shared-ref stampedes become forks
 //! (I5/I8), not a lock convoy. SQLite still serializes the metadata txn.
 
-use crate::Forge;
+use crate::{ApiStats, Forge};
 use forge_cap::Cap;
 use forge_store::blob::BlobStoreStats;
 use forge_types::{CasResult, Error, Result};
@@ -68,6 +68,7 @@ pub struct BenchReport {
     pub merge_seal: Option<Duration>,
     pub verify: Option<Duration>,
     pub store: Option<BlobStoreStats>,
+    pub api: Option<ApiStats>,
 }
 
 impl BenchReport {
@@ -119,6 +120,26 @@ impl BenchReport {
             s.push_str(&format!(
                 "storage          puts={} fsync_file={} fsync_dir={}\n",
                 stats.puts, stats.fsync_file, stats.fsync_dir
+            ));
+        }
+        if let Some(stats) = self.api {
+            let wall_s = self
+                .private
+                .as_ref()
+                .map(|(_, d, _)| d.as_secs_f64())
+                .unwrap_or(0.0)
+                + self
+                    .shared
+                    .as_ref()
+                    .map(|(_, d, _, _)| d.as_secs_f64())
+                    .unwrap_or(0.0);
+            let rate = |n: u64| if wall_s > 0.0 { n as f64 / wall_s } else { 0.0 };
+            s.push_str(&format!(
+                "api outcomes     stale={} ({:.2}/s) conflict={} ({:.2}/s)\n",
+                stats.stale_observation,
+                rate(stats.stale_observation),
+                stats.merge_conflict,
+                rate(stats.merge_conflict),
             ));
         }
         s
@@ -308,5 +329,6 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         merge_seal: Some(merge_seal),
         verify: Some(verify),
         store: Some(store),
+        api: Some(forge.api_stats()),
     })
 }

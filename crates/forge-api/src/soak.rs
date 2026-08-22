@@ -210,5 +210,6 @@ pub fn run_bench_with_workers(
         merge_seal: Some(merge_seal),
         verify: Some(verify),
         store: Some(store),
+        api: Some(forge.api_stats()),
     })
 }
