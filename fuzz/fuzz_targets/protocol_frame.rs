@@ -27,8 +27,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    // Capability parsing has its own target. Use a valid throwaway
-    // root cap here so mutations reach operation/body dispatch too.
+    // Capability parsing has its own target. Use a valid throwaway root cap here
+    // so this target spends mutations on operation/body dispatch after framing.
     request.cap = forge()
         .root_cap()
         .expect("read throwaway root cap")
