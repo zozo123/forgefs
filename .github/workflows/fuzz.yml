@@ -1,0 +1,60 @@
+name: fuzz
+
+on:
+  pull_request:
+    paths:
+      - 'fuzz/**'
+      - 'crates/forge-core/src/**'
+      - 'crates/forge-cap/src/**'
+      - 'crates/forge-protocol/src/**'
+      - 'crates/forge-api/src/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'fuzz/**'
+      - 'crates/forge-core/src/**'
+      - 'crates/forge-cap/src/**'
+      - 'crates/forge-protocol/src/**'
+      - 'crates/forge-api/src/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-build
+      - name: Compile every fuzz target
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
+  fuzz-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Object decoder fuzz smoke
+        run: cargo +nightly fuzz run object_decode -- -max_total_time=60 -rss_limit_mb=2048
+      - name: Capability parser fuzz smoke
+        run: cargo +nightly fuzz run cap_token -- -max_total_time=60 -rss_limit_mb=2048
+      - name: Protocol dispatch fuzz smoke
+        run: cargo +nightly fuzz run protocol_frame -- -max_total_time=60 -rss_limit_mb=2048
