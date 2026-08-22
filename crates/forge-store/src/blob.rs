@@ -198,7 +198,9 @@ mod tests {
         let mut joins = Vec::new();
         for _ in 0..32 {
             let s = s.clone();
-            joins.push(thread::spawn(move || s.put(b"same durable object").unwrap()));
+            joins.push(thread::spawn(move || {
+                s.put(b"same durable object").unwrap()
+            }));
         }
         let ids: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
         assert!(ids.iter().all(|id| *id == ids[0]));
