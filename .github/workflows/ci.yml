@@ -59,7 +59,7 @@ jobs:
         run: cargo run --locked -p forge-cli -- bench --agents 32 --shared 16
 
   onef916-box-followup:
-    if: "${{ github.event_name == 'pull_request' && github.event.pull_request.title == 'chore: trigger 1F916 Box follow-up' }}"
+    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: trigger 1F916 Box follow-up now' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
