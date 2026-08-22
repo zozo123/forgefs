@@ -56,3 +56,32 @@ fn reopening_current_schema_is_idempotent() {
         .unwrap();
     assert_eq!(n, 1);
 }
+
+#[test]
+fn newer_schema_rejection_does_not_mutate_journal_mode() {
+    let d = tempdir().unwrap();
+    let path = d.path().join("future.sqlite");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL);\
+         INSERT INTO schema_migrations (version, applied_ms) VALUES (2, 0);",
+    )
+    .unwrap();
+    let before: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(before.to_ascii_lowercase(), "delete");
+    drop(conn);
+
+    let err = Meta::open(&path)
+        .err()
+        .expect("future schema must fail before durability mutation");
+    assert!(matches!(err, Error::Invalid(_)), "unexpected error: {err}");
+
+    let conn = Connection::open(&path).unwrap();
+    let after: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(after.to_ascii_lowercase(), "delete");
+    assert!(!d.path().join("future.sqlite-wal").exists());
+}

@@ -25,8 +25,13 @@ use forge_ns::{
 };
 use forge_store::{sanitize_agent, Store};
 use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, RefRow, Result};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,10 +76,8 @@ impl Forge {
             )));
         }
 
-        // Build a complete repository under a sibling staging name. VERSION is
-        // written last, then the directory rename publishes the repository in
-        // one namespace operation. A crash before rename leaves no `.forge`
-        // validity marker, so a retry is safe.
+        // Build completely under a sibling name. Publication is one atomic,
+        // no-replace rename; VERSION remains the validity marker written last.
         let parent = root
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -91,7 +94,7 @@ impl Forge {
         ));
         fs::create_dir(&staging)?;
 
-        let initialized = (|| -> Result<()> {
+        let prepared = (|| -> Result<File> {
             secure_key_dir(&staging.join("keys"))?;
             fs::create_dir_all(staging.join("objects"))?;
             fs::create_dir_all(staging.join("tmp"))?;
@@ -146,29 +149,39 @@ impl Forge {
             store.meta.landmark(cid, "commit", "init")?;
             drop(store);
 
-            // VERSION is the validity/compatibility marker and is published last.
             write_public(staging.join("VERSION"), b"1\n")?;
+            // Acquire the direct-client shared ownership while LOCK is still in
+            // staging. The descriptor keeps the same inode locked across rename,
+            // eliminating the post-publication daemon race.
+            let cell_lock = acquire_cell_lock(&staging, false)?;
             sync_dir(&staging)?;
-            Ok(())
+            Ok(cell_lock)
         })();
 
-        if let Err(error) = initialized {
+        let cell_lock = match prepared {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = publish_noreplace(&staging, &root) {
+            drop(cell_lock);
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
-
-        if let Err(error) = fs::rename(&staging, &root) {
-            let _ = fs::remove_dir_all(&staging);
-            if root.exists() {
-                return Err(Error::Invalid(format!(
-                    "already a forge: {}",
-                    root.display()
-                )));
-            }
-            return Err(error.into());
+        if let Err(error) = sync_dir(parent) {
+            return Err(Error::Io(format!(
+                "repository published at {} but parent directory fsync failed: {error}",
+                root.display()
+            )));
         }
-        sync_dir(parent)?;
-        Self::open(&root)
+
+        // Ownership was acquired before publication; opening the committed cell
+        // cannot race a daemon. All repository contents were already validated in
+        // staging, so remaining failures are local I/O/corruption, not ambiguity.
+        Self::open_locked(root, cell_lock, false)
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
@@ -185,6 +198,10 @@ impl Forge {
     fn open_with_lock(dir: &Path, exclusive: bool) -> Result<Self> {
         let root = find_forge(dir)?;
         let cell_lock = acquire_cell_lock(&root, exclusive)?;
+        Self::open_locked(root, cell_lock, exclusive)
+    }
+
+    fn open_locked(root: PathBuf, cell_lock: File, exclusive: bool) -> Result<Self> {
         validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
@@ -1012,37 +1029,85 @@ fn is_exec(p: &Path) -> Result<bool> {
     }
 }
 
+fn path_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Invalid(format!("path contains NUL: {}", path.display())))
+}
+
+fn publish_noreplace(from: &Path, to: &Path) -> Result<()> {
+    let from_c = path_cstring(from)?;
+    let to_c = path_cstring(to)?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        libc::renamex_np(
+            from_c.as_ptr(),
+            to_c.as_ptr(),
+            libc::RENAME_EXCL as libc::c_uint,
+        )
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    return Err(Error::Invalid(
+        "atomic no-replace repository publication is unsupported on this platform".into(),
+    ));
+
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Err(Error::Invalid(format!("already a forge: {}", to.display())));
+    }
+    Err(error.into())
+}
+
 fn acquire_cell_lock(root: &Path, exclusive: bool) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join("LOCK"))?;
+    let path = root.join("LOCK");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path)?;
+
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+            return Err(Error::Denied(format!(
+                "LOCK must be a single-link regular file: {}",
+                path.display()
+            )));
+        }
+    }
+
     let result = if exclusive {
         file.try_lock()
     } else {
         file.try_lock_shared()
     };
     match result {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(Error::Busy(if exclusive {
-                "forge cell is in use by a direct client or daemon".into()
-            } else {
-                "forge daemon owns this cell; use the socket or stop forge serve".into()
-            }));
-        }
-        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy(if exclusive {
+            "forge cell is in use by a direct client or daemon".into()
+        } else {
+            "forge daemon owns this cell; use the socket or stop forge serve".into()
+        })),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
-
-    if exclusive {
-        file.set_len(0)?;
-        let mut handle = &file;
-        handle.write_all(std::process::id().to_string().as_bytes())?;
-        file.sync_all()?;
-    }
-    Ok(file)
 }
 
 fn validate_repo_version(root: &Path) -> Result<()> {
@@ -1186,6 +1251,55 @@ mod tests {
         let f = Forge::init(d.path()).unwrap();
         let cap = f.root_cap().unwrap();
         (d, f, cap)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn publish_never_replaces_an_existing_empty_root() {
+        let d = tempdir().unwrap();
+        let staging = d.path().join("staging");
+        let root = d.path().join(".forge");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(staging.join("VERSION"), b"1\n").unwrap();
+
+        assert!(publish_noreplace(&staging, &root).is_err());
+        assert!(root.is_dir());
+        assert!(staging.join("VERSION").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn staged_shared_lock_remains_authoritative_after_publish() {
+        let d = tempdir().unwrap();
+        let staging = d.path().join("staging");
+        let root = d.path().join(".forge");
+        fs::create_dir(&staging).unwrap();
+        let shared = acquire_cell_lock(&staging, false).unwrap();
+        publish_noreplace(&staging, &root).unwrap();
+
+        assert!(matches!(
+            acquire_cell_lock(&root, true),
+            Err(Error::Busy(_))
+        ));
+        drop(shared);
+        drop(acquire_cell_lock(&root, true).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let d = tempdir().unwrap();
+        let root = d.path().join(".forge");
+        fs::create_dir(&root).unwrap();
+        let victim = d.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, root.join("LOCK")).unwrap();
+
+        assert!(acquire_cell_lock(&root, true).is_err());
+        assert_eq!(fs::read(victim).unwrap(), b"keep");
     }
 
     #[test]
