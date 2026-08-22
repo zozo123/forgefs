@@ -128,6 +128,12 @@ impl Store {
     }
 
     /// First-intro walk: record every oid in `new` that is not in `old`.
+    pub fn collect_intros(&self, old: Option<ObjectId>, new: ObjectId) -> Result<Vec<ObjectId>> {
+        let mut oids = Vec::new();
+        self.intro_walk(old, new, ObjectType::Tree, &mut oids)?;
+        Ok(oids)
+    }
+
     pub fn record_intros(
         &self,
         old: Option<ObjectId>,
@@ -135,8 +141,7 @@ impl Store {
         commit: ObjectId,
         agent: &str,
     ) -> Result<()> {
-        let mut oids = Vec::new();
-        self.intro_walk(old, new, ObjectType::Tree, &mut oids)?;
+        let oids = self.collect_intros(old, new)?;
         self.meta.intro_insert_many(&oids, commit, agent)
     }
 

@@ -84,10 +84,17 @@ impl Forge {
             landmark: true,
         };
         let cid = store.put_commit(&commit)?;
-        store.record_intros(None, empty, cid, "init")?;
-        store
-            .meta
-            .insert_ref("main", cid, "commit", true, false, "init", "init")?;
+        let intro_oids = store.collect_intros(None, empty)?;
+        store.meta.insert_ref_with_intros(
+            "main",
+            cid,
+            "commit",
+            true,
+            false,
+            "init",
+            "init",
+            &intro_oids,
+        )?;
         store.meta.landmark(cid, "commit", "init")?;
 
         Ok(Self {
@@ -425,8 +432,9 @@ impl Forge {
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store
-            .record_intros(Some(base_commit.tree), new_tree, cid, cap.agent_id())?;
+        let intro_oids = self
+            .store
+            .collect_intros(Some(base_commit.tree), new_tree)?;
         let result = self.store.meta.cas_ref_session(
             &ref_name,
             pin,
@@ -435,6 +443,7 @@ impl Forge {
             cap.agent_id(),
             ns,
             &m.path,
+            &intro_oids,
         )?;
         Ok(result)
     }
@@ -566,9 +575,8 @@ impl Forge {
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store
-            .record_intros(Some(ours_c.tree), tree, cid, cap.agent_id())?;
-        self.store.meta.cas_ref(
+        let intro_oids = self.store.collect_intros(Some(ours_c.tree), tree)?;
+        self.store.meta.cas_ref_with_intros(
             into,
             into_row.oid,
             cid,
@@ -576,6 +584,7 @@ impl Forge {
             cap.agent_id(),
             cap.agent_id(),
             into_row.protected,
+            &intro_oids,
         )
     }
 
@@ -723,15 +732,12 @@ impl Forge {
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store.record_intros(
-            previous_commit.as_ref().map(|c| c.tree),
-            tree,
-            cid,
-            cap.agent_id(),
-        )?;
+        let intro_oids = self
+            .store
+            .collect_intros(previous_commit.as_ref().map(|c| c.tree), tree)?;
         match previous {
             Some(row) => {
-                self.store.meta.cas_ref(
+                self.store.meta.cas_ref_with_intros(
                     r#ref,
                     row.oid,
                     cid,
@@ -739,10 +745,11 @@ impl Forge {
                     cap.agent_id(),
                     cap.agent_id(),
                     false,
+                    &intro_oids,
                 )?;
             }
             None => {
-                self.store.meta.insert_ref(
+                self.store.meta.insert_ref_with_intros(
                     r#ref,
                     cid,
                     "commit",
@@ -750,6 +757,7 @@ impl Forge {
                     false,
                     cap.agent_id(),
                     "import",
+                    &intro_oids,
                 )?;
             }
         }

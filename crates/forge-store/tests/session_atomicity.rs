@@ -43,7 +43,7 @@ fn failed_checkin_cleanup_rolls_back_ref_and_session_state() {
         "CREATE TRIGGER fail_overlay BEFORE DELETE ON overlay BEGIN SELECT RAISE(FAIL, 'boom'); END;"
     ).unwrap();
     assert!(meta
-        .cas_ref_session("shared", oid(1), oid(2), "a", "a", "ns", "/")
+        .cas_ref_session("shared", oid(1), oid(2), "a", "a", "ns", "/", &[])
         .is_err());
     assert_eq!(meta.get_ref("shared").unwrap().unwrap().oid, oid(1));
     assert_eq!(meta.get_namespace("ns").unwrap().pinned_oid, Some(oid(1)));
@@ -57,7 +57,7 @@ fn successful_checkin_moves_ref_and_clears_session_state_together() {
     let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
     seed(&meta, "ns", "shared", oid(1), oid(1));
     let r = meta
-        .cas_ref_session("shared", oid(1), oid(2), "a", "a", "ns", "/")
+        .cas_ref_session("shared", oid(1), oid(2), "a", "a", "ns", "/", &[])
         .unwrap();
     assert!(matches!(r, CasResult::Updated { .. }));
     assert_eq!(meta.get_ref("shared").unwrap().unwrap().oid, oid(2));
@@ -72,7 +72,7 @@ fn stale_checkin_forks_and_retargets_mount_atomically() {
     let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
     seed(&meta, "ns", "shared", oid(1), oid(2));
     let r = meta
-        .cas_ref_session("shared", oid(1), oid(3), "a", "a", "ns", "/")
+        .cas_ref_session("shared", oid(1), oid(3), "a", "a", "ns", "/", &[])
         .unwrap();
     let CasResult::Forked { fork, .. } = r else {
         panic!("expected fork")
@@ -102,4 +102,49 @@ fn provenance_batch_rolls_back_all_rows_on_failure() {
         .is_err());
     assert!(meta.intro_get(oid(1)).unwrap().is_none());
     assert!(meta.intro_get(oid(2)).unwrap().is_none());
+}
+
+#[test]
+fn provenance_failure_rolls_back_checkin_publication() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("m.sqlite");
+    let meta = Meta::open(&db).unwrap();
+    seed(&meta, "ns", "shared", oid(1), oid(1));
+    Connection::open(&db).unwrap().execute_batch(
+        "CREATE TRIGGER fail_intro BEFORE INSERT ON object_intro BEGIN SELECT RAISE(FAIL, 'boom'); END;"
+    ).unwrap();
+    assert!(meta
+        .cas_ref_session("shared", oid(1), oid(2), "a", "a", "ns", "/", &[oid(7)])
+        .is_err());
+    assert_eq!(meta.get_ref("shared").unwrap().unwrap().oid, oid(1));
+    assert_eq!(meta.get_namespace("ns").unwrap().pinned_oid, Some(oid(1)));
+    assert_eq!(meta.overlay_list("ns", "/").unwrap().len(), 1);
+    assert_eq!(meta.observations("ns").unwrap().len(), 1);
+    assert!(meta.intro_get(oid(7)).unwrap().is_none());
+}
+
+#[test]
+fn generic_cas_provenance_failure_rolls_back_ref() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("m.sqlite");
+    let meta = Meta::open(&db).unwrap();
+    meta.insert_ref("shared", oid(1), "commit", false, false, "a", "seed")
+        .unwrap();
+    Connection::open(&db).unwrap().execute_batch(
+        "CREATE TRIGGER fail_intro BEFORE INSERT ON object_intro BEGIN SELECT RAISE(FAIL, 'boom'); END;"
+    ).unwrap();
+    assert!(meta
+        .cas_ref_with_intros(
+            "shared",
+            oid(1),
+            oid(2),
+            "commit",
+            "a",
+            "a",
+            false,
+            &[oid(7)]
+        )
+        .is_err());
+    assert_eq!(meta.get_ref("shared").unwrap().unwrap().oid, oid(1));
+    assert!(meta.intro_get(oid(7)).unwrap().is_none());
 }

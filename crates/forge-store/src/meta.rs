@@ -244,6 +244,23 @@ impl Meta {
         .transpose()
     }
 
+    fn insert_intros_tx(
+        tx: &rusqlite::Transaction<'_>,
+        oids: &[ObjectId],
+        commit: ObjectId,
+        agent_id: &str,
+        ts: i64,
+    ) -> Result<()> {
+        for oid in oids {
+            tx.execute(
+                "INSERT OR IGNORE INTO object_intro (oid, commit_oid, agent_id, ts_ms) VALUES (?1,?2,?3,?4)",
+                params![oid.as_bytes().as_slice(), commit.as_bytes().as_slice(), agent_id, ts],
+            )
+            .map_err(map_sql)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_ref(
         &self,
@@ -274,6 +291,42 @@ impl Meta {
         params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
     )
     .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_ref_with_intros(
+        &self,
+        name: &str,
+        oid: ObjectId,
+        kind: &str,
+        protected: bool,
+        sealed: bool,
+        agent_id: &str,
+        reason: &str,
+        intro_oids: &[ObjectId],
+    ) -> Result<()> {
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied("tags may only be created by seal".into()));
+        }
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let ts = now_ms() as i64;
+        tx.execute(
+        "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
+    )
+    .map_err(map_sql)?;
+        tx.execute(
+        "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+        params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
+    )
+    .map_err(map_sql)?;
+        Self::insert_intros_tx(&tx, intro_oids, oid, agent_id, ts)?;
         tx.commit().map_err(map_sql)?;
         Ok(())
     }
@@ -430,6 +483,148 @@ impl Meta {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn cas_ref_with_intros(
+        &self,
+        name: &str,
+        expected: ObjectId,
+        new: ObjectId,
+        kind: &str,
+        agent_id: &str,
+        fork_agent: &str,
+        allow_protected: bool,
+        intro_oids: &[ObjectId],
+    ) -> Result<CasResult> {
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied(
+                "sealed tags cannot be updated through CAS".into(),
+            ));
+        }
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let row = tx
+            .query_row(
+                "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
+                [name],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sql)?;
+
+        let ts = now_ms() as i64;
+
+        if row.is_none() {
+            tx.execute(
+                "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
+                params![name, new.as_bytes().as_slice(), kind, ts],
+            )
+            .map_err(map_sql)?;
+            tx.execute(
+                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'cas',?4)",
+                params![name, new.as_bytes().as_slice(), agent_id, ts],
+            )
+            .map_err(map_sql)?;
+            Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
+            tx.commit().map_err(map_sql)?;
+            return Ok(CasResult::Updated {
+                name: name.to_string(),
+                oid: new,
+            });
+        }
+
+        let (oid_b, current_kind, prot, sealed) = row.unwrap();
+        if current_kind != kind {
+            return Err(Error::Invalid(format!(
+                "ref {name} kind is immutable: {current_kind} != {kind}"
+            )));
+        }
+        let current = oid_from_blob(oid_b)?;
+        if sealed != 0 {
+            return Err(Error::Sealed(name.to_string()));
+        }
+        if prot != 0 && !allow_protected {
+            return Err(Error::Denied(format!(
+                "ref {name} is protected; only merge/seal may advance it"
+            )));
+        }
+
+        let n = tx
+            .execute(
+                "UPDATE refs SET oid=?1, kind=?2, updated_ms=?3 WHERE name=?4 AND oid=?5 AND sealed=0",
+                params![
+                    new.as_bytes().as_slice(),
+                    kind,
+                    ts,
+                    name,
+                    expected.as_bytes().as_slice()
+                ],
+            )
+            .map_err(map_sql)?;
+
+        if n == 1 {
+            tx.execute(
+                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'cas',?5)",
+                params![
+                    name,
+                    expected.as_bytes().as_slice(),
+                    new.as_bytes().as_slice(),
+                    agent_id,
+                    ts
+                ],
+            )
+            .map_err(map_sql)?;
+            Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
+            tx.commit().map_err(map_sql)?;
+            return Ok(CasResult::Updated {
+                name: name.to_string(),
+                oid: new,
+            });
+        }
+
+        // Lost CAS → fork.
+        let fork = format!(
+            "forks/{}/{}/{}",
+            name,
+            sanitize_agent(fork_agent),
+            ulid::Ulid::new()
+        );
+        validate_ref_kind(&fork, kind)?;
+        tx.execute(
+            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
+            params![fork, new.as_bytes().as_slice(), kind, ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
+            params![
+                fork,
+                current.as_bytes().as_slice(),
+                new.as_bytes().as_slice(),
+                agent_id,
+                ts
+            ],
+        )
+        .map_err(map_sql)?;
+        Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(CasResult::Forked {
+            requested: name.to_string(),
+            fork,
+            ours: new,
+            theirs: current,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn cas_ref_session(
         &self,
         name: &str,
@@ -439,6 +634,7 @@ impl Meta {
         fork_agent: &str,
         ns_id: &str,
         mount_path: &str,
+        intro_oids: &[ObjectId],
     ) -> Result<CasResult> {
         validate_ref_kind(name, "commit")?;
         let mut conn = self.write.lock();
@@ -549,6 +745,7 @@ impl Meta {
         }
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
             .map_err(map_sql)?;
+        Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
         tx.commit().map_err(map_sql)?;
         Ok(result)
     }
@@ -876,17 +1073,10 @@ impl Meta {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql)?;
         let ts = now_ms() as i64;
-        for oid in oids {
-            tx.execute(
-                "INSERT OR IGNORE INTO object_intro (oid, commit_oid, agent_id, ts_ms) VALUES (?1,?2,?3,?4)",
-                params![oid.as_bytes().as_slice(), commit.as_bytes().as_slice(), agent_id, ts],
-            )
-            .map_err(map_sql)?;
-        }
+        Self::insert_intros_tx(&tx, oids, commit, agent_id, ts)?;
         tx.commit().map_err(map_sql)?;
         Ok(())
     }
-
     pub fn intro_get(&self, oid: ObjectId) -> Result<Option<String>> {
         let conn = self.write.lock();
         conn.query_row(
