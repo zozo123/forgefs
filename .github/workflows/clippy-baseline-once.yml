@@ -1,0 +1,49 @@
+name: clippy-baseline-once
+
+on:
+  push:
+    branches:
+      - forgefs/rustfmt-baseline
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: forgefs/rustfmt-baseline
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt
+      - name: Apply narrow clippy baseline fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+          old = '    pub fn insert_ref(\n'
+          new = '    #[allow(clippy::too_many_arguments)]\n    pub fn insert_ref(\n'
+          assert old in s and new not in s
+          s = s.replace(old, new, 1)
+          marker = 'pub struct NsRow {\n    pub id: String,\n    pub agent_id: String,\n}\n'
+          alias = marker + '\npub type ReflogEntry = (Option<ObjectId>, ObjectId, String, String);\n'
+          assert marker in s and 'pub type ReflogEntry' not in s
+          s = s.replace(marker, alias, 1)
+          old_ret = 'Result<Vec<(Option<ObjectId>, ObjectId, String, String)>>'
+          assert old_ret in s
+          s = s.replace(old_ret, 'Result<Vec<ReflogEntry>>', 1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+      - name: Commit fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/forge-store/src/meta.rs
+          git commit -m "Resolve clippy baseline warnings"
+          git push origin HEAD:forgefs/rustfmt-baseline
