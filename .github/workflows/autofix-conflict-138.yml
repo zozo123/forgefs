@@ -1,0 +1,37 @@
+name: autofix-conflict-138
+
+on:
+  push:
+    branches: [cli/show-conflict-106]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: cli/show-conflict-106
+          persist-credentials: true
+      - name: Fix raw OID spec and format
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/forge-api/tests/show_conflict.rs')
+          s = p.read_text()
+          old = '    let rendered = forge.show(&root, &oid.hex()).unwrap();'
+          new = '    let rendered = forge.show(&root, &format!("oid:{}", oid.hex())).unwrap();'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+          PY
+          cargo fmt --all
+          git rm .github/workflows/autofix-conflict-138.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-api/src/lib.rs crates/forge-api/tests/show_conflict.rs
+          git commit -m 'fix: use explicit raw OID spec for conflict show (#138)'
+          git push origin HEAD:cli/show-conflict-106
