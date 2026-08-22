@@ -1,0 +1,444 @@
+name: autopatch-contribution-108
+
+on:
+  push:
+    branches: [objects/contribution-108]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: objects/contribution-108
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt
+      - name: Implement canonical Contribution v1
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('crates/forge-types/src/lib.rs')
+          s = p.read_text()
+          s = s.replace('    Snapshot = 0x05,\n}', '    Snapshot = 0x05,\n    Contribution = 0x06,\n}')
+          s = s.replace('            0x05 => Ok(Self::Snapshot),\n', '            0x05 => Ok(Self::Snapshot),\n            0x06 => Ok(Self::Contribution),\n')
+          s = s.replace('            Self::Snapshot => "snapshot",\n', '            Self::Snapshot => "snapshot",\n            Self::Contribution => "contribution",\n')
+          p.write_text(s)
+
+          p = Path('crates/forge-core/src/lib.rs')
+          s = p.read_text()
+          s = s.replace('pub mod cbor;\n', 'pub mod cbor;\npub mod contribution;\n')
+          s = s.replace('pub use object::{', 'pub use contribution::{Contribution, ContributionRead};\npub use object::{')
+          p.write_text(s)
+
+          p = Path('crates/forge-core/src/object.rs')
+          s = p.read_text()
+          s = s.replace('    pub landmark: bool,\n}', '    pub landmark: bool,\n    pub contrib: Option<ObjectId>,\n}', 1)
+          old = '''        let mut header = Vec::new();\n        encode_map_sorted(\n            &mut header,\n            vec![\n                (text_key("agent"), agent_v),\n                (text_key("lm"), lm_v),\n                (text_key("msg"), msg_v),\n                (text_key("parents"), parents_v),\n                (text_key("tree"), tree_v),\n                (text_key("ts"), ts_v),\n            ],\n        );'''
+          new = '''        let mut fields = vec![\n            (text_key("agent"), agent_v),\n            (text_key("lm"), lm_v),\n            (text_key("msg"), msg_v),\n            (text_key("parents"), parents_v),\n            (text_key("tree"), tree_v),\n            (text_key("ts"), ts_v),\n        ];\n        if let Some(contrib) = self.contrib {\n            let mut contrib_v = Vec::new();\n            encode_bytes(&mut contrib_v, contrib.as_bytes());\n            fields.push((text_key("contrib"), contrib_v));\n        }\n        let mut header = Vec::new();\n        encode_map_sorted(&mut header, fields);'''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          s = s.replace('        let mut lm = None;\n        let mut last = None;', '        let mut lm = None;\n        let mut contrib = None;\n        let mut last = None;', 1)
+          s = s.replace('                "lm" => lm = Some(r.bool()?),\n', '                "lm" => lm = Some(r.bool()?),\n                "contrib" => contrib = Some(ObjectId(r.bstr32()?)),\n', 1)
+          s = s.replace('            landmark: lm.ok_or_else(|| Error::Corrupt("commit lm".into()))?,\n        })', '            landmark: lm.ok_or_else(|| Error::Corrupt("commit lm".into()))?,\n            contrib,\n        })', 1)
+          p.write_text(s)
+
+          # Preserve existing commit object IDs: every old Commit literal explicitly has contrib=None.
+          pat = re.compile(r'(?m)^(\s*)landmark:\s*([^,\n]+),\n(\s*)}')
+          for f in Path('.').rglob('*.rs'):
+              if '.git' in f.parts:
+                  continue
+              text = f.read_text()
+              if 'Commit {' not in text:
+                  continue
+              text2, n = pat.subn(lambda m: f'{m.group(1)}landmark: {m.group(2)},\n{m.group(1)}contrib: None,\n{m.group(3)}}}', text)
+              if n:
+                  f.write_text(text2)
+
+          p = Path('fuzz/fuzz_targets/object_decode.rs')
+          s = p.read_text()
+          s = s.replace('use forge_core::{parse_file, Blob, Commit, Conflict, Snapshot, Tree};', 'use forge_core::{parse_file, Blob, Commit, Conflict, Contribution, Snapshot, Tree};')
+          s = s.replace('    let _ = Conflict::decode(data);\n', '    let _ = Conflict::decode(data);\n    let _ = Contribution::decode(data);\n')
+          p.write_text(s)
+          PY
+
+          cat > crates/forge-core/src/contribution.rs <<'RS'
+          use crate::cbor::{
+              encode_array_header, encode_bytes, encode_map_sorted, encode_text, encode_u64, text_key,
+              Reader,
+          };
+          use crate::{encode_file, parse_file};
+          use forge_types::{Error, ObjectId, ObjectType, Result};
+
+          const MAX_ITEMS: u64 = 100_000;
+          const MAX_PARENTS: u64 = 1_024;
+          const MAX_PATH_BYTES: usize = 4_096;
+          const MAX_AGENT_BYTES: usize = 1_024;
+
+          #[derive(Clone, Debug, PartialEq, Eq)]
+          pub struct ContributionRead {
+              pub path: String,
+              pub id: ObjectId,
+          }
+
+          #[derive(Clone, Debug, PartialEq, Eq)]
+          pub struct Contribution {
+              pub base: ObjectId,
+              pub tree: ObjectId,
+              pub parents: Vec<ObjectId>,
+              pub reads: Vec<ContributionRead>,
+              pub writes: Vec<String>,
+              pub agent: String,
+              pub ts: u64,
+          }
+
+          fn validate_path(path: &str) -> Result<()> {
+              if path.is_empty() || path.len() > MAX_PATH_BYTES || path.contains('\0') {
+                  return Err(Error::Invalid("contribution path bounds".into()));
+              }
+              Ok(())
+          }
+
+          fn validate_sorted_unique<'a>(paths: impl Iterator<Item = &'a str>) -> Result<()> {
+              let mut prev: Option<&str> = None;
+              for path in paths {
+                  validate_path(path)?;
+                  if let Some(prev) = prev {
+                      if prev.as_bytes() >= path.as_bytes() {
+                          return Err(Error::Invalid(
+                              "contribution paths must be bytewise sorted unique".into(),
+                          ));
+                      }
+                  }
+                  prev = Some(path);
+              }
+              Ok(())
+          }
+
+          impl Contribution {
+              fn validate(&self) -> Result<()> {
+                  if self.parents.len() as u64 > MAX_PARENTS
+                      || self.reads.len() as u64 > MAX_ITEMS
+                      || self.writes.len() as u64 > MAX_ITEMS
+                  {
+                      return Err(Error::Invalid("contribution fanout exceeds limit".into()));
+                  }
+                  if self.agent.is_empty() || self.agent.len() > MAX_AGENT_BYTES {
+                      return Err(Error::Invalid("contribution agent bounds".into()));
+                  }
+                  validate_sorted_unique(self.reads.iter().map(|r| r.path.as_str()))?;
+                  validate_sorted_unique(self.writes.iter().map(String::as_str))?;
+                  Ok(())
+              }
+
+              pub fn encode(&self) -> Result<Vec<u8>> {
+                  self.validate()?;
+
+                  let mut base_v = Vec::new();
+                  encode_bytes(&mut base_v, self.base.as_bytes());
+                  let mut tree_v = Vec::new();
+                  encode_bytes(&mut tree_v, self.tree.as_bytes());
+                  let mut parents_v = Vec::new();
+                  encode_array_header(&mut parents_v, self.parents.len() as u64);
+                  for parent in &self.parents {
+                      encode_bytes(&mut parents_v, parent.as_bytes());
+                  }
+                  let mut reads_v = Vec::new();
+                  encode_array_header(&mut reads_v, self.reads.len() as u64);
+                  for read in &self.reads {
+                      let mut path_v = Vec::new();
+                      encode_text(&mut path_v, &read.path);
+                      let mut id_v = Vec::new();
+                      encode_bytes(&mut id_v, read.id.as_bytes());
+                      encode_map_sorted(
+                          &mut reads_v,
+                          vec![(text_key("id"), id_v), (text_key("p"), path_v)],
+                      );
+                  }
+                  let mut writes_v = Vec::new();
+                  encode_array_header(&mut writes_v, self.writes.len() as u64);
+                  for path in &self.writes {
+                      encode_text(&mut writes_v, path);
+                  }
+                  let mut agent_v = Vec::new();
+                  encode_text(&mut agent_v, &self.agent);
+                  let mut ts_v = Vec::new();
+                  encode_u64(&mut ts_v, self.ts);
+
+                  let mut header = Vec::new();
+                  encode_map_sorted(
+                      &mut header,
+                      vec![
+                          (text_key("agent"), agent_v),
+                          (text_key("base"), base_v),
+                          (text_key("parents"), parents_v),
+                          (text_key("reads"), reads_v),
+                          (text_key("tree"), tree_v),
+                          (text_key("ts"), ts_v),
+                          (text_key("writes"), writes_v),
+                      ],
+                  );
+                  Ok(encode_file(ObjectType::Contribution, &header, &[]))
+              }
+
+              pub fn decode(bytes: &[u8]) -> Result<Self> {
+                  let (ty, header, payload) = parse_file(bytes)?;
+                  if ty != ObjectType::Contribution {
+                      return Err(Error::Corrupt("not a contribution".into()));
+                  }
+                  if !payload.is_empty() {
+                      return Err(Error::Corrupt("contribution has payload".into()));
+                  }
+                  let mut r = Reader::new(header);
+                  let n = r.map()?;
+                  let mut base = None;
+                  let mut tree = None;
+                  let mut parents = None;
+                  let mut reads = None;
+                  let mut writes = None;
+                  let mut agent = None;
+                  let mut ts = None;
+                  let mut last = None;
+                  for _ in 0..n {
+                      let key = r.text_map_key(&mut last)?;
+                      match key.as_str() {
+                          "base" => base = Some(ObjectId(r.bstr32()?)),
+                          "tree" => tree = Some(ObjectId(r.bstr32()?)),
+                          "parents" => {
+                              let count = r.array()?;
+                              if count > MAX_PARENTS {
+                                  return Err(Error::Corrupt(
+                                      "contribution parent count exceeds limit".into(),
+                                  ));
+                              }
+                              let mut out = Vec::with_capacity(count as usize);
+                              for _ in 0..count {
+                                  out.push(ObjectId(r.bstr32()?));
+                              }
+                              parents = Some(out);
+                          }
+                          "reads" => {
+                              let count = r.array()?;
+                              if count > MAX_ITEMS {
+                                  return Err(Error::Corrupt(
+                                      "contribution read count exceeds limit".into(),
+                                  ));
+                              }
+                              let mut out = Vec::with_capacity(count as usize);
+                              for _ in 0..count {
+                                  let fields = r.map()?;
+                                  let mut path = None;
+                                  let mut id = None;
+                                  let mut last_read = None;
+                                  for _ in 0..fields {
+                                      let key = r.text_map_key(&mut last_read)?;
+                                      match key.as_str() {
+                                          "p" => path = Some(r.text()?),
+                                          "id" => id = Some(ObjectId(r.bstr32()?)),
+                                          _ => {
+                                              return Err(Error::Corrupt(format!(
+                                                  "unknown contribution read key {key}"
+                                              )))
+                                          }
+                                      }
+                                  }
+                                  out.push(ContributionRead {
+                                      path: path.ok_or_else(|| {
+                                          Error::Corrupt("contribution read path".into())
+                                      })?,
+                                      id: id.ok_or_else(|| {
+                                          Error::Corrupt("contribution read id".into())
+                                      })?,
+                                  });
+                              }
+                              reads = Some(out);
+                          }
+                          "writes" => {
+                              let count = r.array()?;
+                              if count > MAX_ITEMS {
+                                  return Err(Error::Corrupt(
+                                      "contribution write count exceeds limit".into(),
+                                  ));
+                              }
+                              let mut out = Vec::with_capacity(count as usize);
+                              for _ in 0..count {
+                                  out.push(r.text()?);
+                              }
+                              writes = Some(out);
+                          }
+                          "agent" => agent = Some(r.text()?),
+                          "ts" => ts = Some(r.u64()?),
+                          _ => {
+                              return Err(Error::Corrupt(format!(
+                                  "unknown contribution key {key}"
+                              )))
+                          }
+                      }
+                  }
+                  if !r.at_end() {
+                      return Err(Error::Corrupt(
+                          "contribution header trailing bytes".into(),
+                      ));
+                  }
+                  let value = Contribution {
+                      base: base.ok_or_else(|| Error::Corrupt("contribution base".into()))?,
+                      tree: tree.ok_or_else(|| Error::Corrupt("contribution tree".into()))?,
+                      parents: parents
+                          .ok_or_else(|| Error::Corrupt("contribution parents".into()))?,
+                      reads: reads.ok_or_else(|| Error::Corrupt("contribution reads".into()))?,
+                      writes: writes
+                          .ok_or_else(|| Error::Corrupt("contribution writes".into()))?,
+                      agent: agent.ok_or_else(|| Error::Corrupt("contribution agent".into()))?,
+                      ts: ts.ok_or_else(|| Error::Corrupt("contribution ts".into()))?,
+                  };
+                  value
+                      .validate()
+                      .map_err(|e| Error::Corrupt(e.to_string()))?;
+                  if value.encode()? != bytes {
+                      return Err(Error::Corrupt(
+                          "non-canonical contribution encoding".into(),
+                      ));
+                  }
+                  Ok(value)
+              }
+          }
+          RS
+
+          cat > crates/forge-core/tests/contribution.rs <<'RS'
+          use forge_core::{hash_bytes, Commit, Contribution, ContributionRead};
+          use forge_types::{hex_encode, ObjectId};
+
+          fn sample() -> Contribution {
+              Contribution {
+                  base: ObjectId([0x10; 32]),
+                  tree: ObjectId([0x20; 32]),
+                  parents: vec![ObjectId([0x30; 32])],
+                  reads: vec![
+                      ContributionRead {
+                          path: "Cargo.lock".into(),
+                          id: ObjectId([0x40; 32]),
+                      },
+                      ContributionRead {
+                          path: "src/lib.rs".into(),
+                          id: ObjectId([0x41; 32]),
+                      },
+                  ],
+                  writes: vec!["README.md".into(), "src/lib.rs".into()],
+                  agent: "agent-a".into(),
+                  ts: 1,
+              }
+          }
+
+          #[test]
+          fn contribution_roundtrip_and_golden_encoding() {
+              let value = sample();
+              let bytes = value.encode().unwrap();
+              assert_eq!(Contribution::decode(&bytes).unwrap(), value);
+              assert_eq!(
+                  hex_encode(&bytes),
+                  include_str!("../../../testdata/canonical/contribution.hex").trim()
+              );
+              assert_eq!(
+                  hash_bytes(&bytes).hex(),
+                  include_str!("../../../testdata/canonical/contribution.oid").trim()
+              );
+          }
+
+          #[test]
+          fn contribution_rejects_noncanonical_uint() {
+              let mut bytes = sample().encode().unwrap();
+              // Canonical map sorting puts the two-byte key "ts" first. With ts=1,
+              // the value is the one-byte uint 0x01 at header offset 4.
+              assert_eq!(&bytes[6..10], &[0x62, b't', b's', 0x01]);
+              let header_len = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+              bytes[1..5].copy_from_slice(&(header_len + 1).to_be_bytes());
+              bytes.splice(9..10, [0x18, 0x01]);
+              assert!(Contribution::decode(&bytes).is_err());
+          }
+
+          #[test]
+          fn missing_contribution_preserves_old_commit_identity() {
+              let commit = Commit {
+                  tree: ObjectId([0x22; 32]),
+                  parents: vec![ObjectId([0x33; 32]), ObjectId([0x44; 32])],
+                  agent: "golden".into(),
+                  msg: "v1".into(),
+                  ts: 42,
+                  landmark: true,
+                  contrib: None,
+              };
+              assert_eq!(
+                  hash_bytes(&commit.encode()).hex(),
+                  include_str!("../../../testdata/canonical/commit.oid").trim()
+              );
+              assert_eq!(Commit::decode(&commit.encode()).unwrap().contrib, None);
+          }
+
+          #[test]
+          fn contribution_reference_is_optional_and_hashed_when_present() {
+              let mut commit = Commit {
+                  tree: ObjectId([0x22; 32]),
+                  parents: vec![],
+                  agent: "agent-a".into(),
+                  msg: "with receipt".into(),
+                  ts: 2,
+                  landmark: false,
+                  contrib: None,
+              };
+              let old = hash_bytes(&commit.encode());
+              commit.contrib = Some(hash_bytes(&sample().encode().unwrap()));
+              let encoded = commit.encode();
+              assert_ne!(hash_bytes(&encoded), old);
+              assert_eq!(Commit::decode(&encoded).unwrap(), commit);
+          }
+          RS
+
+          mkdir -p crates/forge-core/examples testdata/canonical
+          cat > crates/forge-core/examples/generate_contribution_golden.rs <<'RS'
+          use forge_core::{hash_bytes, Contribution, ContributionRead};
+          use forge_types::{hex_encode, ObjectId};
+
+          fn main() {
+              let value = Contribution {
+                  base: ObjectId([0x10; 32]),
+                  tree: ObjectId([0x20; 32]),
+                  parents: vec![ObjectId([0x30; 32])],
+                  reads: vec![
+                      ContributionRead { path: "Cargo.lock".into(), id: ObjectId([0x40; 32]) },
+                      ContributionRead { path: "src/lib.rs".into(), id: ObjectId([0x41; 32]) },
+                  ],
+                  writes: vec!["README.md".into(), "src/lib.rs".into()],
+                  agent: "agent-a".into(),
+                  ts: 1,
+              };
+              let bytes = value.encode().unwrap();
+              println!("{}", hex_encode(&bytes));
+              eprintln!("{}", hash_bytes(&bytes));
+          }
+          RS
+
+          cargo fmt --all
+          cargo run --locked --quiet -p forge-core --example generate_contribution_golden > /tmp/contrib.hex 2> /tmp/contrib.oid
+          tr -d '\n' < /tmp/contrib.hex > testdata/canonical/contribution.hex
+          printf '\n' >> testdata/canonical/contribution.hex
+          tail -n 1 /tmp/contrib.oid | tr -d '\n' > testdata/canonical/contribution.oid
+          printf '\n' >> testdata/canonical/contribution.oid
+          rm crates/forge-core/examples/generate_contribution_golden.rs
+          rmdir crates/forge-core/examples || true
+
+          cargo test --locked -p forge-core --all-targets
+          cargo check --locked --workspace --all-targets
+          rm -f .github/worker-trigger-108
+          git rm .github/workflows/autopatch-contribution-108.yml
+          git add crates fuzz testdata/canonical
+          git commit -m 'object: add canonical Contribution type 0x06 (#108)'
+          git push origin HEAD:objects/contribution-108
