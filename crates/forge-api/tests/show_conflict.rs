@@ -43,19 +43,43 @@ fn show_conflict_exposes_both_sides_and_typed_path_oids() {
     let root = forge.root_cap().unwrap();
     let s = store(d.path());
     let main = s.meta.get_ref("main").unwrap().unwrap();
-    let base = s.get_commit(main.oid).unwrap();
     let ours = commit(&s, tree(&s, b"ours"), main.oid, 1);
     let theirs = commit(&s, tree(&s, b"theirs"), main.oid, 2);
-    s.meta.insert_ref("heads/ours", ours, "commit", false, false, "test", "test").unwrap();
-    s.meta.insert_ref("heads/theirs", theirs, "commit", false, false, "test", "test").unwrap();
+    s.meta
+        .insert_ref(
+            "heads/ours",
+            ours,
+            "commit",
+            false,
+            false,
+            "test",
+            "test",
+        )
+        .unwrap();
+    s.meta
+        .insert_ref(
+            "heads/theirs",
+            theirs,
+            "commit",
+            false,
+            false,
+            "test",
+            "test",
+        )
+        .unwrap();
 
-    let err = forge.merge(&root, "heads/ours", "heads/theirs", None).unwrap_err();
-    let Error::MergeConflict(oid) = err else { panic!("expected conflict: {err:?}"); };
+    let err = forge
+        .merge(&root, "heads/ours", "heads/theirs", None)
+        .unwrap_err();
+    let Error::MergeConflict(oid) = err else {
+        panic!("expected conflict: {err:?}");
+    };
+    let conflict = s.get_conflict(oid).unwrap();
     let rendered = forge.show(&root, &oid.hex()).unwrap();
 
     assert!(rendered.contains(&format!("conflict {oid}")));
-    assert!(rendered.contains(&format!("ours {}", base.tree)) || rendered.contains("ours "));
-    assert!(rendered.contains("theirs "));
+    assert!(rendered.contains(&format!("ours {}", conflict.ours)));
+    assert!(rendered.contains(&format!("theirs {}", conflict.theirs)));
     assert!(rendered.contains("path same.txt a="));
     assert!(rendered.contains(" b="));
     assert!(rendered.contains(" base="));
