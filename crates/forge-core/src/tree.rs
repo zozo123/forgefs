@@ -101,21 +101,19 @@ fn apply_level(
     let mut files: BTreeMap<String, Option<(ObjectId, bool)>> = BTreeMap::new();
 
     for (path, op) in overlay {
-        let rest = if prefix.is_empty() {
-            path.as_str()
-        } else {
-            match path.strip_prefix(prefix) {
-                Some(r) if prefix.is_empty() => r,
-                Some(r) => r.strip_prefix('/').unwrap_or(r),
-                None => continue,
-            }
+        let rest = match strip_path_prefix(path, prefix) {
+            Some(r) => r,
+            None => continue,
         };
         if rest.is_empty() {
             continue;
         }
         if rest.contains('/') {
             let (first, _) = rest.split_once('/').unwrap();
-            groups.entry(first.to_string()).or_default().insert(path.clone(), *op);
+            groups
+                .entry(first.to_string())
+                .or_default()
+                .insert(path.clone(), *op);
         } else {
             files.insert(rest.to_string(), *op);
         }
@@ -169,6 +167,23 @@ fn apply_level(
 
     let tree = Tree::new(entries.into_values().collect())?;
     store.put_tree(&tree)
+}
+
+/// Strip a directory prefix only on a `/` boundary (`dir` does not match `dir2`).
+fn strip_path_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return Some(path);
+    }
+    if path == prefix {
+        return Some("");
+    }
+    if path.len() > prefix.len()
+        && path.as_bytes().get(prefix.len()) == Some(&b'/')
+        && path.starts_with(prefix)
+    {
+        return Some(&path[prefix.len() + 1..]);
+    }
+    None
 }
 
 pub fn split_path(path: &str) -> Result<Vec<String>> {
@@ -246,5 +261,19 @@ mod apply_tests {
         assert_eq!(sub2.entries.len(), 1);
         assert_eq!(sub2.entries[0].name, "b.txt");
         assert!(sub2.entries[0].exec);
+    }
+
+    #[test]
+    fn overlay_prefix_is_path_atomic() {
+        let store = Mem(Mutex::new(HashMap::new()));
+        let a = ObjectId([4u8; 32]);
+        let b = ObjectId([5u8; 32]);
+        let mut ov = Overlay::new();
+        ov.insert("dir/a.txt".into(), Some((a, false)));
+        ov.insert("dir2/b.txt".into(), Some((b, false)));
+        let root = apply_overlay(None, &ov, &store).unwrap();
+        let t = store.get_tree(root).unwrap();
+        let names: Vec<_> = t.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["dir", "dir2"]);
     }
 }

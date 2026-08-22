@@ -7,7 +7,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "forge", version, about = "Content-addressable filesystem for agents")]
+#[command(
+    name = "forge",
+    version,
+    about = "Content-addressable filesystem for agents"
+)]
 struct Cli {
     /// Forge directory (or a parent of .forge). Env FORGE_DIR.
     #[arg(long, global = true, env = "FORGE_DIR")]
@@ -239,10 +243,7 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             from,
             resolved,
         } => {
-            let res = resolved
-                .as_deref()
-                .map(ObjectId::from_hex)
-                .transpose()?;
+            let res = resolved.as_deref().map(ObjectId::from_hex).transpose()?;
             match f.merge(cap, &into, &from, res) {
                 Ok(CasResult::Updated { name, oid }) => println!("merged {name} {oid}"),
                 Ok(CasResult::Forked { fork, .. }) => println!("merge forked {fork}"),

@@ -33,7 +33,10 @@ impl Forge {
     pub fn init(dir: &Path) -> Result<Self> {
         let root = forge_root(dir);
         if root.join("VERSION").exists() {
-            return Err(Error::Invalid(format!("already a forge: {}", root.display())));
+            return Err(Error::Invalid(format!(
+                "already a forge: {}",
+                root.display()
+            )));
         }
         fs::create_dir_all(root.join("keys"))?;
         fs::create_dir_all(root.join("objects"))?;
@@ -60,8 +63,11 @@ impl Forge {
 
         let root_cap = mint_root(&hmac_key)?;
         let integ = mint_integrator(&hmac_key)?;
-        fs::write(root.join("keys/root.cap"), root_cap.to_token())?;
-        fs::write(root.join("keys/integrator.cap"), integ.to_token())?;
+        write_secret(root.join("keys/root.cap"), root_cap.to_token().as_bytes())?;
+        write_secret(
+            root.join("keys/integrator.cap"),
+            integ.to_token().as_bytes(),
+        )?;
 
         let empty = store.empty_tree_id()?;
         let commit = Commit {
@@ -90,10 +96,18 @@ impl Forge {
 
     pub fn open(dir: &Path) -> Result<Self> {
         let root = find_forge(dir)?;
-        if root.join("LOCK").exists() && root.join("forge.sock").exists() {
-            return Err(Error::Busy(
-                "daemon holds LOCK; speak the socket or stop forge serve".into(),
-            ));
+        let sock = root.join("forge.sock");
+        if sock.exists() {
+            match std::os::unix::net::UnixStream::connect(&sock) {
+                Ok(_) => {
+                    return Err(Error::Busy(
+                        "daemon is running; use the socket or stop forge serve".into(),
+                    ));
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&sock);
+                }
+            }
         }
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
@@ -133,6 +147,39 @@ impl Forge {
         cap.allows(op, r#ref, now_ms())
     }
 
+    /// Root/integrator tokens have no `agent=` caveat and may administer all sessions.
+    fn is_unscoped(cap: &Cap) -> bool {
+        cap.agent.is_none()
+    }
+
+    fn require_ns(&self, cap: &Cap, ns: &str) -> Result<forge_store::NsRow> {
+        let row = self.store.meta.get_namespace(ns)?;
+        if Self::is_unscoped(cap) || row.agent_id == cap.agent_id() {
+            Ok(row)
+        } else {
+            Err(Error::Denied(format!(
+                "namespace {ns} is owned by {}, not {}",
+                row.agent_id,
+                cap.agent_id()
+            )))
+        }
+    }
+
+    fn check_spec_read(&self, cap: &Cap, spec: &str) -> Result<()> {
+        match parse_spec(spec)? {
+            Spec::Ref(n) => self.check(cap, Op::Read, Some(&n)),
+            Spec::Oid(_) => {
+                if Self::is_unscoped(cap) {
+                    self.check(cap, Op::Read, None)
+                } else {
+                    Err(Error::Denied(
+                        "ref-scoped caps cannot address raw object ids".into(),
+                    ))
+                }
+            }
+        }
+    }
+
     pub fn grant(&self, cap: &Cap, extra: Vec<String>) -> Result<Cap> {
         self.check(cap, Op::Grant, None)?;
         attenuate(&self.hmac_key, cap, extra)
@@ -140,7 +187,13 @@ impl Forge {
 
     pub fn refs(&self, cap: &Cap) -> Result<Vec<RefRow>> {
         self.check(cap, Op::Read, None)?;
-        self.store.meta.list_refs()
+        let mut out = Vec::new();
+        for r in self.store.meta.list_refs()? {
+            if cap.allows(Op::Read, Some(&r.name), now_ms()).is_ok() {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     pub fn peel_commit(&self, spec: &str) -> Result<(ObjectId, Commit)> {
@@ -191,26 +244,32 @@ impl Forge {
         self.store
             .meta
             .insert_mount(&ns_id, "/", &format!("ref:{live}"), "rw")?;
-        self.store
-            .meta
-            .insert_mount(&ns_id, "/main", "ref:main", "ro")?;
+        if cap.allows(Op::Read, Some("main"), now_ms()).is_ok() {
+            self.store
+                .meta
+                .insert_mount(&ns_id, "/main", "ref:main", "ro")?;
+        }
         let _ = commit;
         Ok(ns_id)
     }
 
     pub fn mount(&self, cap: &Cap, ns: &str, path: &str, spec: &str, rw: bool) -> Result<()> {
+        self.require_ns(cap, ns)?;
         let path = normalize_abs(path)?;
         let mode = if rw { "rw" } else { "ro" };
         if rw {
             if let Spec::Ref(n) = parse_spec(spec)? {
                 self.check(cap, Op::Write, Some(&n))?;
-            } else {
+            } else if Self::is_unscoped(cap) {
                 self.check(cap, Op::Write, None)?;
+            } else {
+                return Err(Error::Denied(
+                    "ref-scoped caps cannot mount raw oids read-write".into(),
+                ));
             }
         } else {
-            self.check(cap, Op::Read, None)?;
+            self.check_spec_read(cap, spec)?;
         }
-        self.store.meta.get_namespace(ns)?;
         self.store.meta.insert_mount(ns, &path, spec, mode)?;
         Ok(())
     }
@@ -231,17 +290,20 @@ impl Forge {
             ObjectType::Commit => Ok(self.store.get_commit(oid)?.tree),
             ObjectType::Snapshot => Ok(self.store.get_snapshot(oid)?.tree),
             ObjectType::Tree => Ok(oid),
-            other => Err(Error::Invalid(format!(
-                "cannot mount {}",
-                other.as_str()
-            ))),
+            other => Err(Error::Invalid(format!("cannot mount {}", other.as_str()))),
         }
     }
 
-    pub fn ls(&self, cap: &Cap, ns: &str, path: &str) -> Result<Vec<(String, String, String, bool)>> {
-        self.check(cap, Op::Read, None)?;
+    pub fn ls(
+        &self,
+        cap: &Cap,
+        ns: &str,
+        path: &str,
+    ) -> Result<Vec<(String, String, String, bool)>> {
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
+        self.check_spec_read(cap, &m.spec)?;
         let rel = rel_of(&m.path, path)?;
         let tree = self.mount_tree(&m.spec)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
@@ -263,9 +325,10 @@ impl Forge {
     }
 
     pub fn read(&self, cap: &Cap, ns: &str, path: &str) -> Result<Vec<u8>> {
-        self.check(cap, Op::Read, None)?;
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
+        self.check_spec_read(cap, &m.spec)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
         let tree = self.mount_tree(&m.spec)?;
         match resolve(&self.store, &mounts, &ov, tree, path)? {
@@ -274,7 +337,15 @@ impl Forge {
         }
     }
 
-    pub fn write(&self, cap: &Cap, ns: &str, path: &str, data: &[u8], exec: bool) -> Result<ObjectId> {
+    pub fn write(
+        &self,
+        cap: &Cap,
+        ns: &str,
+        path: &str,
+        data: &[u8],
+        exec: bool,
+    ) -> Result<ObjectId> {
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         if m.mode != Mode::Rw {
@@ -300,6 +371,7 @@ impl Forge {
     }
 
     pub fn delete(&self, cap: &Cap, ns: &str, path: &str) -> Result<()> {
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         if m.mode != Mode::Rw {
@@ -311,11 +383,14 @@ impl Forge {
             self.check(cap, Op::Write, None)?;
         }
         let rel = rel_of(&m.path, path)?;
-        self.store.meta.overlay_upsert(ns, &m.path, &rel, None, false)?;
+        self.store
+            .meta
+            .overlay_upsert(ns, &m.path, &rel, None, false)?;
         Ok(())
     }
 
     pub fn checkin(&self, cap: &Cap, ns: &str, mount: &str, msg: &str) -> Result<CasResult> {
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, mount)?;
         if m.mode != Mode::Rw {
@@ -359,17 +434,18 @@ impl Forge {
             "commit",
             cap.agent_id(),
             cap.agent_id(),
+            false,
         )?;
         match &result {
-            CasResult::Updated { .. } => {
+            CasResult::Updated { .. } | CasResult::Forked { .. } => {
                 self.store.meta.overlay_clear(ns, &m.path)?;
             }
-            CasResult::Forked { fork, .. } => {
-                self.store
-                    .meta
-                    .update_mount_spec(ns, &m.path, &format!("ref:{fork}"))?;
-            }
             CasResult::Noop { .. } => {}
+        }
+        if let CasResult::Forked { fork, .. } = &result {
+            self.store
+                .meta
+                .update_mount_spec(ns, &m.path, &format!("ref:{fork}"))?;
         }
         Ok(result)
     }
@@ -403,6 +479,9 @@ impl Forge {
         let ours_c = self.store.get_commit(into_row.oid)?;
         let (theirs_oid, theirs_c) = self.peel_commit(from)?;
         let tree = if let Some(t) = resolved {
+            if self.store.object_type(t)? != ObjectType::Tree {
+                return Err(Error::Invalid("resolved oid is not a tree".into()));
+            }
             t
         } else {
             let base = lca(&self.store, into_row.oid, theirs_oid)?;
@@ -447,6 +526,7 @@ impl Forge {
             "commit",
             cap.agent_id(),
             cap.agent_id(),
+            into_row.protected,
         )
     }
 
@@ -499,21 +579,9 @@ impl Forge {
         let sig: Signature = sk.sign(h.as_bytes());
         snap.sig = sig.to_bytes();
         let snap_oid = self.store.put_snapshot(&snap)?;
-        let tag_ref = format!("tags/{tag}");
-        self.store.meta.insert_ref(
-            &tag_ref,
-            snap_oid,
-            "snapshot",
-            true,
-            true,
-            cap.agent_id(),
-            "seal",
-        )?;
         self.store
             .meta
-            .insert_seal(tag, snap_oid, row.oid, commit.tree)?;
-        self.store.meta.landmark(snap_oid, "snapshot", "seal")?;
-        self.store.meta.landmark(row.oid, "commit", "seal")?;
+            .commit_seal(tag, snap_oid, row.oid, commit.tree, cap.agent_id())?;
         Ok(snap_oid)
     }
 
@@ -525,18 +593,22 @@ impl Forge {
             .get_seal(tag)?
             .ok_or_else(|| Error::NotFound(format!("tag {tag}")))?;
         let snap = self.store.get_snapshot(snap_oid)?;
+        if snap.pk != self.seal_pk {
+            return Err(Error::Corrupt(
+                "snapshot key is not this forge's seal key".into(),
+            ));
+        }
         if snap.tree != tree {
             return Err(Error::Corrupt("seal table tree mismatch".into()));
         }
         let unsigned = snap.encode_unsigned();
         let h = hash_bytes(&unsigned);
-        let pk = VerifyingKey::from_bytes(&snap.pk)
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
+        let pk = VerifyingKey::from_bytes(&snap.pk).map_err(|e| Error::Corrupt(e.to_string()))?;
         let sig = Signature::from_bytes(&snap.sig);
         pk.verify(h.as_bytes(), &sig)
             .map_err(|_| Error::Corrupt("snapshot signature".into()))?;
         let walked = self.store.reachable_oids(snap.tree)?;
-        if walked.is_empty() || walked[0] != snap.tree {
+        if !walked.iter().any(|id| *id == snap.tree) {
             return Err(Error::Corrupt("tree walk".into()));
         }
         // re-hash every object file
@@ -547,7 +619,7 @@ impl Forge {
     }
 
     pub fn export_tar(&self, cap: &Cap, spec: &str, out: &Path) -> Result<()> {
-        self.check(cap, Op::Read, None)?;
+        self.check_spec_read(cap, spec)?;
         crate::export::export_tar(&self.store, self.resolve_tree(spec)?, out)
     }
 
@@ -585,6 +657,7 @@ impl Forge {
                     "commit",
                     cap.agent_id(),
                     cap.agent_id(),
+                    false,
                 )?;
             }
             None => {
@@ -625,7 +698,11 @@ impl Forge {
             self.resolve_spec_oid(spec)?
         };
         let bytes = self.store.get_raw(oid)?;
-        Ok(format!("{} {} bytes", self.store.object_type(oid)?.as_str(), bytes.len()))
+        Ok(format!(
+            "{} {} bytes",
+            self.store.object_type(oid)?.as_str(),
+            bytes.len()
+        ))
     }
 }
 
@@ -725,7 +802,10 @@ fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
 fn read32(path: &Path) -> Result<[u8; 32]> {
     let v = fs::read(path)?;
     if v.len() != 32 {
-        return Err(Error::Corrupt(format!("expected 32 bytes in {}", path.display())));
+        return Err(Error::Corrupt(format!(
+            "expected 32 bytes in {}",
+            path.display()
+        )));
     }
     let mut a = [0u8; 32];
     a.copy_from_slice(&v);
@@ -773,8 +853,9 @@ mod tests {
                         vec![
                             format!("ops=read,write,branch"),
                             format!("agent=w{i}"),
-                            format!("ref=heads/agents/*"),
-                            format!("ref=main"),
+                            // One ref set: OR of private heads and the snapshot of main.
+                            // Two separate `ref=` caveats would AND and deny `session_open` from main.
+                            format!("ref=heads/agents/*,main"),
                         ],
                     )
                     .unwrap();
@@ -916,5 +997,90 @@ mod tests {
         };
         let err = f.merge(&cap, &r3, &r4, None).unwrap_err();
         assert!(matches!(err, Error::MergeConflict(_)));
+    }
+
+    #[test]
+    fn agent_cannot_checkin_protected_main() {
+        let (_d, f, cap) = setup();
+        let agent = f
+            .grant(
+                &cap,
+                vec![
+                    "ops=read,write,branch".into(),
+                    "agent=mallory".into(),
+                    "ref=main,heads/agents/*".into(),
+                ],
+            )
+            .unwrap();
+        let ns = f.session_open(&agent, "main").unwrap();
+        f.mount(&agent, &ns, "/", "ref:main", true).unwrap();
+        f.write(&agent, &ns, "/evil.txt", b"nope", false).unwrap();
+        let err = f.checkin(&agent, &ns, "/", "clobber main").unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+    }
+
+    #[test]
+    fn agents_cannot_read_each_others_namespaces() {
+        let (_d, f, cap) = setup();
+        let alice = f
+            .grant(
+                &cap,
+                vec![
+                    "ops=read,write,branch".into(),
+                    "agent=alice".into(),
+                    "ref=heads/agents/alice/*,main".into(),
+                ],
+            )
+            .unwrap();
+        let bob = f
+            .grant(
+                &cap,
+                vec![
+                    "ops=read,write,branch".into(),
+                    "agent=bob".into(),
+                    "ref=heads/agents/bob/*,main".into(),
+                ],
+            )
+            .unwrap();
+        let a_ns = f.session_open(&alice, "main").unwrap();
+        let _b_ns = f.session_open(&bob, "main").unwrap();
+        f.write(&alice, &a_ns, "/secret.txt", b"alice", false)
+            .unwrap();
+        let err = f.read(&bob, &a_ns, "/secret.txt").unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+    }
+
+    #[test]
+    fn tampered_object_fails_verify() {
+        let d = tempdir().unwrap();
+        let f = Forge::init(d.path()).unwrap();
+        let cap = f.root_cap().unwrap();
+        let integ = f.integrator_cap().unwrap();
+        let ns = f.session_open(&cap, "main").unwrap();
+        f.write(&cap, &ns, "/paper.txt", b"final", false).unwrap();
+        let CasResult::Updated { name, .. } = f.checkin(&cap, &ns, "/", "paper").unwrap() else {
+            panic!("expected update");
+        };
+        f.merge(&integ, "main", &name, None).unwrap();
+        f.seal(&integ, "main", "v1.0").unwrap();
+        f.verify_tag(&cap, "v1.0").unwrap();
+        let obj_root = f.root().join("objects");
+        drop(f);
+        let mut stack = vec![obj_root];
+        while let Some(p) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        let _ = std::fs::write(&p, b"tamper");
+                    }
+                }
+            }
+        }
+        let f = Forge::open(d.path()).unwrap();
+        let cap = f.root_cap().unwrap();
+        assert!(f.verify_tag(&cap, "v1.0").is_err());
     }
 }

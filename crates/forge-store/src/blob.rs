@@ -38,16 +38,10 @@ impl LocalBlobStore {
             .ok_or_else(|| Error::Internal("object path has no parent".into()))?;
         fs::create_dir_all(parent)?;
         fs::create_dir_all(self.root.join("tmp"))?;
-        let tmp = self
-            .root
-            .join("tmp")
-            .join(ulid::Ulid::new().to_string());
+        let tmp = self.root.join("tmp").join(ulid::Ulid::new().to_string());
 
         {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
             // The bytes themselves must reach stable storage before publication.
             f.sync_all()?;
@@ -120,9 +114,7 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(s.get(a).unwrap(), b"abc");
         assert_eq!(
-            std::fs::read_dir(d.path().join("objects"))
-                .unwrap()
-                .count(),
+            std::fs::read_dir(d.path().join("objects")).unwrap().count(),
             1
         );
     }

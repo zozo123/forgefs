@@ -166,7 +166,10 @@ impl<'a> Reader<'a> {
     pub fn bstr32(&mut self) -> Result<[u8; 32]> {
         let b = self.bytes()?;
         if b.len() != 32 {
-            return Err(Error::Corrupt(format!("expected 32-byte bstr, got {}", b.len())));
+            return Err(Error::Corrupt(format!(
+                "expected 32-byte bstr, got {}",
+                b.len()
+            )));
         }
         let mut a = [0u8; 32];
         a.copy_from_slice(b);

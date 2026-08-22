@@ -104,7 +104,12 @@ fn merge_trees(
     let b = their_tree.unwrap();
     let g = base_tree.unwrap_or_else(Tree::default);
     let mut names = HashSet::new();
-    for e in a.entries.iter().chain(b.entries.iter()).chain(g.entries.iter()) {
+    for e in a
+        .entries
+        .iter()
+        .chain(b.entries.iter())
+        .chain(g.entries.iter())
+    {
         names.insert(e.name.clone());
     }
     let am = a.as_map();
@@ -166,14 +171,8 @@ fn merge_trees(
                     continue;
                 }
                 if x.kind == EntryKind::Tree && y.kind == EntryKind::Tree {
-                    let merged = merge_trees(
-                        store,
-                        &child_path,
-                        g.map(|g| g.id),
-                        x.id,
-                        y.id,
-                        conflicts,
-                    )?;
+                    let merged =
+                        merge_trees(store, &child_path, g.map(|g| g.id), x.id, y.id, conflicts)?;
                     let mut e = x.clone();
                     e.id = merged;
                     out.push(e);
@@ -192,7 +191,10 @@ fn merge_trees(
     store.put_tree(&Tree::new(out)?)
 }
 
-pub fn commit_parent_map(store: &Store, start: ObjectId) -> Result<HashMap<ObjectId, Vec<ObjectId>>> {
+pub fn commit_parent_map(
+    store: &Store,
+    start: ObjectId,
+) -> Result<HashMap<ObjectId, Vec<ObjectId>>> {
     let mut m = HashMap::new();
     let mut q = vec![start];
     let mut seen = HashSet::new();

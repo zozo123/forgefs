@@ -12,7 +12,10 @@ pub use tree::{apply_overlay, split_path, validate_name, Overlay, Tree, TreeEntr
 use forge_types::{ObjectId, Result};
 
 pub fn put_blob_bytes(data: &[u8]) -> (ObjectId, Vec<u8>) {
-    let file = Blob { data: data.to_vec() }.encode();
+    let file = Blob {
+        data: data.to_vec(),
+    }
+    .encode();
     (hash_bytes(&file), file)
 }
 

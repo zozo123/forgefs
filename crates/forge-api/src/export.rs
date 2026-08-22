@@ -49,8 +49,7 @@ fn write_tree(store: &Store, b: &mut Builder<File>, prefix: &str, tree: ObjectId
                 let mut h = Header::new_ustar();
                 if h.set_path(&path).is_err() {
                     h = Header::new_gnu();
-                    h.set_path(&path)
-                        .map_err(|e| Error::Io(e.to_string()))?;
+                    h.set_path(&path).map_err(|e| Error::Io(e.to_string()))?;
                 }
                 h.set_entry_type(tar::EntryType::Regular);
                 h.set_mode(if e.exec { 0o755 } else { 0o644 });
@@ -68,5 +67,3 @@ fn write_tree(store: &Store, b: &mut Builder<File>, prefix: &str, tree: ObjectId
     }
     Ok(())
 }
-
-

@@ -220,7 +220,9 @@ impl Meta {
         Ok(())
     }
 
-    /// Compare-and-swap. `allow_protected` is checked by the caller; we still refuse sealed.
+    /// Compare-and-swap. Protected refs (e.g. `main`) only move when
+    /// `allow_protected` is true (merge/seal). Ordinary checkin/import never
+    /// fork a protected name — they are denied.
     pub fn cas_ref(
         &self,
         name: &str,
@@ -229,6 +231,7 @@ impl Meta {
         kind: &str,
         agent_id: &str,
         fork_agent: &str,
+        allow_protected: bool,
     ) -> Result<CasResult> {
         let mut conn = self.write.lock();
         let tx = conn
@@ -270,10 +273,15 @@ impl Meta {
             });
         }
 
-        let (oid_b, _k, _prot, sealed) = row.unwrap();
+        let (oid_b, _k, prot, sealed) = row.unwrap();
         let current = oid_from_blob(oid_b)?;
         if sealed != 0 {
             return Err(Error::Sealed(name.to_string()));
+        }
+        if prot != 0 && !allow_protected {
+            return Err(Error::Denied(format!(
+                "ref {name} is protected; only merge/seal may advance it"
+            )));
         }
 
         let n = tx
@@ -385,7 +393,12 @@ impl Meta {
         conn.query_row(
             "SELECT id, agent_id FROM namespaces WHERE id=?1",
             [id],
-            |r| Ok(NsRow { id: r.get(0)?, agent_id: r.get(1)? }),
+            |r| {
+                Ok(NsRow {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                })
+            },
         )
         .map_err(|_| Error::NotFound(format!("namespace {id}")))
     }
@@ -478,12 +491,7 @@ impl Meta {
         Ok(())
     }
 
-    pub fn intro_insert(
-        &self,
-        oid: ObjectId,
-        commit: ObjectId,
-        agent_id: &str,
-    ) -> Result<()> {
+    pub fn intro_insert(&self, oid: ObjectId, commit: ObjectId, agent_id: &str) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
             "INSERT OR IGNORE INTO object_intro (oid, commit_oid, agent_id, ts_ms) VALUES (?1,?2,?3,?4)",
@@ -526,9 +534,35 @@ impl Meta {
         commit: ObjectId,
         tree: ObjectId,
     ) -> Result<()> {
-        let conn = self.write.lock();
+        self.commit_seal(tag, snap, commit, tree, "seal")
+    }
+
+    /// Atomically publish a sealed tag: refs row + seals row + landmarks.
+    pub fn commit_seal(
+        &self,
+        tag: &str,
+        snap: ObjectId,
+        commit: ObjectId,
+        tree: ObjectId,
+        agent_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
         let ts = now_ms() as i64;
-        conn.execute(
+        let tag_ref = format!("tags/{tag}");
+        tx.execute(
+            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'snapshot',1,1,?3)",
+            params![tag_ref, snap.as_bytes().as_slice(), ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, 'seal', ?4)",
+            params![tag_ref, snap.as_bytes().as_slice(), agent_id, ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
             "INSERT INTO seals (tag, snap_oid, commit_oid, tree_oid, ts_ms) VALUES (?1,?2,?3,?4,?5)",
             params![
                 tag,
@@ -539,6 +573,17 @@ impl Meta {
             ],
         )
         .map_err(map_sql)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO landmarks (oid, kind, reason, ts_ms) VALUES (?1,'snapshot','seal',?2)",
+            params![snap.as_bytes().as_slice(), ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO landmarks (oid, kind, reason, ts_ms) VALUES (?1,'commit','seal',?2)",
+            params![commit.as_bytes().as_slice(), ts],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
         Ok(())
     }
 
@@ -561,7 +606,11 @@ impl Meta {
         .transpose()
     }
 
-    pub fn reflog(&self, name: &str, limit: usize) -> Result<Vec<(Option<ObjectId>, ObjectId, String, String)>> {
+    pub fn reflog(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<(Option<ObjectId>, ObjectId, String, String)>> {
         let conn = self.write.lock();
         let mut stmt = conn
             .prepare(
@@ -629,8 +678,10 @@ mod tests {
             .unwrap();
         let m1 = meta.clone();
         let m2 = meta.clone();
-        let h1 = thread::spawn(move || m1.cas_ref("shared", oid(1), oid(2), "commit", "a", "a"));
-        let h2 = thread::spawn(move || m2.cas_ref("shared", oid(1), oid(3), "commit", "b", "b"));
+        let h1 =
+            thread::spawn(move || m1.cas_ref("shared", oid(1), oid(2), "commit", "a", "a", false));
+        let h2 =
+            thread::spawn(move || m2.cas_ref("shared", oid(1), oid(3), "commit", "b", "b", false));
         let r1 = h1.join().unwrap().unwrap();
         let r2 = h2.join().unwrap().unwrap();
         let results = [r1, r2];
@@ -644,5 +695,21 @@ mod tests {
             .count();
         assert_eq!(updates, 1, "{results:?}");
         assert_eq!(forks, 1, "{results:?}");
+    }
+
+    #[test]
+    fn protected_ref_cannot_cas_without_flag() {
+        let d = tempdir().unwrap();
+        let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
+        meta.insert_ref("main", oid(1), "commit", true, false, "init", "init")
+            .unwrap();
+        let err = meta
+            .cas_ref("main", oid(1), oid(2), "commit", "a", "a", false)
+            .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let ok = meta
+            .cas_ref("main", oid(1), oid(2), "commit", "a", "a", true)
+            .unwrap();
+        assert!(matches!(ok, CasResult::Updated { .. }));
     }
 }
