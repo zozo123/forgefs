@@ -7,12 +7,16 @@ use crate::cbor::{
 use crate::tree::{validate_name, Tree, TreeEntry};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 
+const MAX_TREE_ENTRIES: u64 = 100_000;
+const MAX_COMMIT_PARENTS: u64 = 1_024;
+const MAX_CONFLICT_ITEMS: u64 = 100_000;
+
 pub fn hash_bytes(bytes: &[u8]) -> ObjectId {
     ObjectId(*blake3::hash(bytes).as_bytes())
 }
 
 pub fn encode_file(ty: ObjectType, header: &[u8], payload: &[u8]) -> Vec<u8> {
-    let n = header.len() as u32;
+    let n = u32::try_from(header.len()).expect("Forge object header exceeds u32::MAX");
     let mut v = Vec::with_capacity(5 + header.len() + payload.len());
     v.push(ty as u8);
     v.extend_from_slice(&n.to_be_bytes());
@@ -27,11 +31,14 @@ pub fn parse_file(bytes: &[u8]) -> Result<(ObjectType, &[u8], &[u8])> {
     }
     let ty = ObjectType::from_u8(bytes[0])?;
     let n = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-    if 5 + n > bytes.len() {
+    let header_end = 5usize
+        .checked_add(n)
+        .ok_or_else(|| Error::Corrupt("object header length overflow".into()))?;
+    if header_end > bytes.len() {
         return Err(Error::Corrupt("object header truncated".into()));
     }
-    let header = &bytes[5..5 + n];
-    let payload = &bytes[5 + n..];
+    let header = &bytes[5..header_end];
+    let payload = &bytes[header_end..];
     Ok((ty, header, payload))
 }
 
@@ -57,15 +64,18 @@ impl Blob {
         let mut r = Reader::new(header);
         let n = r.map()?;
         let mut size = None;
+        let mut last = None;
         for _ in 0..n {
-            let k = r.text()?;
+            let k = r.text_map_key(&mut last)?;
             match k.as_str() {
                 "size" => size = Some(r.u64()?),
                 _ => return Err(Error::Corrupt(format!("unknown blob key {k}"))),
             }
         }
         let size = size.ok_or_else(|| Error::Corrupt("blob missing size".into()))?;
-        if size as usize != payload.len() {
+        let size =
+            usize::try_from(size).map_err(|_| Error::Corrupt("blob size overflow".into()))?;
+        if size != payload.len() {
             return Err(Error::Corrupt(format!(
                 "blob size {size} != payload {}",
                 payload.len()
@@ -127,7 +137,7 @@ impl Tree {
                 return Err(Error::Corrupt(format!("unknown tree key {k}")));
             }
             let m = r.array()?;
-            if m > 100_000 {
+            if m > MAX_TREE_ENTRIES {
                 return Err(Error::Corrupt("tree fanout exceeds limit".into()));
             }
             let mut v = Vec::with_capacity(m as usize);
@@ -142,7 +152,12 @@ impl Tree {
                     let fk = r.text_map_key(&mut last_ent)?;
                     match fk.as_str() {
                         "n" => name = Some(r.text()?),
-                        "k" => kind = Some(EntryKind::from_u8(r.u64()? as u8)?),
+                        "k" => {
+                            let raw = r.u64()?;
+                            let raw = u8::try_from(raw)
+                                .map_err(|_| Error::Corrupt("entry kind overflow".into()))?;
+                            kind = Some(EntryKind::from_u8(raw)?);
+                        }
                         "id" => id = Some(ObjectId(r.bstr32()?)),
                         "x" => exec = Some(r.bool()?),
                         _ => return Err(Error::Corrupt(format!("unknown entry key {fk}"))),
@@ -222,13 +237,17 @@ impl Commit {
         let mut msg = None;
         let mut ts = None;
         let mut lm = None;
+        let mut last = None;
         for _ in 0..n {
-            let k = r.text()?;
+            let k = r.text_map_key(&mut last)?;
             match k.as_str() {
                 "tree" => tree = Some(ObjectId(r.bstr32()?)),
                 "parents" => {
                     let m = r.array()?;
-                    let mut v = Vec::new();
+                    if m > MAX_COMMIT_PARENTS {
+                        return Err(Error::Corrupt("commit parent count exceeds limit".into()));
+                    }
+                    let mut v = Vec::with_capacity(m as usize);
                     for _ in 0..m {
                         v.push(ObjectId(r.bstr32()?));
                     }
@@ -240,6 +259,9 @@ impl Commit {
                 "lm" => lm = Some(r.bool()?),
                 _ => return Err(Error::Corrupt(format!("unknown commit key {k}"))),
             }
+        }
+        if !r.at_end() {
+            return Err(Error::Corrupt("commit header trailing bytes".into()));
         }
         Ok(Commit {
             tree: tree.ok_or_else(|| Error::Corrupt("commit tree".into()))?,
@@ -321,9 +343,12 @@ impl Conflict {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (ty, header, _) = parse_file(bytes)?;
+        let (ty, header, payload) = parse_file(bytes)?;
         if ty != ObjectType::Conflict {
             return Err(Error::Corrupt("not a conflict".into()));
+        }
+        if !payload.is_empty() {
+            return Err(Error::Corrupt("conflict has payload".into()));
         }
         let mut r = Reader::new(header);
         let n = r.map()?;
@@ -332,8 +357,9 @@ impl Conflict {
         let mut theirs = None;
         let mut paths = None;
         let mut causal = None;
+        let mut last = None;
         for _ in 0..n {
-            let k = r.text()?;
+            let k = r.text_map_key(&mut last)?;
             match k.as_str() {
                 "bases" => bases = Some(id_array(&mut r)?),
                 "ours" => ours = Some(ObjectId(r.bstr32()?)),
@@ -341,15 +367,19 @@ impl Conflict {
                 "causal" => causal = Some(id_array(&mut r)?),
                 "paths" => {
                     let m = r.array()?;
-                    let mut v = Vec::new();
+                    if m > MAX_CONFLICT_ITEMS {
+                        return Err(Error::Corrupt("conflict path count exceeds limit".into()));
+                    }
+                    let mut v = Vec::with_capacity(m as usize);
                     for _ in 0..m {
                         let kn = r.map()?;
                         let mut path = None;
                         let mut a = None;
                         let mut b = None;
                         let mut base = None;
+                        let mut last_path = None;
                         for _ in 0..kn {
-                            let fk = r.text()?;
+                            let fk = r.text_map_key(&mut last_path)?;
                             match fk.as_str() {
                                 "p" => path = Some(r.text()?),
                                 "a" => a = r.null_or(|r| Ok(ObjectId(r.bstr32()?)))?,
@@ -370,6 +400,9 @@ impl Conflict {
                 _ => return Err(Error::Corrupt(format!("unknown conflict key {k}"))),
             }
         }
+        if !r.at_end() {
+            return Err(Error::Corrupt("conflict header trailing bytes".into()));
+        }
         Ok(Conflict {
             bases: bases.unwrap_or_default(),
             ours: ours.ok_or_else(|| Error::Corrupt("conflict ours".into()))?,
@@ -389,7 +422,10 @@ fn opt_id(out: &mut Vec<u8>, id: Option<ObjectId>) {
 
 fn id_array(r: &mut Reader<'_>) -> Result<Vec<ObjectId>> {
     let m = r.array()?;
-    let mut v = Vec::new();
+    if m > MAX_CONFLICT_ITEMS {
+        return Err(Error::Corrupt("object id array exceeds limit".into()));
+    }
+    let mut v = Vec::with_capacity(m as usize);
     for _ in 0..m {
         v.push(ObjectId(r.bstr32()?));
     }
@@ -446,9 +482,12 @@ impl Snapshot {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (ty, header, _) = parse_file(bytes)?;
+        let (ty, header, payload) = parse_file(bytes)?;
         if ty != ObjectType::Snapshot {
             return Err(Error::Corrupt("not a snapshot".into()));
+        }
+        if !payload.is_empty() {
+            return Err(Error::Corrupt("snapshot has payload".into()));
         }
         let mut r = Reader::new(header);
         let n = r.map()?;
@@ -459,8 +498,9 @@ impl Snapshot {
         let mut prov = None;
         let mut pk = None;
         let mut sig = None;
+        let mut last = None;
         for _ in 0..n {
-            let k = r.text()?;
+            let k = r.text_map_key(&mut last)?;
             match k.as_str() {
                 "tree" => tree = Some(ObjectId(r.bstr32()?)),
                 "commit" => commit = Some(ObjectId(r.bstr32()?)),
@@ -487,6 +527,9 @@ impl Snapshot {
                 }
                 _ => return Err(Error::Corrupt(format!("unknown snapshot key {k}"))),
             }
+        }
+        if !r.at_end() {
+            return Err(Error::Corrupt("snapshot header trailing bytes".into()));
         }
         Ok(Snapshot {
             tree: tree.ok_or_else(|| Error::Corrupt("snap tree".into()))?,
