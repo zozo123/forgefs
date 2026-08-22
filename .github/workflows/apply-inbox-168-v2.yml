@@ -1,0 +1,203 @@
+name: apply-inbox-168-v2
+
+on:
+  push:
+    branches: [agents/inbox-111-v2]
+    paths:
+      - .github/workflows/apply-inbox-168-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agents/inbox-111-v2
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Apply inbox primitive and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "forgefs-integration-bot"
+          git config user.email "forgefs-integration-bot@users.noreply.github.com"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+          old = '''    let expected = if name == "main" || name.starts_with("heads/") || name.starts_with("forks/") {
+              Some("commit")
+          } else if name.starts_with("conflicts/") {
+              Some("conflict")
+          } else if name.starts_with("tags/") {
+              Some("snapshot")
+          } else {
+              None
+          };'''
+          new = '''    if let Some(rest) = name.strip_prefix("inbox/") {
+              let mut parts = rest.split('/');
+              let agent = parts.next().unwrap_or_default();
+              let id = parts.next().unwrap_or_default();
+              if parts.next().is_some()
+                  || agent.is_empty()
+                  || sanitize_agent(agent) != agent
+                  || ulid::Ulid::from_string(id).is_err()
+              {
+                  return Err(Error::Invalid(format!("invalid inbox ref {name:?}")));
+              }
+          }
+
+          let expected = if name == "main" || name.starts_with("heads/") {
+              Some("commit")
+          } else if name.starts_with("forks/inbox/") {
+              Some("snapshot")
+          } else if name.starts_with("forks/") {
+              Some("commit")
+          } else if name.starts_with("conflicts/") {
+              Some("conflict")
+          } else if name.starts_with("tags/") || name.starts_with("inbox/") {
+              Some("snapshot")
+          } else {
+              None
+          };'''
+          if old not in s:
+              raise SystemExit('validate_ref_kind marker drifted')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('crates/forge-api/src/lib.rs')
+          s = p.read_text()
+          marker = '''    pub fn refs(&self, cap: &Cap) -> Result<Vec<RefRow>> {
+              self.check(cap, Op::Read, None)?;
+              let mut out = Vec::new();
+              for r in self.store.meta.list_refs()? {
+                  if cap.allows(Op::Read, Some(&r.name), now_ms()).is_ok() {
+                      out.push(r);
+                  }
+              }
+              Ok(out)
+          }'''
+          addition = marker + '''
+
+          /// Publish an immutable sealed snapshot to a recipient-owned inbox ref.
+          /// ForgeFS stores only the durable pointer; scheduling and messaging stay above the core.
+          pub fn inbox_push(&self, cap: &Cap, to: &str, snapshot: &str) -> Result<CasResult> {
+              let recipient = sanitize_agent(to);
+              if recipient != to || recipient == "anon" {
+                  return Err(Error::Invalid(format!("invalid inbox recipient {to:?}")));
+              }
+              self.check_spec_read(cap, snapshot)?;
+              let oid = self.resolve_spec_oid(snapshot)?;
+              if self.store.object_type(oid)? != ObjectType::Snapshot {
+                  return Err(Error::Invalid("inbox payload must be a sealed snapshot".into()));
+              }
+              let name = format!("inbox/{recipient}/{}", ulid::Ulid::new());
+              self.check(cap, Op::Write, Some(&name))?;
+              self.store.meta.cas_ref(
+                  &name,
+                  ObjectId([0; 32]),
+                  oid,
+                  "snapshot",
+                  cap.agent_id(),
+                  cap.agent_id(),
+                  false,
+              )
+          }
+
+          /// List only the calling agent's concrete inbox refs that its capability can read.
+          pub fn inbox_list(&self, cap: &Cap) -> Result<Vec<RefRow>> {
+              verify(&self.hmac_key, cap)?;
+              let agent = sanitize_agent(cap.agent_id());
+              let prefix = format!("inbox/{agent}/");
+              let mut out = Vec::new();
+              for row in self.store.meta.list_refs()? {
+                  if row.name.starts_with(&prefix)
+                      && cap.allows(Op::Read, Some(&row.name), now_ms()).is_ok()
+                  {
+                      out.push(row);
+                  }
+              }
+              Ok(out)
+          }'''
+          if marker not in s:
+              raise SystemExit('refs marker drifted')
+          p.write_text(s.replace(marker, addition, 1))
+          PY
+
+          cat > crates/forge-api/tests/inbox_refs.rs <<'RS'
+          use forge_api::Forge;
+          use forge_types::CasResult;
+          use tempfile::tempdir;
+
+          #[test]
+          fn sealed_snapshot_can_be_published_to_recipient_inbox() {
+              let d = tempdir().unwrap();
+              let forge = Forge::init(d.path()).unwrap();
+              let root = forge.root_cap().unwrap();
+              let snap = forge.seal(&root, "main", "v1.0").unwrap();
+
+              let alice = forge
+                  .grant(
+                      &root,
+                      vec![
+                          "ops=read,write".into(),
+                          "agent=alice".into(),
+                          "ref=tags/v1.0,inbox/bob/*".into(),
+                      ],
+                  )
+                  .unwrap();
+              let bob = forge
+                  .grant(
+                      &root,
+                      vec![
+                          "ops=read".into(),
+                          "agent=bob".into(),
+                          "ref=inbox/bob/*".into(),
+                      ],
+                  )
+                  .unwrap();
+
+              let result = forge.inbox_push(&alice, "bob", "tags/v1.0").unwrap();
+              let CasResult::Updated { name, oid } = result else {
+                  panic!("new inbox ref must publish directly");
+              };
+              assert!(name.starts_with("inbox/bob/"));
+              assert_eq!(oid, snap);
+
+              let rows = forge.inbox_list(&bob).unwrap();
+              assert_eq!(rows.len(), 1);
+              assert_eq!(rows[0].name, name);
+              assert_eq!(rows[0].oid, snap);
+              assert_eq!(rows[0].kind, "snapshot");
+          }
+
+          #[test]
+          fn inbox_write_requires_concrete_prefix_authority() {
+              let d = tempdir().unwrap();
+              let forge = Forge::init(d.path()).unwrap();
+              let root = forge.root_cap().unwrap();
+              forge.seal(&root, "main", "v1.0").unwrap();
+              let alice = forge
+                  .grant(
+                      &root,
+                      vec![
+                          "ops=read,write".into(),
+                          "agent=alice".into(),
+                          "ref=tags/v1.0,inbox/alice/*".into(),
+                      ],
+                  )
+                  .unwrap();
+              assert!(forge.inbox_push(&alice, "bob", "tags/v1.0").is_err());
+          }
+          RS
+
+          cargo fmt --all
+          cargo test --locked -p forge-api --test inbox_refs
+          cargo check --locked --workspace --all-targets
+          git rm .github/workflows/apply-inbox-168-v2.yml
+          git add crates/forge-api/src/lib.rs crates/forge-store/src/meta.rs crates/forge-api/tests/inbox_refs.rs
+          git commit -m "agents: add capability-scoped snapshot inbox refs"
+          git push origin HEAD:agents/inbox-111-v2
