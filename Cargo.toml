@@ -36,7 +36,7 @@ data-encoding = "2.6.0"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 getrandom = "0.2.15"
 hmac = "0.12.1"
-lru = "0.12.4"
+lru = "0.18.2"
 parking_lot = "0.12.3"
 rand = "0.8.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
