@@ -213,7 +213,11 @@ fn checkin_persists_showable_contribution_from_reads_and_writes() {
     assert!(shown.contains("write /b.txt"));
     assert!(shown.contains(&format!("base {}", first_oid)));
     assert!(shown.contains(&format!("tree {}", second.tree)));
-    assert!(shown.contains("agent root"));
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.starts_with("agent ") && line.len() > 6)
+    );
 }
 
 #[test]
