@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Monotonic process-local counters for physical durability work.
+/// `puts` counts newly published OIDs; dedup hits do not increment it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlobStoreStats {
     pub puts: u64,
