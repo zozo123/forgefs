@@ -3,6 +3,7 @@ use forge_types::Error;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
+// Metadata schema versioning is deliberately separate from immutable object format versioning.
 #[test]
 fn fresh_metadata_records_schema_v1() {
     let d = tempdir().unwrap();
