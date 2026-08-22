@@ -1,16 +1,15 @@
 name: apply-inbox-168-v2
 
 on:
-  push:
-    branches: [agents/inbox-111-v2]
-    paths:
-      - .github/workflows/apply-inbox-168-v2.yml
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -138,35 +137,12 @@ jobs:
               let forge = Forge::init(d.path()).unwrap();
               let root = forge.root_cap().unwrap();
               let snap = forge.seal(&root, "main", "v1.0").unwrap();
-
-              let alice = forge
-                  .grant(
-                      &root,
-                      vec![
-                          "ops=read,write".into(),
-                          "agent=alice".into(),
-                          "ref=tags/v1.0,inbox/bob/*".into(),
-                      ],
-                  )
-                  .unwrap();
-              let bob = forge
-                  .grant(
-                      &root,
-                      vec![
-                          "ops=read".into(),
-                          "agent=bob".into(),
-                          "ref=inbox/bob/*".into(),
-                      ],
-                  )
-                  .unwrap();
-
+              let alice = forge.grant(&root, vec!["ops=read,write".into(), "agent=alice".into(), "ref=tags/v1.0,inbox/bob/*".into()]).unwrap();
+              let bob = forge.grant(&root, vec!["ops=read".into(), "agent=bob".into(), "ref=inbox/bob/*".into()]).unwrap();
               let result = forge.inbox_push(&alice, "bob", "tags/v1.0").unwrap();
-              let CasResult::Updated { name, oid } = result else {
-                  panic!("new inbox ref must publish directly");
-              };
+              let CasResult::Updated { name, oid } = result else { panic!("new inbox ref must publish directly"); };
               assert!(name.starts_with("inbox/bob/"));
               assert_eq!(oid, snap);
-
               let rows = forge.inbox_list(&bob).unwrap();
               assert_eq!(rows.len(), 1);
               assert_eq!(rows[0].name, name);
@@ -180,16 +156,7 @@ jobs:
               let forge = Forge::init(d.path()).unwrap();
               let root = forge.root_cap().unwrap();
               forge.seal(&root, "main", "v1.0").unwrap();
-              let alice = forge
-                  .grant(
-                      &root,
-                      vec![
-                          "ops=read,write".into(),
-                          "agent=alice".into(),
-                          "ref=tags/v1.0,inbox/alice/*".into(),
-                      ],
-                  )
-                  .unwrap();
+              let alice = forge.grant(&root, vec!["ops=read,write".into(), "agent=alice".into(), "ref=tags/v1.0,inbox/alice/*".into()]).unwrap();
               assert!(forge.inbox_push(&alice, "bob", "tags/v1.0").is_err());
           }
           RS
@@ -201,4 +168,3 @@ jobs:
           git add crates/forge-api/src/lib.rs crates/forge-store/src/meta.rs crates/forge-api/tests/inbox_refs.rs
           git commit -m "agents: add capability-scoped snapshot inbox refs"
           git push origin HEAD:agents/inbox-111-v2
-# retrigger
