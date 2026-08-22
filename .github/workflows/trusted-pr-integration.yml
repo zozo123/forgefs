@@ -54,3 +54,17 @@ jobs:
       - name: Run trusted import-lossless integrator from main
         shell: bash
         run: git show origin/main:.github/integration/import-lossless-28.sh | bash
+
+  checkin-contribution:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'agents/checkin-contribution-109'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Run trusted checkin Contribution integrator from main
+        shell: bash
+        run: git show origin/main:.github/integration/checkin-contribution-109.sh | bash
