@@ -51,6 +51,7 @@ fn commit_rejects_trailing_header_bytes() {
         msg: "m".into(),
         ts: 1,
         landmark: false,
+        contrib: None,
     };
     let mut bytes = c.encode();
     let n = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;

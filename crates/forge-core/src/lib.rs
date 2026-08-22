@@ -87,6 +87,7 @@ mod tests {
             msg: "init".into(),
             ts: 1,
             landmark: true,
+            contrib: None,
         };
         let bytes = c.encode();
         assert_eq!(Commit::decode(&bytes).unwrap(), c);

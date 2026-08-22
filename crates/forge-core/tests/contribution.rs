@@ -56,3 +56,21 @@ fn contribution_decoder_is_type_strict() {
     .encode();
     assert!(Contribution::decode(&blob).is_err());
 }
+
+#[test]
+fn commit_contribution_link_roundtrips() {
+    use forge_core::Commit;
+
+    let contrib = ObjectId([9; 32]);
+    let commit = Commit {
+        tree: ObjectId([1; 32]),
+        parents: vec![ObjectId([2; 32])],
+        agent: "agent".into(),
+        msg: "msg".into(),
+        ts: 7,
+        landmark: false,
+        contrib: Some(contrib),
+    };
+    let decoded = Commit::decode(&commit.encode()).unwrap();
+    assert_eq!(decoded.contrib, Some(contrib));
+}

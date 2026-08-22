@@ -13,6 +13,7 @@ fn commit(store: &Store, tree: ObjectId, parents: Vec<ObjectId>, ts: u64, msg: &
             msg: msg.into(),
             ts,
             landmark: false,
+            contrib: None,
         })
         .unwrap()
 }

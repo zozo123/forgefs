@@ -293,6 +293,13 @@ fn verify_graph(
                         format!("commit:{id}:parent"),
                     ));
                 }
+                if let Some(contrib) = commit.contrib {
+                    queue.push_back((
+                        contrib,
+                        Some(ObjectType::Contribution),
+                        format!("commit:{id}:contribution"),
+                    ));
+                }
             }),
             ObjectType::Snapshot => Snapshot::decode(&bytes).map(|snapshot| {
                 queue.push_back((

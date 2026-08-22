@@ -8,6 +8,7 @@ const MAX_ITEMS: u64 = 100_000;
 const MAX_PARENTS: u64 = 1_024;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_AGENT_BYTES: usize = 1_024;
+const MAX_SERIALIZED_HEADER_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContributionRead {
@@ -63,6 +64,30 @@ impl Contribution {
         if self.agent.is_empty() || self.agent.len() > MAX_AGENT_BYTES {
             return Err(Error::Invalid("contribution agent bounds".into()));
         }
+
+        // A receipt is control-plane metadata, never an unbounded data carrier.
+        // This conservative preflight upper-bounds CBOR framing so encode cannot
+        // allocate hundreds of MiB before discovering an oversized header.
+        let mut estimated = 1_024usize
+            .checked_add(self.agent.len())
+            .and_then(|n| n.checked_add(self.parents.len().saturating_mul(40)))
+            .ok_or_else(|| Error::Invalid("contribution size overflow".into()))?;
+        for read in &self.reads {
+            estimated = estimated
+                .checked_add(read.path.len().saturating_add(64))
+                .ok_or_else(|| Error::Invalid("contribution size overflow".into()))?;
+        }
+        for path in &self.writes {
+            estimated = estimated
+                .checked_add(path.len().saturating_add(8))
+                .ok_or_else(|| Error::Invalid("contribution size overflow".into()))?;
+        }
+        if estimated > MAX_SERIALIZED_HEADER_BYTES {
+            return Err(Error::Invalid(
+                "contribution exceeds serialized size limit".into(),
+            ));
+        }
+
         validate_sorted_unique(self.reads.iter().map(|r| r.path.as_str()))?;
         validate_sorted_unique(self.writes.iter().map(String::as_str))?;
         Ok(())
@@ -115,11 +140,26 @@ impl Contribution {
                 (text_key("writes"), writes_v),
             ],
         );
+        if header.len() > MAX_SERIALIZED_HEADER_BYTES {
+            return Err(Error::Invalid(
+                "contribution exceeds serialized size limit".into(),
+            ));
+        }
         Ok(encode_file(ObjectType::Contribution, &header, &[]))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_SERIALIZED_HEADER_BYTES.saturating_add(5) {
+            return Err(Error::Corrupt(
+                "contribution exceeds serialized size limit".into(),
+            ));
+        }
         let (ty, header, payload) = parse_file(bytes)?;
+        if header.len() > MAX_SERIALIZED_HEADER_BYTES {
+            return Err(Error::Corrupt(
+                "contribution exceeds serialized size limit".into(),
+            ));
+        }
         if ty != ObjectType::Contribution {
             return Err(Error::Corrupt("not a contribution".into()));
         }
@@ -224,5 +264,39 @@ impl Contribution {
             return Err(Error::Corrupt("non-canonical contribution encoding".into()));
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_limit_rejects_only_over_boundary_before_decode() {
+        let at_limit = vec![0u8; MAX_SERIALIZED_HEADER_BYTES + 5];
+        let at_err = Contribution::decode(&at_limit).unwrap_err().to_string();
+        assert!(!at_err.contains("serialized size limit"));
+
+        let over_limit = vec![0u8; MAX_SERIALIZED_HEADER_BYTES + 6];
+        let over_err = Contribution::decode(&over_limit).unwrap_err().to_string();
+        assert!(over_err.contains("serialized size limit"));
+    }
+
+    #[test]
+    fn encode_preflight_rejects_pathological_receipt() {
+        let writes = (0..2_100)
+            .map(|i| format!("{i:06}{}", "a".repeat(4_090)))
+            .collect();
+        let value = Contribution {
+            base: ObjectId([0; 32]),
+            tree: ObjectId([1; 32]),
+            parents: Vec::new(),
+            reads: Vec::new(),
+            writes,
+            agent: "agent".into(),
+            ts: 0,
+        };
+        let err = value.encode().unwrap_err().to_string();
+        assert!(err.contains("serialized size limit"));
     }
 }

@@ -32,6 +32,7 @@ fn commit(store: &Store, tree: ObjectId, parent: ObjectId, n: u64) -> ObjectId {
             msg: format!("c{n}"),
             ts: n,
             landmark: false,
+            contrib: None,
         })
         .unwrap()
 }
