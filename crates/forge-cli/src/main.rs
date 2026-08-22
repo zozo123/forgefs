@@ -204,7 +204,8 @@ fn run() -> forge_types::Result<()> {
             Ok(())
         }
         Cmd::Serve { http } => {
-            let f = Arc::new(open(&cli)?);
+            let dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+            let f = Arc::new(Forge::open_for_serve(&dir)?);
             eprintln!("forge serve {}", f.root().display());
             forge_api::serve(f, http)
         }

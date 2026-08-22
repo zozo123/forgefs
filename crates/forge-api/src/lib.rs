@@ -25,7 +25,7 @@ use forge_ns::{
 };
 use forge_store::{sanitize_agent, Store};
 use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, RefRow, Result};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,97 +49,142 @@ pub struct Forge {
     seal_pk: [u8; 32],
     root: PathBuf,
     stats: ApiCounters,
+    // Shared for direct clients, exclusive for the daemon. The descriptor lifetime is the lock.
+    _cell_lock: File,
+    exclusive_cell_lock: bool,
 }
 
 impl Forge {
     pub fn init(dir: &Path) -> Result<Self> {
         let root = forge_root(dir);
-        if root.join("VERSION").exists() {
+        if root.exists() {
+            if root.join("VERSION").exists() {
+                validate_repo_version(&root)?;
+                return Err(Error::Invalid(format!(
+                    "already a forge: {}",
+                    root.display()
+                )));
+            }
             return Err(Error::Invalid(format!(
-                "already a forge: {}",
+                "{} already exists without a ForgeFS VERSION; refusing to overwrite",
                 root.display()
             )));
         }
-        secure_key_dir(&root.join("keys"))?;
-        fs::create_dir_all(root.join("objects"))?;
-        fs::create_dir_all(root.join("tmp"))?;
-        fs::write(root.join("VERSION"), b"1\n")?;
-        fs::write(
-            root.join("config.toml"),
-            b"[store]\nhash = \"blake3-256\"\nblob_warn_bytes = 67108864\n\n[serve]\nlisten = \"127.0.0.1:4077\"\n",
-        )?;
 
-        let mut hmac_key = [0u8; 32];
-        let mut seal_seed = [0u8; 32];
-        getrandom::getrandom(&mut hmac_key).map_err(|e| Error::Internal(e.to_string()))?;
-        getrandom::getrandom(&mut seal_seed).map_err(|e| Error::Internal(e.to_string()))?;
-        let sk = SigningKey::from_bytes(&seal_seed);
-        let pk = sk.verifying_key().to_bytes();
+        // Build a complete repository under a sibling staging name. VERSION is
+        // written last, then the directory rename publishes the repository in
+        // one namespace operation. A crash before rename leaves no `.forge`
+        // validity marker, so a retry is safe.
+        let parent = root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let base = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".forge");
+        let staging = parent.join(format!(
+            "{base}.init-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        fs::create_dir(&staging)?;
 
-        write_secret(root.join("keys/root.secret"), &hmac_key)?;
-        write_secret(root.join("keys/seal.ed25519"), &seal_seed)?;
-        write_public(root.join("keys/seal.pub"), &pk)?;
+        let initialized = (|| -> Result<()> {
+            secure_key_dir(&staging.join("keys"))?;
+            fs::create_dir_all(staging.join("objects"))?;
+            fs::create_dir_all(staging.join("tmp"))?;
 
-        let store = Store::open(&root)?;
-        store.meta.set_cap_root(&pk)?;
+            let mut hmac_key = [0u8; 32];
+            let mut seal_seed = [0u8; 32];
+            getrandom::getrandom(&mut hmac_key).map_err(|e| Error::Internal(e.to_string()))?;
+            getrandom::getrandom(&mut seal_seed).map_err(|e| Error::Internal(e.to_string()))?;
+            let sk = SigningKey::from_bytes(&seal_seed);
+            let pk = sk.verifying_key().to_bytes();
 
-        let root_cap = mint_root(&hmac_key)?;
-        let integ = mint_integrator(&hmac_key)?;
-        write_secret(root.join("keys/root.cap"), root_cap.to_token().as_bytes())?;
-        write_secret(
-            root.join("keys/integrator.cap"),
-            integ.to_token().as_bytes(),
-        )?;
-        sync_dir(&root.join("keys"))?;
+            write_secret(staging.join("keys/root.secret"), &hmac_key)?;
+            write_secret(staging.join("keys/seal.ed25519"), &seal_seed)?;
+            write_public(staging.join("keys/seal.pub"), &pk)?;
 
-        let empty = store.empty_tree_id()?;
-        let commit = Commit {
-            tree: empty,
-            parents: vec![],
-            agent: "init".into(),
-            msg: "init".into(),
-            ts: now_ms(),
-            landmark: true,
-        };
-        let cid = store.put_commit(&commit)?;
-        let intro_oids = store.collect_intros(None, empty)?;
-        store.meta.insert_ref_with_intros(
-            "main",
-            cid,
-            "commit",
-            true,
-            false,
-            "init",
-            "init",
-            &intro_oids,
-        )?;
-        store.meta.landmark(cid, "commit", "init")?;
+            let store = Store::open(&staging)?;
+            store.meta.set_cap_root(&pk)?;
 
-        Ok(Self {
-            store,
-            hmac_key,
-            seal_seed,
-            seal_pk: pk,
-            root,
-            stats: ApiCounters::default(),
-        })
+            let root_cap = mint_root(&hmac_key)?;
+            let integ = mint_integrator(&hmac_key)?;
+            write_secret(
+                staging.join("keys/root.cap"),
+                root_cap.to_token().as_bytes(),
+            )?;
+            write_secret(
+                staging.join("keys/integrator.cap"),
+                integ.to_token().as_bytes(),
+            )?;
+            sync_dir(&staging.join("keys"))?;
+
+            let empty = store.empty_tree_id()?;
+            let commit = Commit {
+                tree: empty,
+                parents: vec![],
+                agent: "init".into(),
+                msg: "init".into(),
+                ts: now_ms(),
+                landmark: true,
+            };
+            let cid = store.put_commit(&commit)?;
+            let intro_oids = store.collect_intros(None, empty)?;
+            store.meta.insert_ref_with_intros(
+                "main",
+                cid,
+                "commit",
+                true,
+                false,
+                "init",
+                "init",
+                &intro_oids,
+            )?;
+            store.meta.landmark(cid, "commit", "init")?;
+            drop(store);
+
+            // VERSION is the validity/compatibility marker and is published last.
+            write_public(staging.join("VERSION"), b"1\n")?;
+            sync_dir(&staging)?;
+            Ok(())
+        })();
+
+        if let Err(error) = initialized {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+
+        if let Err(error) = fs::rename(&staging, &root) {
+            let _ = fs::remove_dir_all(&staging);
+            if root.exists() {
+                return Err(Error::Invalid(format!(
+                    "already a forge: {}",
+                    root.display()
+                )));
+            }
+            return Err(error.into());
+        }
+        sync_dir(parent)?;
+        Self::open(&root)
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with_lock(dir, false)
+    }
+
+    /// Open a cell for `forge serve`. The exclusive lock is acquired before
+    /// SQLite or object state is opened, so a daemon can never coexist with a
+    /// direct client that holds the shared cell lock.
+    pub fn open_for_serve(dir: &Path) -> Result<Self> {
+        Self::open_with_lock(dir, true)
+    }
+
+    fn open_with_lock(dir: &Path, exclusive: bool) -> Result<Self> {
         let root = find_forge(dir)?;
-        let sock = root.join("forge.sock");
-        if sock.exists() {
-            match std::os::unix::net::UnixStream::connect(&sock) {
-                Ok(_) => {
-                    return Err(Error::Busy(
-                        "daemon is running; use the socket or stop forge serve".into(),
-                    ));
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&sock);
-                }
-            }
-        }
+        let cell_lock = acquire_cell_lock(&root, exclusive)?;
         validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
@@ -159,7 +204,13 @@ impl Forge {
             seal_pk,
             root,
             stats: ApiCounters::default(),
+            _cell_lock: cell_lock,
+            exclusive_cell_lock: exclusive,
         })
+    }
+
+    pub(crate) fn has_exclusive_cell_lock(&self) -> bool {
+        self.exclusive_cell_lock
     }
 
     pub fn root(&self) -> &Path {
@@ -755,7 +806,7 @@ impl Forge {
             Some(row) => Some(self.store.get_commit(row.oid)?),
             None => None,
         };
-        let tree = import_walk(&self.store, dir)?;
+        let tree = import_walk(&self.store, dir, true)?;
         let parents = previous
             .as_ref()
             .map(|row| vec![row.oid])
@@ -854,16 +905,19 @@ fn blob_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<ObjectId>>
     Ok(None)
 }
 
-fn import_walk(store: &Store, dir: &Path) -> Result<ObjectId> {
+fn import_walk(store: &Store, dir: &Path, source_root: bool) -> Result<ObjectId> {
     let mut entries = Vec::new();
-    let mut kids: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    // Never turn a per-entry enumeration error into a successful partial import.
+    let mut kids: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
     kids.sort_by_key(|e| e.file_name());
     for k in kids {
         let name = k
             .file_name()
             .into_string()
             .map_err(|_| Error::Invalid(format!("non-utf8 name in {}", dir.display())))?;
-        if name == ".forge" || name == ".git" {
+        // Root control directories are outside the import domain. Nested names
+        // with the same spelling are ordinary user data and must be preserved.
+        if source_root && (name == ".forge" || name == ".git") {
             continue;
         }
         let ft = k.file_type()?;
@@ -874,7 +928,7 @@ fn import_walk(store: &Store, dir: &Path) -> Result<ObjectId> {
             )));
         }
         if ft.is_dir() {
-            let id = import_walk(store, &k.path())?;
+            let id = import_walk(store, &k.path(), false)?;
             entries.push(forge_core::TreeEntry {
                 name,
                 kind: forge_types::EntryKind::Tree,
@@ -889,7 +943,7 @@ fn import_walk(store: &Store, dir: &Path) -> Result<ObjectId> {
         } else {
             let data = fs::read(k.path())?;
             let id = store.put_blob_data(&data)?;
-            let exec = is_exec(&k.path());
+            let exec = is_exec(&k.path())?;
             entries.push(forge_core::TreeEntry {
                 name,
                 kind: forge_types::EntryKind::Blob,
@@ -901,18 +955,60 @@ fn import_walk(store: &Store, dir: &Path) -> Result<ObjectId> {
     store.put_tree(&Tree::new(entries)?)
 }
 
-fn is_exec(p: &Path) -> bool {
+fn is_exec(p: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        Ok(fs::metadata(p)?.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
         let _ = p;
-        false
+        Ok(false)
+    }
+}
+
+fn acquire_cell_lock(root: &Path, exclusive: bool) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("LOCK"))?;
+    let result = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match result {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(Error::Busy(if exclusive {
+                "forge cell is in use by a direct client or daemon".into()
+            } else {
+                "forge daemon owns this cell; use the socket or stop forge serve".into()
+            }));
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+
+    if exclusive {
+        file.set_len(0)?;
+        let mut handle = &file;
+        handle.write_all(std::process::id().to_string().as_bytes())?;
+        file.sync_all()?;
+    }
+    Ok(file)
+}
+
+fn validate_repo_version(root: &Path) -> Result<()> {
+    let version = fs::read(root.join("VERSION"))?;
+    match version.as_slice() {
+        b"1" | b"1\n" | b"1\r\n" => Ok(()),
+        _ => Err(Error::Invalid(format!(
+            "unsupported ForgeFS repository VERSION at {} (this binary supports VERSION 1)",
+            root.display()
+        ))),
     }
 }
 
@@ -937,6 +1033,7 @@ pub fn find_forge(start: &Path) -> Result<PathBuf> {
             cur.join(".forge")
         };
         if cand.join("VERSION").exists() {
+            validate_repo_version(&cand)?;
             return Ok(cand);
         }
         if !cur.pop() {

@@ -218,6 +218,7 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sql)?;
+    tx.execute_batch(SCHEMA).map_err(map_sql)?;
     tx.execute(
         "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, ?2)",
         params![CURRENT_SCHEMA_VERSION, now_ms() as i64],
@@ -299,21 +300,56 @@ impl Meta {
 
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path).map_err(map_sql)?;
+
+        // Durability is part of the catalog contract, not an inherited SQLite
+        // default. Establish it before any schema or metadata write.
+        conn.pragma_update(None, "busy_timeout", 5000i64)
+            .map_err(map_sql)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(map_sql)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(map_sql)?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(map_sql)?;
+        #[cfg(target_os = "macos")]
+        conn.pragma_update(None, "fullfsync", "ON")
+            .map_err(map_sql)?;
+
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(map_sql)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(Error::Corrupt(format!(
+                "metadata durability requires journal_mode=WAL, got {journal_mode}"
+            )));
+        }
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .map_err(map_sql)?;
+        if synchronous != 2 {
+            return Err(Error::Corrupt(format!(
+                "metadata durability requires synchronous=FULL(2), got {synchronous}"
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let fullfsync: i64 = conn
+                .pragma_query_value(None, "fullfsync", |row| row.get(0))
+                .map_err(map_sql)?;
+            if fullfsync != 1 {
+                return Err(Error::Corrupt(format!(
+                    "metadata durability requires fullfsync=ON on macOS, got {fullfsync}"
+                )));
+            }
+        }
+
         let version = schema_version(&conn)?;
         if version > CURRENT_SCHEMA_VERSION {
             return Err(Error::Invalid(format!(
                 "metadata schema version {version} is newer than supported {CURRENT_SCHEMA_VERSION}"
             )));
         }
-        conn.execute_batch(SCHEMA).map_err(map_sql)?;
         migrate(&mut conn, version)?;
-        // execute_batch may not apply PRAGMA journal_mode via some paths; force.
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sql)?;
-        conn.pragma_update(None, "busy_timeout", 5000i64)
-            .map_err(map_sql)?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(map_sql)?;
         conn.execute(
             "UPDATE cap_root SET hmac_key=X'' WHERE length(hmac_key) != 0",
             [],
@@ -1457,5 +1493,33 @@ mod tests {
             .cas_ref("main", oid(1), oid(2), "commit", "a", "a", true)
             .unwrap();
         assert!(matches!(ok, CasResult::Updated { .. }));
+    }
+}
+
+#[cfg(test)]
+mod durability_policy_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn open_enforces_catalog_durability_pragmas() {
+        let dir = tempdir().unwrap();
+        let meta = Meta::open(&dir.path().join("meta.sqlite")).unwrap();
+        let conn = meta.write.lock();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 2, "FULL is SQLite value 2");
+        #[cfg(target_os = "macos")]
+        {
+            let fullfsync: i64 = conn
+                .pragma_query_value(None, "fullfsync", |row| row.get(0))
+                .unwrap();
+            assert_eq!(fullfsync, 1);
+        }
     }
 }
