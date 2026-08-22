@@ -22,8 +22,38 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.89
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --locked
+      - name: Test MSRV
+        run: cargo test --workspace --all-targets --locked
+
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Concurrent agent smoke benchmark
+        run: cargo run --locked -p forge-cli -- bench --agents 32 --shared 16
