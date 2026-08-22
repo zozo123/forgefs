@@ -28,7 +28,7 @@ fn cli_requires_cap() {
         .args(["--dir", d.path().to_str().unwrap(), "refs"])
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no ambient root"), "{err}");
 }
@@ -175,4 +175,94 @@ fn cli_parallel_checkin_processes() {
     }
     assert_eq!(updated, 8);
     let _ = Path::new(&dir);
+}
+
+#[test]
+fn cli_merge_conflict_has_stable_exit_code_four() {
+    let d = tempdir().unwrap();
+    run(forge().arg("init").current_dir(d.path()));
+    let dir = d.path().to_str().unwrap();
+    let root = d.path().join(".forge/keys/root.cap");
+    let integ = d.path().join(".forge/keys/integrator.cap");
+    let root = root.to_str().unwrap();
+    let integ = integ.to_str().unwrap();
+
+    let a = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "session",
+        "open",
+        "--from=main",
+    ]));
+    let b = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "session",
+        "open",
+        "--from=main",
+    ]));
+    let a = a.trim();
+    let b = b.trim();
+    run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "write",
+        "--ns",
+        a,
+        "/same.txt",
+        "--text",
+        "ours",
+    ]));
+    run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "write",
+        "--ns",
+        b,
+        "/same.txt",
+        "--text",
+        "theirs",
+    ]));
+    run(forge().args([
+        "--dir", dir, "--cap", root, "checkin", "--ns", a, "-m", "ours",
+    ]));
+    run(forge().args([
+        "--dir", dir, "--cap", root, "checkin", "--ns", b, "-m", "theirs",
+    ]));
+
+    let ref_a = format!("heads/agents/anon/{a}");
+    let ref_b = format!("heads/agents/anon/{b}");
+    run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        integ,
+        "merge",
+        "--into=main",
+        "--from",
+        &ref_a,
+    ]));
+    let out = forge()
+        .args([
+            "--dir",
+            dir,
+            "--cap",
+            integ,
+            "merge",
+            "--into=main",
+            "--from",
+            &ref_b,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("conflict"));
 }
