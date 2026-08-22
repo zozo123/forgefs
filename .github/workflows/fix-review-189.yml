@@ -29,6 +29,18 @@ jobs:
           toolchain: 1.97.0
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Make generator clippy-clean
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/fix_review_189.py')
+          s = p.read_text()
+          old = '        return Err(error.into());\n    }\n\n    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]'
+          new = '        Err(error.into())\n    }\n\n    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]'
+          if s.count(old) != 1:
+              raise SystemExit('expected one generated needless-return marker')
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Apply final review fixes
         run: python3 .github/scripts/fix_review_189.py
       - name: Format
