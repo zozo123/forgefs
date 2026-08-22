@@ -69,9 +69,7 @@ pub fn longest_mount<'a>(mounts: &'a [Mount], abs: &str) -> Result<&'a Mount> {
     let mut best_len = 0usize;
     for m in mounts {
         let mp = normalize_abs(&m.path)?;
-        if (abs == mp || mp == "/" || abs.starts_with(&format!("{mp}/")))
-            && mp.len() >= best_len
-        {
+        if (abs == mp || mp == "/" || abs.starts_with(&format!("{mp}/"))) && mp.len() >= best_len {
             best_len = mp.len();
             best = Some(m);
         }
