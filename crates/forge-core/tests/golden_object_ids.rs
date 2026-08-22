@@ -7,6 +7,7 @@ fn expected(s: &str) -> &str {
 
 #[test]
 fn v1_object_ids_are_userspace_abi() {
+    // These hashes are compatibility vectors, not snapshots to regenerate casually.
     let blob = Blob {
         data: b"forgefs-v1-golden".to_vec(),
     };
