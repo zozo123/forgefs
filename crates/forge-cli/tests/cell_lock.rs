@@ -40,7 +40,10 @@ fn wait_for_server(path: &std::path::Path, child: &mut Child) {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("daemon did not accept socket connections: {}", path.display());
+    panic!(
+        "daemon did not accept socket connections: {}",
+        path.display()
+    );
 }
 
 #[test]
