@@ -1,0 +1,32 @@
+name: one-shot lru lock refresh
+
+on:
+  push:
+    branches: [fix/lru-rustsec]
+    paths:
+      - '.github/workflows/lru-lock.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - name: Regenerate only the lru lock graph
+        run: cargo update -p lru --precise 0.18.2
+      - name: Commit deterministic lockfile and remove this workflow
+        run: |
+          rm .github/workflows/lru-lock.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock .github/workflows/lru-lock.yml
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix(deps): regenerate lockfile for lru 0.18.2'
+          git push origin HEAD:fix/lru-rustsec
