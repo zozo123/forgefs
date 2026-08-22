@@ -110,9 +110,12 @@ fn apply_level(
     overlay: &Overlay,
     store: &impl TreeStore,
 ) -> Result<ObjectId> {
-    let mut entries: BTreeMap<String, TreeEntry> = match base {
-        Some(id) => store.get_tree(id)?.as_map(),
-        None => BTreeMap::new(),
+    // Trees are already canonical sorted vectors. Keep that representation and
+    // merge only the sparse direct-child edits instead of cloning every entry
+    // into a BTreeMap (O(n log n) work for a one-entry edit).
+    let base_tree = match base {
+        Some(id) => store.get_tree(id)?,
+        None => Tree::default(),
     };
 
     let mut groups: BTreeMap<String, Overlay> = BTreeMap::new();
@@ -137,29 +140,28 @@ fn apply_level(
         }
     }
 
-    for (name, op) in files {
-        match op {
-            Some((id, exec)) => {
-                entries.insert(
-                    name.clone(),
-                    TreeEntry {
-                        name,
-                        kind: EntryKind::Blob,
-                        id,
-                        exec,
-                    },
-                );
-            }
-            None => {
-                entries.remove(&name);
-            }
-        }
+    // A direct file edit is applied before a nested group in the old algorithm;
+    // therefore a same-name nested group sees no tree base and then wins the
+    // final entry. Preserve that exact semantic while avoiding the full map.
+    let mut edits: BTreeMap<String, Option<TreeEntry>> = BTreeMap::new();
+    for (name, op) in &files {
+        let edit = op.map(|(id, exec)| TreeEntry {
+            name: name.clone(),
+            kind: EntryKind::Blob,
+            id,
+            exec,
+        });
+        edits.insert(name.clone(), edit);
     }
 
     for (name, sub) in groups {
-        let child_base = match entries.get(&name) {
-            Some(e) if e.kind == EntryKind::Tree => Some(e.id),
-            _ => None,
+        let child_base = if files.contains_key(&name) {
+            None
+        } else {
+            match base_tree.get(&name) {
+                Some(e) if e.kind == EntryKind::Tree => Some(e.id),
+                _ => None,
+            }
         };
         let child_prefix = if prefix.is_empty() {
             name.clone()
@@ -168,23 +170,66 @@ fn apply_level(
         };
         let child_id = apply_level(child_base, &child_prefix, &sub, store)?;
         let child_tree = store.get_tree(child_id)?;
-        if child_tree.is_empty() {
-            entries.remove(&name);
+        let edit = if child_tree.is_empty() {
+            None
         } else {
-            entries.insert(
-                name.clone(),
-                TreeEntry {
-                    name,
-                    kind: EntryKind::Tree,
-                    id: child_id,
-                    exec: false,
-                },
-            );
+            Some(TreeEntry {
+                name: name.clone(),
+                kind: EntryKind::Tree,
+                id: child_id,
+                exec: false,
+            })
+        };
+        edits.insert(name, edit);
+    }
+
+    let entries = merge_sorted_entries(base_tree.entries, edits);
+    let tree = Tree::from_canonical(entries)?;
+    store.put_tree(&tree)
+}
+
+/// Merge canonical base entries with sorted sparse edits in O(n + m).
+fn merge_sorted_entries(
+    base: Vec<TreeEntry>,
+    edits: BTreeMap<String, Option<TreeEntry>>,
+) -> Vec<TreeEntry> {
+    let mut out = Vec::with_capacity(base.len().saturating_add(edits.len()));
+    let mut base = base.into_iter().peekable();
+    let mut edits = edits.into_iter().peekable();
+
+    loop {
+        match (base.peek(), edits.peek()) {
+            (Some(base_entry), Some((edit_name, _))) => {
+                match base_entry.name.as_bytes().cmp(edit_name.as_bytes()) {
+                    std::cmp::Ordering::Less => out.push(base.next().unwrap()),
+                    std::cmp::Ordering::Equal => {
+                        base.next();
+                        let (_, edit) = edits.next().unwrap();
+                        if let Some(entry) = edit {
+                            out.push(entry);
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let (_, edit) = edits.next().unwrap();
+                        if let Some(entry) = edit {
+                            out.push(entry);
+                        }
+                    }
+                }
+            }
+            (Some(_), None) => {
+                out.extend(base);
+                break;
+            }
+            (None, Some(_)) => {
+                out.extend(edits.filter_map(|(_, edit)| edit));
+                break;
+            }
+            (None, None) => break,
         }
     }
 
-    let tree = Tree::new(entries.into_values().collect())?;
-    store.put_tree(&tree)
+    out
 }
 
 /// Strip a directory prefix only on a `/` boundary (`dir` does not match `dir2`).
@@ -293,6 +338,52 @@ mod apply_tests {
         let t = store.get_tree(root).unwrap();
         let names: Vec<_> = t.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["dir", "dir2"]);
+    }
+
+    #[test]
+    fn direct_file_then_nested_group_preserves_group_wins_semantics() {
+        let store = Mem(Mutex::new(HashMap::new()));
+        let file = ObjectId([6u8; 32]);
+        let nested = ObjectId([7u8; 32]);
+        let mut ov = Overlay::new();
+        ov.insert("dir".into(), Some((file, false)));
+        ov.insert("dir/child.txt".into(), Some((nested, false)));
+
+        let root = apply_overlay(None, &ov, &store).unwrap();
+        let tree = store.get_tree(root).unwrap();
+        let dir = tree.get("dir").unwrap();
+        assert_eq!(dir.kind, EntryKind::Tree);
+        let child = store.get_tree(dir.id).unwrap();
+        assert_eq!(child.get("child.txt").unwrap().id, nested);
+    }
+
+    #[test]
+    fn sparse_edit_preserves_canonical_order_and_untouched_entries() {
+        let store = Mem(Mutex::new(HashMap::new()));
+        let entries: Vec<_> = (0..10_000)
+            .map(|i| TreeEntry {
+                name: format!("f{i:05}"),
+                kind: EntryKind::Blob,
+                id: ObjectId([(i % 251) as u8; 32]),
+                exec: false,
+            })
+            .collect();
+        let base = store.put_tree(&Tree::new(entries).unwrap()).unwrap();
+        let replacement = ObjectId([0xee; 32]);
+        let mut ov = Overlay::new();
+        ov.insert("f05000".into(), Some((replacement, true)));
+
+        let root = apply_overlay(Some(base), &ov, &store).unwrap();
+        let tree = store.get_tree(root).unwrap();
+        assert_eq!(tree.entries.len(), 10_000);
+        assert_eq!(tree.get("f04999").unwrap().name, "f04999");
+        assert_eq!(tree.get("f05000").unwrap().id, replacement);
+        assert!(tree.get("f05000").unwrap().exec);
+        assert_eq!(tree.get("f05001").unwrap().name, "f05001");
+        assert!(tree
+            .entries
+            .windows(2)
+            .all(|w| w[0].name.as_bytes() < w[1].name.as_bytes()));
     }
 
     #[test]
