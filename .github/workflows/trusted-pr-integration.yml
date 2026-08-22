@@ -1,0 +1,42 @@
+name: trusted-pr-integration
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trusted-pr-integration-${{ github.head_ref }}
+  cancel-in-progress: false
+
+jobs:
+  contribution:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'objects/contribution-108-v3'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: objects/contribution-108-v3
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Run trusted Contribution integrator from main
+        shell: bash
+        run: git show origin/main:.github/integration/contribution-v3.sh | bash
+
+  inbox:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'agents/inbox-111-v3'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: agents/inbox-111-v3
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Run trusted inbox integrator from main
+        shell: bash
+        run: git show origin/main:.github/integration/inbox-v3.sh | bash
