@@ -6,7 +6,7 @@ pub mod meta;
 pub use blob::LocalBlobStore;
 pub use meta::{sanitize_agent, Meta, MountRow, NsRow, OverlayRow};
 
-use forge_core::object::{decode_object_type, parse_file, Blob, Commit, Conflict, Snapshot};
+use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};
 use forge_core::tree::{Tree, TreeStore};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use lru::LruCache;
