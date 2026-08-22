@@ -24,6 +24,10 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # Keep correctness/style warnings fatal. These two API-shape lints are
+        # intentionally reviewed rather than globally forbidden: transaction
+        # methods can legitimately carry explicit fields, and tuple aliases are
+        # not correctness boundaries.
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::too-many-arguments -A clippy::type-complexity
       - name: Test
         run: cargo test --workspace --all-targets
