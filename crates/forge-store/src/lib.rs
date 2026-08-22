@@ -8,7 +8,7 @@ pub use meta::{sanitize_agent, Meta, MountRow, NsRow, OverlayRow};
 
 use forge_core::object::{decode_object_type, parse_file, Blob, Commit, Conflict, Snapshot};
 use forge_core::tree::{Tree, TreeStore};
-use forge_types::{Error, ObjectId, ObjectType, Result};
+use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
@@ -135,40 +135,72 @@ impl Store {
         commit: ObjectId,
         agent: &str,
     ) -> Result<()> {
-        self.intro_walk(old, new, commit, agent)
+        self.intro_walk(old, new, ObjectType::Tree, commit, agent)
     }
 
     fn intro_walk(
         &self,
         old: Option<ObjectId>,
         new: ObjectId,
+        expected: ObjectType,
         commit: ObjectId,
         agent: &str,
     ) -> Result<()> {
         if old == Some(new) {
             return Ok(());
         }
-        self.meta.intro_insert(new, commit, agent)?;
+
         let bytes = self.get_raw(new)?;
-        let (ty, _, _) = parse_file(&bytes)?;
-        if ty != ObjectType::Tree {
-            return Ok(());
+        let actual = decode_object_type(&bytes)?;
+        if actual != expected {
+            return Err(Error::Corrupt(format!(
+                "typed edge expected {}, found {} at {new}",
+                expected.as_str(),
+                actual.as_str()
+            )));
         }
-        let new_tree = Tree::decode(&bytes)?;
-        let old_map = match old {
-            Some(id) => {
-                if let Ok(t) = self.get_tree(id) {
-                    t.as_map()
-                } else {
-                    Default::default()
+        self.meta.intro_insert(new, commit, agent)?;
+
+        match actual {
+            ObjectType::Blob => {
+                Blob::decode(&bytes)?;
+            }
+            ObjectType::Tree => {
+                let new_tree = Tree::decode(&bytes)?;
+                let old_tree = match old {
+                    Some(id) => {
+                        let old_bytes = self.get_raw(id)?;
+                        match decode_object_type(&old_bytes)? {
+                            ObjectType::Tree => Some(Tree::decode(&old_bytes)?),
+                            ObjectType::Blob => None,
+                            other => {
+                                return Err(Error::Corrupt(format!(
+                                    "unexpected {} in previous tree edge at {id}",
+                                    other.as_str()
+                                )))
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let old_map = old_tree.as_ref().map(Tree::as_map).unwrap_or_default();
+                for e in &new_tree.entries {
+                    let old_id = old_map
+                        .get(&e.name)
+                        .filter(|old_e| old_e.kind == e.kind)
+                        .map(|old_e| old_e.id);
+                    let expected = match e.kind {
+                        EntryKind::Blob => ObjectType::Blob,
+                        EntryKind::Tree => ObjectType::Tree,
+                    };
+                    self.intro_walk(old_id, e.id, expected, commit, agent)?;
                 }
             }
-            None => Default::default(),
-        };
-        for e in &new_tree.entries {
-            let old_id = old_map.get(&e.name).map(|x| x.id);
-            if old_id != Some(e.id) {
-                self.intro_walk(old_id, e.id, commit, agent)?;
+            other => {
+                return Err(Error::Corrupt(format!(
+                    "unexpected {} in provenance tree at {new}",
+                    other.as_str()
+                )))
             }
         }
         Ok(())
@@ -181,23 +213,36 @@ impl Store {
     /// Type-aware walk that fail-closes on decode errors (I15 / #35).
     pub fn reachable_oids_verified(&self, tree: ObjectId) -> Result<Vec<ObjectId>> {
         let mut out = Vec::new();
-        let mut stack = vec![tree];
+        let mut stack = vec![(tree, ObjectType::Tree)];
         let mut seen = std::collections::HashSet::new();
-        while let Some(id) = stack.pop() {
+        while let Some((id, expected)) = stack.pop() {
             if !seen.insert(id) {
                 continue;
             }
-            out.push(id);
             let bytes = self.get_raw_verified(id)?;
-            let ty = decode_object_type(&bytes)?;
-            match ty {
+            let actual = decode_object_type(&bytes)?;
+            if actual != expected {
+                return Err(Error::Corrupt(format!(
+                    "typed edge expected {}, found {} at {id}",
+                    expected.as_str(),
+                    actual.as_str()
+                )));
+            }
+            out.push(id);
+            match actual {
                 ObjectType::Tree => {
                     let t = Tree::decode(&bytes)?;
                     for e in t.entries {
-                        stack.push(e.id);
+                        let expected = match e.kind {
+                            EntryKind::Blob => ObjectType::Blob,
+                            EntryKind::Tree => ObjectType::Tree,
+                        };
+                        stack.push((e.id, expected));
                     }
                 }
-                ObjectType::Blob => {}
+                ObjectType::Blob => {
+                    Blob::decode(&bytes)?;
+                }
                 other => {
                     return Err(Error::Corrupt(format!(
                         "unexpected {} in tree walk at {id}",
