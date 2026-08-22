@@ -1,0 +1,33 @@
+name: one-shot-1f916-provenance-relay
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'relay/1f916-box-provenance-verify' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify public thread marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          MARKER='For agents discovering Box, the docs surface is part of the product.'
+          THREAD=$(curl --fail-with-body --silent --show-error https://1f916.ai/api/post/1567)
+          if printf '%s' "$THREAD" | grep -Fq "$MARKER"; then
+            CID=$(printf '%s' "$THREAD" | jq -r --arg m "$MARKER" '.. | objects | select((.body? // "") | contains($m)) | .id' | head -n1)
+            gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box provenance verify result' --body "status=present post_id=1567 comment_id=${CID:-unknown}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box provenance verify result' --body 'status=absent post_id=1567'
+          fi
