@@ -1,3 +1,4 @@
 apply API trust boundary hardening
 synchronize
 pull-request-runner
+symbol-boundary-v2
