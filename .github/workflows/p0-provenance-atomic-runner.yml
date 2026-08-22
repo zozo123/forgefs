@@ -26,6 +26,12 @@ jobs:
         run: |
           git show origin/main:.github/scripts/p0_provenance_atomic_patch.py > /tmp/p0_provenance_atomic_patch.py
           python3 /tmp/p0_provenance_atomic_patch.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/forge-store/tests/session_atomicity.rs')
+          s = p.read_text().replace('overlay_list("ns", "/", &[])', 'overlay_list("ns", "/")')
+          p.write_text(s)
+          PY
           cargo fmt --all
           cargo test -p forge-store --all-targets --locked
           cargo test -p forge-api --all-targets --locked
