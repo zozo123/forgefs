@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 "#;
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct MountRow {
@@ -317,12 +317,24 @@ impl Meta {
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path).map_err(map_sql)?;
 
-        // Durability is part of the catalog contract, not an inherited SQLite
-        // default. Establish it before any schema or metadata write.
+        // Connection-scoped only: preserve the normal five-second contention
+        // policy without changing an incompatible database on disk.
         conn.pragma_update(None, "busy_timeout", 5000i64)
             .map_err(map_sql)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(map_sql)?;
+
+        // Compatibility checks are read-only. Do not mutate a repository that
+        // this binary has already determined it cannot understand.
+        let version = schema_version(&conn)?;
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(Error::Invalid(format!(
+                "metadata schema version {version} is newer than supported {CURRENT_SCHEMA_VERSION}"
+            )));
+        }
+
+        // Once compatible, establish the persistent durability contract before
+        // any schema migration or metadata write.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
         conn.pragma_update(None, "synchronous", "FULL")
@@ -359,12 +371,6 @@ impl Meta {
             }
         }
 
-        let version = schema_version(&conn)?;
-        if version > CURRENT_SCHEMA_VERSION {
-            return Err(Error::Invalid(format!(
-                "metadata schema version {version} is newer than supported {CURRENT_SCHEMA_VERSION}"
-            )));
-        }
         migrate(&mut conn, version)?;
         conn.execute(
             "UPDATE cap_root SET hmac_key=X'' WHERE length(hmac_key) != 0",
