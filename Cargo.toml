@@ -34,7 +34,7 @@ ciborium = "0.2.2"
 clap = { version = "4.5.17", features = ["derive", "env"] }
 data-encoding = "2.6.0"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
-getrandom = "0.2.15"
+getrandom = "0.4.3"
 hmac = "0.12.1"
 libc = "0.2"
 lru = "0.18.2"

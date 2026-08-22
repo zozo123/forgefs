@@ -365,7 +365,7 @@ dependencies = [
  "forge-protocol",
  "forge-store",
  "forge-types",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "libc",
  "parking_lot",
  "serde",
