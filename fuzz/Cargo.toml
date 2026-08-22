@@ -11,10 +11,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 forge-core = { path = "../crates/forge-core" }
+forge-cap = { path = "../crates/forge-cap" }
 
 [[bin]]
 name = "object_decode"
 path = "fuzz_targets/object_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cap_token"
+path = "fuzz_targets/cap_token.rs"
 test = false
 doc = false
 bench = false
