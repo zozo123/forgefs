@@ -1,0 +1,37 @@
+name: many-agent-soak-driver
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  soak:
+    if: github.event.pull_request.head.ref == 'forgefs/many-agent-soak' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Wire bounded benchmark and run 256-agent regression
+        run: |
+          python3 .github/scripts/many_agent_wire.py
+          cargo fmt --all
+          cargo test -p forge-api --test many_agent_soak private_256_bounded_then_full_fsck --locked -- --nocapture
+      - name: Run explicit 1024 private + 256 shared soak
+        run: |
+          cargo test -p forge-api --test many_agent_soak private_1024_and_shared_256_survive_reopen_and_fsck --locked -- --ignored --nocapture
+      - name: Commit product-only bounded harness
+        run: |
+          rm .github/workflows/many-agent-soak-driver.yml .github/scripts/many_agent_wire.py
+          rmdir .github/scripts 2>/dev/null || true
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'P1: bounded 1024-agent soak and benchmark harness'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
