@@ -33,19 +33,6 @@ pub use soak::{
 p.write_text(s)
 
 
-p = Path("crates/forge-api/src/bench.rs")
-s = p.read_text()
-s = replace_once(
-    s,
-    '''             private = N threads, private refs (throughput; p50 includes convoy wait).\n\\
-             shared  = N threads, one ref; I8 pin ⇒ 1 Updated + N-1 Forked.\n",''',
-    '''             private = N logical agents (CLI uses bounded workers), private refs.\n\\
-             shared  = N pre-pinned writers; I8 pin ⇒ 1 Updated + N-1 Forked.\n",''',
-    "benchmark wording",
-)
-p.write_text(s)
-
-
 p = Path("crates/forge-cli/src/main.rs")
 s = p.read_text()
 s = replace_once(
