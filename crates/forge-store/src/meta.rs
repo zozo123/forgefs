@@ -3,6 +3,8 @@ use forge_types::{CasResult, Error, ObjectId, RefRow, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS refs (
@@ -123,8 +125,42 @@ pub struct ObservationRow {
     pub oid: ObjectId,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetaStats {
+    pub txn_us: u64,
+    pub busy: u64,
+    pub cas_updated: u64,
+    pub cas_forked: u64,
+    pub cas_denied: u64,
+}
+
+#[derive(Debug, Default)]
+struct MetaCounters {
+    txn_us: AtomicU64,
+    busy: AtomicU64,
+    cas_updated: AtomicU64,
+    cas_forked: AtomicU64,
+    cas_denied: AtomicU64,
+}
+
+struct TxnTimer<'a> {
+    started: Instant,
+    total_us: &'a AtomicU64,
+}
+
+impl Drop for TxnTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_micros();
+        self.total_us.fetch_add(
+            u64::try_from(elapsed).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 pub struct Meta {
     write: Mutex<Connection>,
+    stats: MetaCounters,
 }
 
 fn oid_from_blob(v: Vec<u8>) -> Result<ObjectId> {
@@ -231,6 +267,36 @@ fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
 }
 
 impl Meta {
+    pub fn stats(&self) -> MetaStats {
+        MetaStats {
+            txn_us: self.stats.txn_us.load(Ordering::Relaxed),
+            busy: self.stats.busy.load(Ordering::Relaxed),
+            cas_updated: self.stats.cas_updated.load(Ordering::Relaxed),
+            cas_forked: self.stats.cas_forked.load(Ordering::Relaxed),
+            cas_denied: self.stats.cas_denied.load(Ordering::Relaxed),
+        }
+    }
+
+    fn map_sql_counted(&self, error: rusqlite::Error) -> Error {
+        let error = map_sql(error);
+        if matches!(error, Error::Busy(_)) {
+            self.stats.busy.fetch_add(1, Ordering::Relaxed);
+        }
+        error
+    }
+
+    fn begin_tx<'a>(&self, conn: &'a mut Connection) -> Result<rusqlite::Transaction<'a>> {
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| self.map_sql_counted(error))
+    }
+
+    fn txn_timer(&self) -> TxnTimer<'_> {
+        TxnTimer {
+            started: Instant::now(),
+            total_us: &self.stats.txn_us,
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path).map_err(map_sql)?;
         let version = schema_version(&conn)?;
@@ -255,6 +321,7 @@ impl Meta {
         .map_err(map_sql)?;
         Ok(Self {
             write: Mutex::new(conn),
+            stats: MetaCounters::default(),
         })
     }
 
@@ -417,14 +484,14 @@ impl Meta {
     ) -> Result<CasResult> {
         validate_ref_kind(name, kind)?;
         if name.starts_with("tags/") {
+            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Denied(
                 "sealed tags cannot be updated through CAS".into(),
             ));
         }
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let tx = self.begin_tx(&mut conn)?;
+        let _txn_timer = self.txn_timer();
         let row = tx
             .query_row(
                 "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
@@ -439,7 +506,7 @@ impl Meta {
                 },
             )
             .optional()
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
 
         let ts = now_ms() as i64;
 
@@ -448,13 +515,14 @@ impl Meta {
                 "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
                 params![name, new.as_bytes().as_slice(), kind, ts],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             tx.execute(
                 "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'cas',?4)",
                 params![name, new.as_bytes().as_slice(), agent_id, ts],
             )
-            .map_err(map_sql)?;
-            tx.commit().map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
+            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
                 oid: new,
@@ -472,6 +540,7 @@ impl Meta {
             return Err(Error::Sealed(name.to_string()));
         }
         if prot != 0 && !allow_protected {
+            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Denied(format!(
                 "ref {name} is protected; only merge/seal may advance it"
             )));
@@ -488,7 +557,7 @@ impl Meta {
                     expected.as_bytes().as_slice()
                 ],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
 
         if n == 1 {
             tx.execute(
@@ -501,8 +570,9 @@ impl Meta {
                     ts
                 ],
             )
-            .map_err(map_sql)?;
-            tx.commit().map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
+            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
                 oid: new,
@@ -521,7 +591,7 @@ impl Meta {
             "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
             params![fork, new.as_bytes().as_slice(), kind, ts],
         )
-        .map_err(map_sql)?;
+        .map_err(|error| self.map_sql_counted(error))?;
         tx.execute(
             "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
             params![
@@ -532,8 +602,9 @@ impl Meta {
                 ts
             ],
         )
-        .map_err(map_sql)?;
-        tx.commit().map_err(map_sql)?;
+        .map_err(|error| self.map_sql_counted(error))?;
+        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
         Ok(CasResult::Forked {
             requested: name.to_string(),
             fork,
@@ -556,14 +627,14 @@ impl Meta {
     ) -> Result<CasResult> {
         validate_ref_kind(name, kind)?;
         if name.starts_with("tags/") {
+            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Denied(
                 "sealed tags cannot be updated through CAS".into(),
             ));
         }
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let tx = self.begin_tx(&mut conn)?;
+        let _txn_timer = self.txn_timer();
         let row = tx
             .query_row(
                 "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
@@ -578,7 +649,7 @@ impl Meta {
                 },
             )
             .optional()
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
 
         let ts = now_ms() as i64;
 
@@ -587,14 +658,15 @@ impl Meta {
                 "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
                 params![name, new.as_bytes().as_slice(), kind, ts],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             tx.execute(
                 "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'cas',?4)",
                 params![name, new.as_bytes().as_slice(), agent_id, ts],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-            tx.commit().map_err(map_sql)?;
+            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
                 oid: new,
@@ -612,6 +684,7 @@ impl Meta {
             return Err(Error::Sealed(name.to_string()));
         }
         if prot != 0 && !allow_protected {
+            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Denied(format!(
                 "ref {name} is protected; only merge/seal may advance it"
             )));
@@ -628,7 +701,7 @@ impl Meta {
                     expected.as_bytes().as_slice()
                 ],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
 
         if n == 1 {
             tx.execute(
@@ -641,9 +714,10 @@ impl Meta {
                     ts
                 ],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-            tx.commit().map_err(map_sql)?;
+            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
                 oid: new,
@@ -662,7 +736,7 @@ impl Meta {
             "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
             params![fork, new.as_bytes().as_slice(), kind, ts],
         )
-        .map_err(map_sql)?;
+        .map_err(|error| self.map_sql_counted(error))?;
         tx.execute(
             "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
             params![
@@ -673,9 +747,10 @@ impl Meta {
                 ts
             ],
         )
-        .map_err(map_sql)?;
+        .map_err(|error| self.map_sql_counted(error))?;
         Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-        tx.commit().map_err(map_sql)?;
+        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
         Ok(CasResult::Forked {
             requested: name.to_string(),
             fork,
@@ -698,9 +773,8 @@ impl Meta {
     ) -> Result<CasResult> {
         validate_ref_kind(name, "commit")?;
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let tx = self.begin_tx(&mut conn)?;
+        let _txn_timer = self.txn_timer();
         let row = tx
             .query_row(
                 "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
@@ -715,7 +789,7 @@ impl Meta {
                 },
             )
             .optional()
-            .map_err(map_sql)?
+            .map_err(|error| self.map_sql_counted(error))?
             .ok_or_else(|| Error::NotFound(format!("ref {name}")))?;
         let (oid_b, kind, protected, sealed) = row;
         if kind != "commit" {
@@ -725,6 +799,7 @@ impl Meta {
             return Err(Error::Sealed(name.to_string()));
         }
         if protected != 0 {
+            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Denied(format!(
                 "ref {name} is protected; session checkin cannot advance it"
             )));
@@ -738,15 +813,16 @@ impl Meta {
                     "UPDATE refs SET oid=?1, updated_ms=?2 WHERE name=?3 AND oid=?4 AND kind='commit' AND sealed=0 AND protected=0",
                     params![new.as_bytes().as_slice(), ts, name, expected.as_bytes().as_slice()],
                 )
-                .map_err(map_sql)?;
+                .map_err(|error| self.map_sql_counted(error))?;
             if n != 1 {
+                self.stats.busy.fetch_add(1, Ordering::Relaxed);
                 return Err(Error::Busy(format!("ref {name} changed during checkin")));
             }
             tx.execute(
                 "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'cas',?5)",
                 params![name, expected.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             CasResult::Updated {
                 name: name.to_string(),
                 oid: new,
@@ -763,19 +839,19 @@ impl Meta {
                 "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
                 params![fork, new.as_bytes().as_slice(), ts],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             tx.execute(
                 "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
                 params![fork, current.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
             let root_spec = format!("ref:{fork}");
             let n = tx
                 .execute(
                     "UPDATE mounts SET spec=?1 WHERE ns_id=?2 AND path=?3",
                     params![root_spec, ns_id, mount_path],
                 )
-                .map_err(map_sql)?;
+                .map_err(|error| self.map_sql_counted(error))?;
             if n != 1 {
                 return Err(Error::Corrupt(format!(
                     "missing checkin mount {ns_id}:{mount_path}"
@@ -793,20 +869,29 @@ impl Meta {
             "DELETE FROM overlay WHERE ns_id=?1 AND mount=?2",
             params![ns_id, mount_path],
         )
-        .map_err(map_sql)?;
+        .map_err(|error| self.map_sql_counted(error))?;
         let n = tx
             .execute(
                 "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
                 params![new.as_bytes().as_slice(), ns_id],
             )
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
         if n != 1 {
             return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
         }
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
-            .map_err(map_sql)?;
+            .map_err(|error| self.map_sql_counted(error))?;
         Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-        tx.commit().map_err(map_sql)?;
+        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        match &result {
+            CasResult::Updated { .. } => {
+                self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
+            }
+            CasResult::Forked { .. } => {
+                self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
+            }
+            CasResult::Noop { .. } => {}
+        }
         Ok(result)
     }
 

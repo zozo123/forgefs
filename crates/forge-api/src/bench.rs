@@ -11,7 +11,7 @@
 
 use crate::{ApiStats, Forge};
 use forge_cap::Cap;
-use forge_store::blob::BlobStoreStats;
+use forge_store::{blob::BlobStoreStats, MetaStats};
 use forge_types::{CasResult, Error, Result};
 use std::sync::Arc;
 use std::thread;
@@ -68,6 +68,7 @@ pub struct BenchReport {
     pub merge_seal: Option<Duration>,
     pub verify: Option<Duration>,
     pub store: Option<BlobStoreStats>,
+    pub meta: Option<MetaStats>,
     pub api: Option<ApiStats>,
 }
 
@@ -120,6 +121,16 @@ impl BenchReport {
             s.push_str(&format!(
                 "storage          puts={} fsync_file={} fsync_dir={}\n",
                 stats.puts, stats.fsync_file, stats.fsync_dir
+            ));
+        }
+        if let Some(stats) = self.meta {
+            s.push_str(&format!(
+                "sqlite           txn={:.3}ms busy={} updated={} forked={} denied={}\n",
+                stats.txn_us as f64 / 1000.0,
+                stats.busy,
+                stats.cas_updated,
+                stats.cas_forked,
+                stats.cas_denied,
             ));
         }
         if let Some(stats) = self.api {
@@ -329,6 +340,7 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         merge_seal: Some(merge_seal),
         verify: Some(verify),
         store: Some(store),
+        meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
     })
 }
