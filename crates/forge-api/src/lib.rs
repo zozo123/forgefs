@@ -870,12 +870,51 @@ impl Forge {
     pub fn show(&self, cap: &Cap, spec: &str) -> Result<String> {
         self.check_spec_read(cap, spec)?;
         let oid = self.resolve_spec_oid(spec)?;
+        let ty = self.store.object_type(oid)?;
+        if ty == ObjectType::Conflict {
+            let conflict = self.store.get_conflict(oid)?;
+            let fmt_oid = |id: Option<ObjectId>| id.map(|v| v.hex()).unwrap_or_else(|| "-".into());
+            let mut out = String::new();
+            out.push_str(&format!("conflict {oid}\n"));
+            out.push_str(&format!(
+                "bases {}\n",
+                if conflict.bases.is_empty() {
+                    "-".into()
+                } else {
+                    conflict
+                        .bases
+                        .iter()
+                        .map(ObjectId::hex)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            ));
+            out.push_str(&format!("ours {}\n", conflict.ours));
+            out.push_str(&format!("theirs {}\n", conflict.theirs));
+            for path in conflict.paths {
+                out.push_str(&format!(
+                    "path {} a={} b={} base={}\n",
+                    path.path,
+                    fmt_oid(path.a),
+                    fmt_oid(path.b),
+                    fmt_oid(path.base)
+                ));
+            }
+            if !conflict.causal.is_empty() {
+                out.push_str(&format!(
+                    "causal {}\n",
+                    conflict
+                        .causal
+                        .iter()
+                        .map(ObjectId::hex)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            return Ok(out.trim_end().to_string());
+        }
         let bytes = self.store.get_raw(oid)?;
-        Ok(format!(
-            "{} {} bytes",
-            self.store.object_type(oid)?.as_str(),
-            bytes.len()
-        ))
+        Ok(format!("{} {} bytes", ty.as_str(), bytes.len()))
     }
 }
 
