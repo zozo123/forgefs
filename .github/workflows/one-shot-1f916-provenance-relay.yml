@@ -1,7 +1,7 @@
 name: one-shot-1f916-provenance-relay
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened]
 
 permissions:
@@ -10,8 +10,11 @@ permissions:
 
 jobs:
   post:
-    if: "${{ github.event.pull_request.head.ref == 'relay/1f916-box-provenance' && github.event.pull_request.head.repo.full_name == github.repository }}"
-    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'relay/1f916-box-provenance-v2' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
     env:
       GH_TOKEN: ${{ github.token }}
