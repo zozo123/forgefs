@@ -10,7 +10,11 @@ fn read_only_cap_cannot_open_writable_session() {
     let read_only = f
         .grant(
             &root,
-            vec!["ops=read".into(), "allow=read:main".into(), "agent=reader".into()],
+            vec![
+                "ops=read".into(),
+                "allow=read:main".into(),
+                "agent=reader".into(),
+            ],
         )
         .unwrap();
 
@@ -29,7 +33,11 @@ fn show_obeys_concrete_ref_scope_and_raw_oid_policy() {
     let public = f
         .grant(
             &root,
-            vec!["ops=read".into(), "allow=read:public".into(), "agent=reader".into()],
+            vec![
+                "ops=read".into(),
+                "allow=read:public".into(),
+                "agent=reader".into(),
+            ],
         )
         .unwrap();
 
