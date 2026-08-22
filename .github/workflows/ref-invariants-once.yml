@@ -1,0 +1,136 @@
+name: ref-invariants-once
+on:
+  push:
+    branches: [forgefs/p0-ref-invariants]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch ref invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+          anchor = '''fn map_sql(e: rusqlite::Error) -> Error {
+    let s = e.to_string();
+    if s.contains("database is locked") || s.contains("busy") {
+        Error::Busy(s)
+    } else {
+        Error::Sqlite(s)
+    }
+}
+'''
+          helper = anchor + '''
+fn validate_ref_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 512 || name.starts_with('/') || name.ends_with('/') {
+        return Err(Error::Invalid(format!("invalid ref name {name:?}")));
+    }
+    for part in name.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(Error::Invalid(format!("invalid ref component in {name:?}")));
+        }
+        if part.chars().any(|c| c.is_control() || c == '\\\\' || c == ':') {
+            return Err(Error::Invalid(format!("invalid ref character in {name:?}")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
+    validate_ref_name(name)?;
+    if (name == "main" || name.starts_with("heads/") || name.starts_with("forks/"))
+        && kind != "commit"
+    {
+        return Err(Error::Invalid(format!("{name} must point to a commit")));
+    }
+    if name.starts_with("conflicts/") && kind != "conflict" {
+        return Err(Error::Invalid(format!("{name} must point to a conflict")));
+    }
+    if name.starts_with("tags/") && kind != "snapshot" {
+        return Err(Error::Invalid(format!("{name} must point to a snapshot")));
+    }
+    Ok(())
+}
+'''
+          if s.count(anchor) != 1:
+              raise SystemExit('map_sql anchor mismatch')
+          s = s.replace(anchor, helper, 1)
+
+          sig = '''    ) -> Result<()> {
+        let conn = self.write.lock();
+        let ts = now_ms() as i64;
+'''
+          repl = '''    ) -> Result<()> {
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied("tags may only be created by seal".into()));
+        }
+        let conn = self.write.lock();
+        let ts = now_ms() as i64;
+'''
+          # only the first matching block after insert_ref
+          idx = s.index('    pub fn insert_ref(')
+          pre, tail = s[:idx], s[idx:]
+          if tail.count(sig) < 1:
+              raise SystemExit('insert_ref anchor mismatch')
+          tail = tail.replace(sig, repl, 1)
+          s = pre + tail
+
+          cas = '''    ) -> Result<CasResult> {
+        let mut conn = self.write.lock();
+'''
+          cas_repl = '''    ) -> Result<CasResult> {
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied("sealed tag namespace is immutable".into()));
+        }
+        let mut conn = self.write.lock();
+'''
+          if s.count(cas) != 1:
+              raise SystemExit('cas anchor mismatch')
+          s = s.replace(cas, cas_repl, 1)
+
+          old = '''        let (oid_b, _k, prot, sealed) = row.unwrap();
+        let current = oid_from_blob(oid_b)?;
+'''
+          new = '''        let (oid_b, current_kind, prot, sealed) = row.unwrap();
+        if current_kind != kind {
+            return Err(Error::Invalid(format!(
+                "ref {name} kind is immutable: {current_kind} -> {kind}"
+            )));
+        }
+        let current = oid_from_blob(oid_b)?;
+'''
+          if s.count(old) != 1:
+              raise SystemExit('kind anchor mismatch')
+          s = s.replace(old, new, 1)
+
+          seal = '''        let ts = now_ms() as i64;
+        let tag_ref = format!("tags/{tag}");
+        tx.execute(
+'''
+          seal_repl = '''        let ts = now_ms() as i64;
+        let tag_ref = format!("tags/{tag}");
+        validate_ref_kind(&tag_ref, "snapshot")?;
+        tx.execute(
+'''
+          if s.count(seal) != 1:
+              raise SystemExit('seal anchor mismatch')
+          s = s.replace(seal, seal_repl, 1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test -p forge-store --test ref_invariants --locked
+      - name: Commit source only
+        run: |
+          rm .github/workflows/ref-invariants-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-store/src/meta.rs .github/workflows/ref-invariants-once.yml
+          git commit -m 'Enforce typed ref namespace invariants'
+          git push
