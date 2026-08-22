@@ -4,13 +4,20 @@ use forge_types::{Error, Result};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Read};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
-use std::sync::Arc;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::{
+    mpsc::{sync_channel, TrySendError},
+    Arc, Mutex,
+};
 use std::thread;
+use std::time::Duration;
 
 const MAX_HTTP_BODY: usize = 1024 * 1024;
+const MAX_UNIX_WORKERS: usize = 64;
+const MAX_PENDING_UNIX: usize = 256;
+const UNIX_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
     let root = forge.root().to_path_buf();
@@ -42,11 +49,14 @@ pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
 
     if http {
         let f = forge.clone();
-        thread::spawn(move || {
-            if let Err(e) = serve_http(f, "127.0.0.1:4077") {
-                eprintln!("forge http: {e}");
-            }
-        });
+        thread::Builder::new()
+            .name("forge-http".into())
+            .spawn(move || {
+                if let Err(e) = serve_http(f, "127.0.0.1:4077") {
+                    eprintln!("forge http: {e}");
+                }
+            })
+            .map_err(|e| Error::Internal(format!("spawn http thread: {e}")))?;
     }
 
     // Keep lock_file alive for the complete service lifetime.
@@ -57,34 +67,76 @@ pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
     result
 }
 
+fn worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(4).clamp(8, MAX_UNIX_WORKERS))
+        .unwrap_or(16)
+}
+
 fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
-    for stream in listener.incoming() {
-        let stream = stream?;
+    // Fixed workers + bounded admission queue: a connection flood consumes a
+    // bounded amount of memory and threads instead of spawning without limit.
+    let (tx, rx) = sync_channel::<UnixStream>(MAX_PENDING_UNIX);
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..worker_count() {
         let f = forge.clone();
-        thread::spawn(move || {
-            let reader_stream = match stream.try_clone() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut r = BufReader::new(reader_stream);
-            let mut w = BufWriter::new(stream);
-            while let Ok(buf) = read_frame(&mut r) {
-                let req: Request = match serde_json::from_slice(&buf) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        let _ =
-                            write_frame(&mut w, &Response::err(0, &Error::Invalid(e.to_string())));
-                        continue;
+        let rx = rx.clone();
+        thread::Builder::new()
+            .name(format!("forge-unix-{i}"))
+            .spawn(move || loop {
+                let stream = {
+                    let guard = match rx.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                    match guard.recv() {
+                        Ok(stream) => stream,
+                        Err(_) => return,
                     }
                 };
-                let resp = dispatch(&f, req);
-                if write_frame(&mut w, &resp).is_err() {
-                    break;
-                }
+                handle_unix(&f, stream);
+            })
+            .map_err(|e| Error::Internal(format!("spawn unix worker: {e}")))?;
+    }
+
+    for stream in listener.incoming() {
+        let stream = stream?;
+        match tx.try_send(stream) {
+            Ok(()) => {}
+            Err(TrySendError::Full(stream)) => {
+                // Fast overload rejection is safer than queueing unbounded work.
+                let _ = stream.shutdown(Shutdown::Both);
             }
-        });
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(Error::Internal("unix worker pool disconnected".into()));
+            }
+        }
     }
     Ok(())
+}
+
+fn handle_unix(forge: &Forge, stream: UnixStream) {
+    let _ = stream.set_read_timeout(Some(UNIX_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(UNIX_IO_TIMEOUT));
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut r = BufReader::new(reader_stream);
+    let mut w = BufWriter::new(stream);
+    while let Ok(buf) = read_frame(&mut r) {
+        let req: Request = match serde_json::from_slice(&buf) {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = write_frame(&mut w, &Response::err(0, &Error::Invalid(e.to_string())));
+                continue;
+            }
+        };
+        let resp = dispatch(forge, req);
+        if write_frame(&mut w, &resp).is_err() {
+            break;
+        }
+    }
 }
 
 fn serve_http(forge: Arc<Forge>, addr: &str) -> Result<()> {
@@ -162,11 +214,25 @@ fn serve_http(forge: Arc<Forge>, addr: &str) -> Result<()> {
         };
         let resp = dispatch(&forge, envelope);
         let payload = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
-        let status = if resp.ok { 200 } else { 400 };
-        let r = tiny_http::Response::from_data(payload).with_status_code(status);
+        let r = tiny_http::Response::from_data(payload).with_status_code(http_status(&resp));
         let _ = req.respond(r);
     }
     Ok(())
+}
+
+fn http_status(resp: &Response) -> u16 {
+    if resp.ok {
+        return 200;
+    }
+    match resp.err.as_ref().map(|e| e.code.as_str()) {
+        Some("denied") => 403,
+        Some("not_found") => 404,
+        Some("sealed" | "conflict" | "stale_observation" | "invalid_base") => 409,
+        Some("busy") => 503,
+        Some("invalid") => 400,
+        Some("corrupt" | "internal") | None => 500,
+        Some(_) => 500,
+    }
 }
 
 pub fn dispatch(forge: &Forge, req: Request) -> Response {
@@ -264,5 +330,47 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
             Ok(json!({"oid": oid.hex()}))
         }
         other => Err(Error::Invalid(format!("unknown op {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_pool_is_bounded() {
+        assert!((8..=MAX_UNIX_WORKERS).contains(&worker_count()));
+        assert_eq!(MAX_PENDING_UNIX, 256);
+    }
+
+    #[test]
+    fn http_errors_have_semantic_status_codes() {
+        assert_eq!(
+            http_status(&Response::err(1, &Error::Denied("x".into()))),
+            403
+        );
+        assert_eq!(
+            http_status(&Response::err(1, &Error::NotFound("x".into()))),
+            404
+        );
+        assert_eq!(
+            http_status(&Response::err(1, &Error::Busy("x".into()))),
+            503
+        );
+        assert_eq!(
+            http_status(&Response::err(
+                1,
+                &Error::StaleObservation {
+                    path: "x".into(),
+                    expected: "a".into(),
+                    found: "b".into(),
+                }
+            )),
+            409
+        );
+        assert_eq!(
+            http_status(&Response::err(1, &Error::Corrupt("x".into()))),
+            500
+        );
     }
 }
