@@ -12,6 +12,9 @@ fn mutable_metadata_cannot_replace_the_local_seal_trust_root() {
     store.meta.set_cap_root(&[7u8; 32]).unwrap();
     drop(store);
 
-    let err = Forge::open(d.path()).unwrap_err();
+    let err = match Forge::open(d.path()) {
+        Ok(_) => panic!("forged metadata trust root was accepted"),
+        Err(err) => err,
+    };
     assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
 }
