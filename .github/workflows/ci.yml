@@ -56,4 +56,4 @@ jobs:
           toolchain: 1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Concurrent agent smoke benchmark
-        run: cargo run --locked -p forge-cli -- bench --agents 32 --shared 16
+        run: cargo run --locked -p forge-cli -- bench --agents 32 --shared 16 --workers 16
