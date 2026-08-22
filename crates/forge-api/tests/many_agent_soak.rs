@@ -1,6 +1,4 @@
-use forge_api::{
-    private_checkins_bounded, shared_stampede_bounded, Forge,
-};
+use forge_api::{private_checkins_bounded, shared_stampede_bounded, Forge};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -10,8 +8,7 @@ fn private_256_bounded_then_full_fsck() {
     let forge = Arc::new(Forge::init(d.path()).unwrap());
     let root = forge.root_cap().unwrap();
 
-    let (p, wall, updated) =
-        private_checkins_bounded(forge.clone(), &root, 256, 32).unwrap();
+    let (p, wall, updated) = private_checkins_bounded(forge.clone(), &root, 256, 32).unwrap();
     assert_eq!(updated, 256);
     assert_eq!(p.n, 256);
     eprintln!(
@@ -34,8 +31,7 @@ fn private_1024_and_shared_256_survive_reopen_and_fsck() {
     let forge = Arc::new(Forge::init(d.path()).unwrap());
     let root = forge.root_cap().unwrap();
 
-    let (p, wall, updated) =
-        private_checkins_bounded(forge.clone(), &root, 1024, 64).unwrap();
+    let (p, wall, updated) = private_checkins_bounded(forge.clone(), &root, 1024, 64).unwrap();
     assert_eq!(updated, 1024);
     assert_eq!(p.n, 1024);
     eprintln!(
@@ -48,8 +44,7 @@ fn private_1024_and_shared_256_survive_reopen_and_fsck() {
         p.max_us as f64 / 1000.0
     );
 
-    let (p, wall, winners, forks) =
-        shared_stampede_bounded(forge.clone(), &root, 256, 64).unwrap();
+    let (p, wall, winners, forks) = shared_stampede_bounded(forge.clone(), &root, 256, 64).unwrap();
     assert_eq!(winners, 1);
     assert_eq!(forks, 255);
     assert_eq!(p.n, 256);
