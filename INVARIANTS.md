@@ -29,5 +29,8 @@ cap         (operation, resource); attenuation ⊆ parent
 | I13 | Authority(c+d) ⊆ Authority(c). Holder attenuates without the root secret. |
 | I14 | No ambient root. Namespace ID is not a capability. |
 | I15 | verify/fsck reread durable bytes and this forge's seal key. |
+| I16 | Tree names are exact UTF-8 bytes: no Unicode normalization or case folding occurs in core identity. |
+
+A composed Unicode name and its canonically equivalent decomposed spelling are distinct ForgeFS entries if their UTF-8 byte strings differ. Likewise `Foo` and `foo` are distinct. Export adapters must detect target-filesystem collisions and fail rather than silently normalize, fold, or overwrite names.
 
 Tests are named after these IDs. A PR that cannot name an invariant does not merge.
