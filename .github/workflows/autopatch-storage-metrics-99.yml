@@ -1,0 +1,102 @@
+name: autopatch-storage-metrics-99
+
+on:
+  push:
+    branches: [metrics/blobstore-99]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: metrics/blobstore-99
+          persist-credentials: true
+      - name: Add durable put/fsync counters
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-store/src/blob.rs')
+          s = p.read_text()
+          s = s.replace(
+              'use std::path::{Path, PathBuf};\nuse std::time::{SystemTime, UNIX_EPOCH};',
+              'use std::path::{Path, PathBuf};\nuse std::sync::{\n    atomic::{AtomicU64, Ordering},\n    Arc,\n};\nuse std::time::{SystemTime, UNIX_EPOCH};'
+          )
+          old = '''const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;\n\n#[derive(Clone, Debug)]\npub struct LocalBlobStore {\n    root: PathBuf,\n}'''
+          new = '''const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;\n\n#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]\npub struct BlobStoreStats {\n    pub puts: u64,\n    pub fsync_file: u64,\n    pub fsync_dir: u64,\n}\n\n#[derive(Debug, Default)]\nstruct BlobStoreCounters {\n    puts: AtomicU64,\n    fsync_file: AtomicU64,\n    fsync_dir: AtomicU64,\n}\n\n#[derive(Clone, Debug)]\npub struct LocalBlobStore {\n    root: PathBuf,\n    stats: Arc<BlobStoreCounters>,\n}'''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+
+          old = '''    pub fn new(root: PathBuf) -> Result<Self> {\n        let objects = root.join("objects");\n        let tmp = root.join("tmp");\n        ensure_dir_durable(&root, &objects)?;\n        ensure_dir_durable(&root, &tmp)?;\n        cleanup_stale_tmp(&tmp)?;\n        Ok(Self { root })\n    }'''
+          new = '''    pub fn new(root: PathBuf) -> Result<Self> {\n        let stats = Arc::new(BlobStoreCounters::default());\n        let objects = root.join("objects");\n        let tmp = root.join("tmp");\n        ensure_dir_durable(&root, &objects, &stats)?;\n        ensure_dir_durable(&root, &tmp, &stats)?;\n        cleanup_stale_tmp(&tmp, &stats)?;\n        Ok(Self { root, stats })\n    }'''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+
+          s = s.replace('ensure_dir_durable(&objects, &shard_a)?;', 'ensure_dir_durable(&objects, &shard_a, &self.stats)?;')
+          s = s.replace('ensure_dir_durable(&shard_a, &shard_b)?;', 'ensure_dir_durable(&shard_a, &shard_b, &self.stats)?;')
+          s = s.replace('ensure_dir_durable(&self.root, &tmp_dir)?;', 'ensure_dir_durable(&self.root, &tmp_dir, &self.stats)?;')
+          s = s.replace(
+              '            f.sync_all()?;\n        }',
+              '            f.sync_all()?;\n            self.stats.fsync_file.fetch_add(1, Ordering::Relaxed);\n        }',
+              1,
+          )
+          s = s.replace(
+              '                sync_dir(&shard_b)?;\n                let _ = fs::remove_file(&tmp);\n                Ok(id)',
+              '                sync_dir_counted(&shard_b, &self.stats)?;\n                self.stats.puts.fetch_add(1, Ordering::Relaxed);\n                let _ = fs::remove_file(&tmp);\n                Ok(id)'
+          )
+
+          marker = '''    pub fn has(&self, id: ObjectId) -> bool {\n        self.object_path(id).exists()\n    }\n}'''
+          replacement = '''    pub fn has(&self, id: ObjectId) -> bool {\n        self.object_path(id).exists()\n    }\n\n    pub fn stats(&self) -> BlobStoreStats {\n        BlobStoreStats {\n            puts: self.stats.puts.load(Ordering::Relaxed),\n            fsync_file: self.stats.fsync_file.load(Ordering::Relaxed),\n            fsync_dir: self.stats.fsync_dir.load(Ordering::Relaxed),\n        }\n    }\n}\n\nimpl crate::Store {\n    pub fn stats(&self) -> BlobStoreStats {\n        self.blobs.stats()\n    }\n}'''
+          assert s.count(marker) == 1
+          s = s.replace(marker, replacement)
+
+          old = '''fn ensure_dir_durable(parent: &Path, child: &Path) -> Result<()> {\n    match fs::create_dir(child) {\n        Ok(()) => sync_dir(parent),\n        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),\n        Err(e) => Err(Error::Io(e.to_string())),\n    }\n}'''
+          new = '''fn ensure_dir_durable(parent: &Path, child: &Path, stats: &BlobStoreCounters) -> Result<()> {\n    match fs::create_dir(child) {\n        Ok(()) => sync_dir_counted(parent, stats),\n        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),\n        Err(e) => Err(Error::Io(e.to_string())),\n    }\n}'''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          s = s.replace('fn cleanup_stale_tmp(tmp: &Path) -> Result<()> {', 'fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {')
+          s = s.replace('        sync_dir(tmp)?;', '        sync_dir_counted(tmp, stats)?;')
+          old = '''fn sync_dir(path: &Path) -> Result<()> {\n    fs::File::open(path)?.sync_all()?;\n    Ok(())\n}'''
+          new = '''fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {\n    fs::File::open(path)?.sync_all()?;\n    stats.fsync_dir.fetch_add(1, Ordering::Relaxed);\n    Ok(())\n}'''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+
+          test_marker = '''    #[test]\n    fn corrupt_existing_object_is_rejected() {'''
+          test = '''    #[test]\n    fn stats_count_new_durable_publications_not_dedup_hits() {\n        let d = tempdir().unwrap();\n        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();\n        let before = s.stats();\n        let id = s.put(b"measured").unwrap();\n        let after = s.stats();\n        assert_eq!(after.puts, before.puts + 1);\n        assert_eq!(after.fsync_file, before.fsync_file + 1);\n        assert!(after.fsync_dir > before.fsync_dir);\n        s.put(b"measured").unwrap();\n        assert_eq!(s.stats(), after);\n        assert_eq!(s.get(id).unwrap(), b"measured");\n    }\n\n'''
+          assert s.count(test_marker) == 1
+          s = s.replace(test_marker, test + test_marker)
+          p.write_text(s)
+
+          p = Path('crates/forge-api/src/bench.rs')
+          s = p.read_text()
+          s = s.replace('use forge_cap::Cap;\n', 'use forge_cap::Cap;\nuse forge_store::blob::BlobStoreStats;\n')
+          s = s.replace('    pub verify: Option<Duration>,\n}', '    pub verify: Option<Duration>,\n    pub store: Option<BlobStoreStats>,\n}')
+          s = s.replace(
+              '        if let Some(d) = self.verify {\n            s.push_str(&format!("verify           wall={:.3}s\\n", d.as_secs_f64()));\n        }',
+              '        if let Some(d) = self.verify {\n            s.push_str(&format!("verify           wall={:.3}s\\n", d.as_secs_f64()));\n        }\n        if let Some(stats) = self.store {\n            s.push_str(&format!(\n                "storage          puts={} fsync_file={} fsync_dir={}\\n",\n                stats.puts, stats.fsync_file, stats.fsync_dir\n            ));\n        }'
+          )
+          old = '''    forge.verify_tag(&root, "bench")?;\n    Ok(BenchReport {\n        serial: Some(serial),\n        private: Some(private),\n        shared: Some(shared_r),\n        merge_seal: Some(merge_seal),\n        verify: Some(t0.elapsed()),\n    })'''
+          new = '''    forge.verify_tag(&root, "bench")?;\n    let verify = t0.elapsed();\n    let store = forge.store.stats();\n    Ok(BenchReport {\n        serial: Some(serial),\n        private: Some(private),\n        shared: Some(shared_r),\n        merge_seal: Some(merge_seal),\n        verify: Some(verify),\n        store: Some(store),\n    })'''
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+
+          p = Path('crates/forge-api/src/soak.rs')
+          s = p.read_text()
+          old = '''    Ok(BenchReport {\n        serial: Some(serial),\n        private: Some(private),\n        shared: Some(shared_result),\n        merge_seal: Some(merge_seal),\n        verify: Some(verify),\n    })'''
+          new = '''    let store = forge.store.stats();\n    Ok(BenchReport {\n        serial: Some(serial),\n        private: Some(private),\n        shared: Some(shared_result),\n        merge_seal: Some(merge_seal),\n        verify: Some(verify),\n        store: Some(store),\n    })'''
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+          PY
+
+          git rm .github/workflows/autopatch-storage-metrics-99.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-store/src/blob.rs crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs
+          git commit -m 'metrics: count durable puts and fsyncs (#99)'
+          git push origin HEAD:metrics/blobstore-99
