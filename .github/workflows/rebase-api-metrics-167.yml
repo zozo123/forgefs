@@ -1,0 +1,73 @@
+name: rebase-api-metrics-167
+
+on:
+  push:
+    branches: [metrics/api-errors-101-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: metrics/api-errors-101-v2
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Merge main and reapply API metrics on benchmark surface
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin main
+          set +e
+          git merge --no-edit origin/main
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            unresolved="$(git diff --name-only --diff-filter=U | sort)"
+            expected="$(printf '%s\n' crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs | sort)"
+            if [ "$unresolved" != "$expected" ]; then
+              echo "unexpected conflicts:"
+              printf '%s\n' "$unresolved"
+              exit 1
+            fi
+            git checkout --theirs crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs
+            git add crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-api/src/bench.rs')
+          s = p.read_text()
+          assert 'use crate::Forge;' in s
+          s = s.replace('use crate::Forge;', 'use crate::{ApiStats, Forge};')
+          marker = '    pub meta: Option<MetaStats>,\n}'
+          assert s.count(marker) == 1
+          s = s.replace(marker, '    pub meta: Option<MetaStats>,\n    pub api: Option<ApiStats>,\n}')
+          render = '''        if let Some(stats) = self.meta {\n            s.push_str(&format!(\n                "sqlite           txn={:.3}ms busy={} updated={} forked={} denied={}\\n",\n                stats.txn_us as f64 / 1000.0,\n                stats.busy,\n                stats.cas_updated,\n                stats.cas_forked,\n                stats.cas_denied,\n            ));\n        }'''
+          assert s.count(render) == 1
+          api_render = render + '''\n        if let Some(stats) = self.api {\n            let wall_s = self\n                .private\n                .as_ref()\n                .map(|(_, d, _)| d.as_secs_f64())\n                .unwrap_or(0.0)\n                + self\n                    .shared\n                    .as_ref()\n                    .map(|(_, d, _, _)| d.as_secs_f64())\n                    .unwrap_or(0.0);\n            let rate = |n: u64| if wall_s > 0.0 { n as f64 / wall_s } else { 0.0 };\n            s.push_str(&format!(\n                "api outcomes     stale={} ({:.2}/s) conflict={} ({:.2}/s)\\n",\n                stats.stale_observation,\n                rate(stats.stale_observation),\n                stats.merge_conflict,\n                rate(stats.merge_conflict),\n            ));\n        }'''
+          s = s.replace(render, api_render)
+          tail = '''        store: Some(store),\n        meta: Some(forge.store.meta.stats()),\n    })'''
+          assert s.count(tail) == 1
+          s = s.replace(tail, '''        store: Some(store),\n        meta: Some(forge.store.meta.stats()),\n        api: Some(forge.api_stats()),\n    })''')
+          p.write_text(s)
+
+          p = Path('crates/forge-api/src/soak.rs')
+          s = p.read_text()
+          tail = '''        store: Some(store),\n        meta: Some(forge.store.meta.stats()),\n    })'''
+          assert s.count(tail) == 1
+          s = s.replace(tail, '''        store: Some(store),\n        meta: Some(forge.store.meta.stats()),\n        api: Some(forge.api_stats()),\n    })''')
+          p.write_text(s)
+          PY
+
+          cargo fmt --all
+          git rm .github/workflows/rebase-api-metrics-167.yml
+          git add crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs
+          git commit -m 'merge main: compose SQLite and API observability (#167)'
+          git push origin HEAD:metrics/api-errors-101-v2
