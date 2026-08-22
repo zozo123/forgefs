@@ -35,6 +35,52 @@ jobs:
               'git push origin HEAD:objects/contribution-108',
               'git push origin HEAD:objects/contribution-108-v2',
           )
+          fsck_patch = r'''python3 - <<'PYFSCK'
+          from pathlib import Path
+          p = Path('crates/forge-api/src/fsck.rs')
+          s = p.read_text()
+          old_import = 'use forge_core::{decode_object_type, Blob, Commit, Conflict, Snapshot, Tree};'
+          new_import = 'use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};'
+          if old_import not in s:
+              raise SystemExit('fsck import marker drifted')
+          s = s.replace(old_import, new_import, 1)
+          marker = '            ObjectType::Conflict => Conflict::decode(&bytes).map(|conflict| {'
+          arm = '''            ObjectType::Contribution => Contribution::decode(&bytes).map(|contribution| {
+              queue.push_back((
+                  contribution.base,
+                  Some(ObjectType::Commit),
+                  format!("contribution:{id}:base"),
+              ));
+              queue.push_back((
+                  contribution.tree,
+                  Some(ObjectType::Tree),
+                  format!("contribution:{id}:tree"),
+              ));
+              for parent in contribution.parents {
+                  queue.push_back((
+                      parent,
+                      Some(ObjectType::Commit),
+                      format!("contribution:{id}:parent"),
+                  ));
+              }
+              for read in contribution.reads {
+                  queue.push_back((
+                      read.id,
+                      None,
+                      format!("contribution:{id}:read:{}", read.path),
+                  ));
+              }
+          }),
+'''
+          if marker not in s:
+              raise SystemExit('fsck match marker drifted')
+          p.write_text(s.replace(marker, arm + marker, 1))
+          PYFSCK
+          '''
+          needle = 'cargo fmt --all\n'
+          if needle not in s:
+              raise SystemExit('worker cargo fmt marker drifted')
+          s = s.replace(needle, fsck_patch + needle, 1)
           p.write_text(s)
           PY
           bash /tmp/contribution-worker.sh
