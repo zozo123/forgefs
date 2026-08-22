@@ -340,8 +340,11 @@ impl Forge {
 
     /// List only the calling agent's concrete inbox refs that its cap can read.
     pub fn inbox_list(&self, cap: &Cap) -> Result<Vec<RefRow>> {
-        verify(&self.hmac_key, cap)?;
-        let agent = sanitize_agent(cap.agent_id());
+        self.check(cap, Op::Read, None)?;
+        let agent = cap.agent_id();
+        if sanitize_agent(agent) != agent || agent == "anon" {
+            return Err(Error::Invalid(format!("invalid inbox agent {agent:?}")));
+        }
         let prefix = format!("inbox/{agent}/");
         let mut out = Vec::new();
         for row in self.store.meta.list_refs()? {

@@ -68,3 +68,21 @@ fn invalid_inbox_recipient_fails_closed() {
     forge.seal(&root, "main", "v1.0").unwrap();
     assert!(forge.inbox_push(&root, "../bob", "tags/v1.0").is_err());
 }
+
+#[test]
+fn inbox_list_requires_read_authority() {
+    let d = tempdir().unwrap();
+    let forge = Forge::init(d.path()).unwrap();
+    let root = forge.root_cap().unwrap();
+    let write_only = forge
+        .grant(
+            &root,
+            vec![
+                "ops=write".into(),
+                "agent=bob".into(),
+                "ref=inbox/bob/*".into(),
+            ],
+        )
+        .unwrap();
+    assert!(forge.inbox_list(&write_only).is_err());
+}
