@@ -202,11 +202,13 @@ pub fn run_bench_with_workers(
             fsck.findings.len()
         )));
     }
+    let store = forge.store.stats();
     Ok(BenchReport {
         serial: Some(serial),
         private: Some(private),
         shared: Some(shared_result),
         merge_seal: Some(merge_seal),
         verify: Some(verify),
+        store: Some(store),
     })
 }

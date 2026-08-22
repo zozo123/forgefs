@@ -11,6 +11,7 @@
 
 use crate::Forge;
 use forge_cap::Cap;
+use forge_store::blob::BlobStoreStats;
 use forge_types::{CasResult, Error, Result};
 use std::sync::Arc;
 use std::thread;
@@ -66,6 +67,7 @@ pub struct BenchReport {
     pub shared: Option<(Percentiles, Duration, usize, usize)>,
     pub merge_seal: Option<Duration>,
     pub verify: Option<Duration>,
+    pub store: Option<BlobStoreStats>,
 }
 
 impl BenchReport {
@@ -112,6 +114,12 @@ impl BenchReport {
         }
         if let Some(d) = self.verify {
             s.push_str(&format!("verify           wall={:.3}s\n", d.as_secs_f64()));
+        }
+        if let Some(stats) = self.store {
+            s.push_str(&format!(
+                "storage          puts={} fsync_file={} fsync_dir={}\n",
+                stats.puts, stats.fsync_file, stats.fsync_dir
+            ));
         }
         s
     }
@@ -291,11 +299,14 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
     let merge_seal = merge_all_and_seal(&forge, &root, &integ, "bench")?;
     let t0 = Instant::now();
     forge.verify_tag(&root, "bench")?;
+    let verify = t0.elapsed();
+    let store = forge.store.stats();
     Ok(BenchReport {
         serial: Some(serial),
         private: Some(private),
         shared: Some(shared_r),
         merge_seal: Some(merge_seal),
-        verify: Some(t0.elapsed()),
+        verify: Some(verify),
+        store: Some(store),
     })
 }
