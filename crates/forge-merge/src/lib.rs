@@ -140,24 +140,12 @@ fn merge_trees(
     if Some(theirs) == base {
         return Ok(ours);
     }
-    let our_tree = store.get_tree(ours).ok();
-    let their_tree = store.get_tree(theirs).ok();
-    let base_tree = match base {
-        Some(id) => store.get_tree(id).ok(),
-        None => None,
+    let a = store.get_tree(ours)?;
+    let b = store.get_tree(theirs)?;
+    let g = match base {
+        Some(id) => store.get_tree(id)?,
+        None => Tree::default(),
     };
-    if our_tree.is_none() || their_tree.is_none() {
-        conflicts.push(ConflictPath {
-            path: prefix.to_string(),
-            a: Some(ours),
-            b: Some(theirs),
-            base,
-        });
-        return Ok(ours);
-    }
-    let a = our_tree.unwrap();
-    let b = their_tree.unwrap();
-    let g = base_tree.unwrap_or_else(Tree::default);
     let mut names = HashSet::new();
     for e in a
         .entries

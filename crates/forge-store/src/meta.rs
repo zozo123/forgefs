@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS object_intro (
 
 CREATE TABLE IF NOT EXISTS cap_root (
   id INTEGER PRIMARY KEY CHECK(id=1),
-  hmac_key BLOB NOT NULL,
+  hmac_key BLOB NOT NULL DEFAULT X'',
   seal_pub BLOB NOT NULL
 );
 "#;
@@ -189,29 +189,30 @@ impl Meta {
             .map_err(map_sql)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(map_sql)?;
+        conn.execute(
+            "UPDATE cap_root SET hmac_key=X'' WHERE length(hmac_key) != 0",
+            [],
+        )
+        .map_err(map_sql)?;
         Ok(Self {
             write: Mutex::new(conn),
         })
     }
 
-    pub fn set_cap_root(&self, hmac_key: &[u8], seal_pub: &[u8]) -> Result<()> {
+    pub fn set_cap_root(&self, seal_pub: &[u8]) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO cap_root (id, hmac_key, seal_pub) VALUES (1, ?1, ?2)",
-            params![hmac_key, seal_pub],
+            "INSERT OR REPLACE INTO cap_root (id, hmac_key, seal_pub) VALUES (1, X'', ?1)",
+            params![seal_pub],
         )
         .map_err(map_sql)?;
         Ok(())
     }
 
-    pub fn get_cap_root(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn get_seal_pub(&self) -> Result<Vec<u8>> {
         let conn = self.write.lock();
-        conn.query_row(
-            "SELECT hmac_key, seal_pub FROM cap_root WHERE id=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|_| Error::Corrupt("missing cap_root".into()))
+        conn.query_row("SELECT seal_pub FROM cap_root WHERE id=1", [], |r| r.get(0))
+            .map_err(|_| Error::Corrupt("missing cap_root".into()))
     }
 
     pub fn get_ref(&self, name: &str) -> Result<Option<RefRow>> {
@@ -429,6 +430,139 @@ impl Meta {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn cas_ref_session(
+        &self,
+        ns_id: &str,
+        mount_path: &str,
+        name: &str,
+        expected: ObjectId,
+        new: ObjectId,
+        kind: &str,
+        agent_id: &str,
+        fork_agent: &str,
+    ) -> Result<CasResult> {
+        validate_ref_kind(name, kind)?;
+        if name.starts_with("tags/") {
+            return Err(Error::Denied(
+                "sealed tags cannot be updated through CAS".into(),
+            ));
+        }
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let (oid_b, current_kind, protected, sealed) = tx
+            .query_row(
+                "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
+                [name],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sql)?
+            .ok_or_else(|| Error::NotFound(format!("ref {name}")))?;
+        if current_kind != kind {
+            return Err(Error::Invalid(format!(
+                "ref {name} kind is immutable: {current_kind} != {kind}"
+            )));
+        }
+        let current = oid_from_blob(oid_b)?;
+        if sealed != 0 {
+            return Err(Error::Sealed(name.to_string()));
+        }
+        if protected != 0 {
+            return Err(Error::Denied(format!("ref {name} is protected")));
+        }
+        let ts = now_ms() as i64;
+        let updated = tx
+            .execute(
+                "UPDATE refs SET oid=?1, updated_ms=?2 WHERE name=?3 AND oid=?4 AND kind=?5 AND sealed=0 AND protected=0",
+                params![new.as_bytes().as_slice(), ts, name, expected.as_bytes().as_slice(), kind],
+            )
+            .map_err(map_sql)?;
+        let result = if updated == 1 {
+            tx.execute(
+                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'cas',?5)",
+                params![name, expected.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
+            )
+            .map_err(map_sql)?;
+            let n = tx
+                .execute(
+                    "UPDATE namespaces SET pinned_oid=?1, live_ref=?2 WHERE id=?3",
+                    params![new.as_bytes().as_slice(), name, ns_id],
+                )
+                .map_err(map_sql)?;
+            if n != 1 {
+                return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+            }
+            CasResult::Updated {
+                name: name.to_string(),
+                oid: new,
+            }
+        } else {
+            let fork = format!(
+                "forks/{}/{}/{}",
+                name,
+                sanitize_agent(fork_agent),
+                ulid::Ulid::new()
+            );
+            validate_ref_kind(&fork, kind)?;
+            tx.execute(
+                "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
+                params![fork, new.as_bytes().as_slice(), kind, ts],
+            )
+            .map_err(map_sql)?;
+            tx.execute(
+                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
+                params![fork, current.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
+            )
+            .map_err(map_sql)?;
+            let spec = format!("ref:{fork}");
+            let m = tx
+                .execute(
+                    "UPDATE mounts SET spec=?1 WHERE ns_id=?2 AND path=?3",
+                    params![spec, ns_id, mount_path],
+                )
+                .map_err(map_sql)?;
+            if m != 1 {
+                return Err(Error::Corrupt(format!(
+                    "missing session mount {ns_id}:{mount_path}"
+                )));
+            }
+            let n = tx
+                .execute(
+                    "UPDATE namespaces SET pinned_oid=?1, live_ref=?2 WHERE id=?3",
+                    params![new.as_bytes().as_slice(), fork, ns_id],
+                )
+                .map_err(map_sql)?;
+            if n != 1 {
+                return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+            }
+            CasResult::Forked {
+                requested: name.to_string(),
+                fork,
+                ours: new,
+                theirs: current,
+            }
+        };
+        tx.execute(
+            "DELETE FROM overlay WHERE ns_id=?1 AND mount=?2",
+            params![ns_id, mount_path],
+        )
+        .map_err(map_sql)?;
+        tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
+            .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(result)
+    }
+
     pub fn list_refs(&self) -> Result<Vec<RefRow>> {
         let conn = self.write.lock();
         let mut stmt = conn
@@ -457,6 +591,51 @@ impl Meta {
             });
         }
         Ok(out)
+    }
+
+    pub fn create_session(
+        &self,
+        id: &str,
+        agent_id: &str,
+        pinned: ObjectId,
+        live_ref: &str,
+        include_main: bool,
+    ) -> Result<()> {
+        validate_ref_kind(live_ref, "commit")?;
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let ts = now_ms() as i64;
+        tx.execute(
+            "INSERT INTO namespaces (id, agent_id, created_ms, pinned_oid, live_ref) VALUES (?1,?2,?3,?4,?5)",
+            params![id, agent_id, ts, pinned.as_bytes().as_slice(), live_ref],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
+            params![live_ref, pinned.as_bytes().as_slice(), ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'session',?4)",
+            params![live_ref, pinned.as_bytes().as_slice(), agent_id, ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO mounts (ns_id, path, spec, mode) VALUES (?1,'/',?2,'rw')",
+            params![id, format!("ref:{live_ref}")],
+        )
+        .map_err(map_sql)?;
+        if include_main {
+            tx.execute(
+                "INSERT INTO mounts (ns_id, path, spec, mode) VALUES (?1,'/main','ref:main','ro')",
+                [id],
+            )
+            .map_err(map_sql)?;
+        }
+        tx.commit().map_err(map_sql)?;
+        Ok(())
     }
 
     pub fn insert_namespace(
@@ -650,17 +829,28 @@ impl Meta {
     }
 
     pub fn intro_insert(&self, oid: ObjectId, commit: ObjectId, agent_id: &str) -> Result<()> {
-        let conn = self.write.lock();
-        conn.execute(
-            "INSERT OR IGNORE INTO object_intro (oid, commit_oid, agent_id, ts_ms) VALUES (?1,?2,?3,?4)",
-            params![
-                oid.as_bytes().as_slice(),
-                commit.as_bytes().as_slice(),
-                agent_id,
-                now_ms() as i64
-            ],
-        )
-        .map_err(map_sql)?;
+        self.intro_insert_many(&[oid], commit, agent_id)
+    }
+
+    pub fn intro_insert_many(
+        &self,
+        oids: &[ObjectId],
+        commit: ObjectId,
+        agent_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let ts = now_ms() as i64;
+        for oid in oids {
+            tx.execute(
+                "INSERT OR IGNORE INTO object_intro (oid, commit_oid, agent_id, ts_ms) VALUES (?1,?2,?3,?4)",
+                params![oid.as_bytes().as_slice(), commit.as_bytes().as_slice(), agent_id, ts],
+            )
+            .map_err(map_sql)?;
+        }
+        tx.commit().map_err(map_sql)?;
         Ok(())
     }
 

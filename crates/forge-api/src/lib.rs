@@ -60,10 +60,10 @@ impl Forge {
 
         write_secret(root.join("keys/root.secret"), &hmac_key)?;
         write_secret(root.join("keys/seal.ed25519"), &seal_seed)?;
-        fs::write(root.join("keys/seal.pub"), pk)?;
+        write_public(root.join("keys/seal.pub"), &pk)?;
 
         let store = Store::open(&root)?;
-        store.meta.set_cap_root(&hmac_key, &pk)?;
+        store.meta.set_cap_root(&pk)?;
 
         let root_cap = mint_root(&hmac_key)?;
         let integ = mint_integrator(&hmac_key)?;
@@ -117,13 +117,20 @@ impl Forge {
         validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
-        let store = Store::open(&root)?;
         let sk = SigningKey::from_bytes(&seal_seed);
+        let seal_pk = sk.verifying_key().to_bytes();
+        let store = Store::open(&root)?;
+        let configured_pk = store.meta.get_seal_pub()?;
+        if configured_pk != seal_pk.to_vec() {
+            return Err(Error::Corrupt(
+                "configured seal public key does not match local signing key".into(),
+            ));
+        }
         Ok(Self {
             store,
             hmac_key: hmac,
             seal_seed,
-            seal_pk: sk.verifying_key().to_bytes(),
+            seal_pk,
             root,
         })
     }
@@ -233,32 +240,15 @@ impl Forge {
 
     pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
         self.check_spec_read(cap, from)?;
-        let (cid, commit) = self.peel_commit(from)?;
+        let (cid, _) = self.peel_commit(from)?;
         let ns_id = ulid::Ulid::new().to_string();
         let agent = sanitize_agent(cap.agent_id());
         let live = format!("heads/agents/{agent}/{ns_id}");
         self.check(cap, Op::Branch, Some(&live))?;
+        let include_main = cap.allows(Op::Read, Some("main"), now_ms()).is_ok();
         self.store
             .meta
-            .insert_namespace(&ns_id, cap.agent_id(), cid, &live)?;
-        self.store.meta.insert_ref(
-            &live,
-            cid,
-            "commit",
-            false,
-            false,
-            cap.agent_id(),
-            "session",
-        )?;
-        self.store
-            .meta
-            .insert_mount(&ns_id, "/", &format!("ref:{live}"), "rw")?;
-        if cap.allows(Op::Read, Some("main"), now_ms()).is_ok() {
-            self.store
-                .meta
-                .insert_mount(&ns_id, "/main", "ref:main", "ro")?;
-        }
-        let _ = commit;
+            .create_session(&ns_id, cap.agent_id(), cid, &live, include_main)?;
         Ok(ns_id)
     }
 
@@ -443,33 +433,16 @@ impl Forge {
         let cid = self.store.put_commit(&commit)?;
         self.store
             .record_intros(Some(base_commit.tree), new_tree, cid, cap.agent_id())?;
-        let result = self.store.meta.cas_ref(
+        self.store.meta.cas_ref_session(
+            ns,
+            &m.path,
             &ref_name,
             pin,
             cid,
             "commit",
             cap.agent_id(),
             cap.agent_id(),
-            false,
-        )?;
-        match &result {
-            CasResult::Updated { .. } | CasResult::Forked { .. } => {
-                self.store.meta.overlay_clear(ns, &m.path)?;
-            }
-            CasResult::Noop { .. } => {}
-        }
-        if let CasResult::Forked { fork, ours, .. } = &result {
-            self.store
-                .meta
-                .update_mount_spec(ns, &m.path, &format!("ref:{fork}"))?;
-            self.store.meta.set_pin(ns, *ours)?;
-            self.store.meta.observations_clear(ns)?;
-        }
-        if let CasResult::Updated { oid, .. } = &result {
-            self.store.meta.set_pin(ns, *oid)?;
-            self.store.meta.observations_clear(ns)?;
-        }
-        Ok(result)
+        )
     }
 
     fn check_observations(
@@ -981,6 +954,16 @@ fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
         opts.open(&path)?
     };
     #[cfg(not(unix))]
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn write_public(path: PathBuf, bytes: &[u8]) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

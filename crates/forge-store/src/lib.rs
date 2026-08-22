@@ -135,7 +135,9 @@ impl Store {
         commit: ObjectId,
         agent: &str,
     ) -> Result<()> {
-        self.intro_walk(old, new, ObjectType::Tree, commit, agent)
+        let mut introduced = Vec::new();
+        self.intro_walk(old, new, ObjectType::Tree, &mut introduced)?;
+        self.meta.intro_insert_many(&introduced, commit, agent)
     }
 
     fn intro_walk(
@@ -143,8 +145,7 @@ impl Store {
         old: Option<ObjectId>,
         new: ObjectId,
         expected: ObjectType,
-        commit: ObjectId,
-        agent: &str,
+        introduced: &mut Vec<ObjectId>,
     ) -> Result<()> {
         if old == Some(new) {
             return Ok(());
@@ -159,7 +160,7 @@ impl Store {
                 actual.as_str()
             )));
         }
-        self.meta.intro_insert(new, commit, agent)?;
+        introduced.push(new);
 
         match actual {
             ObjectType::Blob => {
@@ -172,7 +173,6 @@ impl Store {
                         let old_bytes = self.get_raw(id)?;
                         match decode_object_type(&old_bytes)? {
                             ObjectType::Tree => Some(Tree::decode(&old_bytes)?),
-                            ObjectType::Blob => None,
                             other => {
                                 return Err(Error::Corrupt(format!(
                                     "unexpected {} in previous tree edge at {id}",
@@ -193,7 +193,7 @@ impl Store {
                         EntryKind::Blob => ObjectType::Blob,
                         EntryKind::Tree => ObjectType::Tree,
                     };
-                    self.intro_walk(old_id, e.id, expected, commit, agent)?;
+                    self.intro_walk(old_id, e.id, expected, introduced)?;
                 }
             }
             other => {

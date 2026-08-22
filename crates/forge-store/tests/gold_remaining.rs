@@ -67,7 +67,8 @@ fn checkin_publication_and_session_state_roll_back_together() {
     let db = d.path().join("meta.sqlite");
     let meta = Meta::open(&db).unwrap();
     let live = "heads/agents/a/ns1";
-    meta.create_session("ns1", "a", oid(1), live, false).unwrap();
+    meta.create_session("ns1", "a", oid(1), live, false)
+        .unwrap();
     meta.overlay_upsert("ns1", "/", "f", Some(oid(9)), false)
         .unwrap();
     meta.observe("ns1", "/", "seen", oid(8)).unwrap();
@@ -93,7 +94,8 @@ fn lost_cas_fork_retargets_the_session_atomically() {
     let d = tempdir().unwrap();
     let meta = Meta::open(&d.path().join("meta.sqlite")).unwrap();
     let live = "heads/agents/a/ns1";
-    meta.create_session("ns1", "a", oid(1), live, false).unwrap();
+    meta.create_session("ns1", "a", oid(1), live, false)
+        .unwrap();
     meta.cas_ref(live, oid(1), oid(3), "commit", "other", "other", false)
         .unwrap();
     meta.overlay_upsert("ns1", "/", "f", Some(oid(9)), false)
@@ -102,7 +104,10 @@ fn lost_cas_fork_retargets_the_session_atomically() {
     let result = meta
         .cas_ref_session("ns1", "/", live, oid(1), oid(2), "commit", "a", "a")
         .unwrap();
-    let CasResult::Forked { fork, ours, theirs, .. } = result else {
+    let CasResult::Forked {
+        fork, ours, theirs, ..
+    } = result
+    else {
         panic!("expected fork");
     };
     assert_eq!(ours, oid(2));
