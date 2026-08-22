@@ -39,3 +39,4 @@ jobs:
           p.write_text(s)
           PY
           bash /tmp/contribution-worker.sh
+# retrigger
