@@ -90,15 +90,19 @@ impl<'a> Reader<'a> {
     }
 
     pub fn at_end(&self) -> bool {
-        self.pos >= self.buf.len()
+        self.pos == self.buf.len()
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.buf.len() {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| Error::Corrupt("cbor length overflow".into()))?;
+        if end > self.buf.len() {
             return Err(Error::Corrupt("cbor truncated".into()));
         }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
 
@@ -153,6 +157,14 @@ impl<'a> Reader<'a> {
         Ok((major, ai))
     }
 
+    fn bounded_len(&self, n: u64, what: &str) -> Result<usize> {
+        let n = usize::try_from(n).map_err(|_| Error::Corrupt(format!("{what} length overflow")))?;
+        if n > self.remaining().len() {
+            return Err(Error::Corrupt(format!("{what} length exceeds input")));
+        }
+        Ok(n)
+    }
+
     /// Map keys must be strictly increasing by **encoded** CBOR bytes (RFC 8949).
     pub fn text_map_key(&mut self, last: &mut Option<Vec<u8>>) -> Result<String> {
         let start = self.pos;
@@ -197,7 +209,8 @@ impl<'a> Reader<'a> {
         if major != 2 {
             return Err(Error::Corrupt("expected bytes".into()));
         }
-        let n = self.take_uint(ai)? as usize;
+        let raw = self.take_uint(ai)?;
+        let n = self.bounded_len(raw, "bytes")?;
         self.take(n)
     }
 
@@ -219,7 +232,8 @@ impl<'a> Reader<'a> {
         if major != 3 {
             return Err(Error::Corrupt("expected text".into()));
         }
-        let n = self.take_uint(ai)? as usize;
+        let raw = self.take_uint(ai)?;
+        let n = self.bounded_len(raw, "text")?;
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).map_err(|_| Error::Corrupt("utf8".into()))
     }
@@ -229,7 +243,11 @@ impl<'a> Reader<'a> {
         if major != 4 {
             return Err(Error::Corrupt("expected array".into()));
         }
-        self.take_uint(ai)
+        let n = self.take_uint(ai)?;
+        if n > self.remaining().len() as u64 {
+            return Err(Error::Corrupt("array count exceeds input".into()));
+        }
+        Ok(n)
     }
 
     pub fn map(&mut self) -> Result<u64> {
@@ -237,6 +255,10 @@ impl<'a> Reader<'a> {
         if major != 5 {
             return Err(Error::Corrupt("expected map".into()));
         }
-        self.take_uint(ai)
+        let n = self.take_uint(ai)?;
+        if n > (self.remaining().len() / 2) as u64 {
+            return Err(Error::Corrupt("map count exceeds input".into()));
+        }
+        Ok(n)
     }
 }
