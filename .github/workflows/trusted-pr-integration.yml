@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: objects/contribution-108-v3
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: true
       - name: Run trusted Contribution integrator from main
@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: agents/inbox-111-v3
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: true
       - name: Run trusted inbox integrator from main
