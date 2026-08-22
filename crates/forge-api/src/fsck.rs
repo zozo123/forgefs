@@ -1,6 +1,6 @@
 use crate::Forge;
 use forge_cap::{Cap, Op};
-use forge_core::{decode_object_type, Blob, Commit, Conflict, Snapshot, Tree};
+use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use forge_ns::{parse_spec, Spec};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
@@ -293,6 +293,13 @@ fn verify_graph(
                         format!("commit:{id}:parent"),
                     ));
                 }
+                if let Some(contrib) = commit.contrib {
+                    queue.push_back((
+                        contrib,
+                        Some(ObjectType::Contribution),
+                        format!("commit:{id}:contribution"),
+                    ));
+                }
             }),
             ObjectType::Snapshot => Snapshot::decode(&bytes).map(|snapshot| {
                 queue.push_back((
@@ -310,6 +317,32 @@ fn verify_graph(
                     Some(ObjectType::Blob),
                     format!("snapshot:{id}:provenance"),
                 ));
+            }),
+            ObjectType::Contribution => Contribution::decode(&bytes).map(|contribution| {
+                queue.push_back((
+                    contribution.base,
+                    Some(ObjectType::Commit),
+                    format!("contribution:{id}:base"),
+                ));
+                queue.push_back((
+                    contribution.tree,
+                    Some(ObjectType::Tree),
+                    format!("contribution:{id}:tree"),
+                ));
+                for parent in contribution.parents {
+                    queue.push_back((
+                        parent,
+                        Some(ObjectType::Commit),
+                        format!("contribution:{id}:parent"),
+                    ));
+                }
+                for read in contribution.reads {
+                    queue.push_back((
+                        read.id,
+                        None,
+                        format!("contribution:{id}:read:{}", read.path),
+                    ));
+                }
             }),
             ObjectType::Conflict => Conflict::decode(&bytes).map(|conflict| {
                 for base in conflict.bases {

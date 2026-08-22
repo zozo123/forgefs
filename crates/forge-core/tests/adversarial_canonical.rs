@@ -84,6 +84,7 @@ fn accepted_commit_mutations_are_canonical() {
         msg: "deterministic mutation corpus".into(),
         ts: 42,
         landmark: true,
+        contrib: None,
     }
     .encode();
 

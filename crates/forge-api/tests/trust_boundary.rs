@@ -49,6 +49,7 @@ fn commit(
             msg: format!("c{n}"),
             ts: n,
             landmark: false,
+            contrib: None,
         })
         .unwrap()
 }

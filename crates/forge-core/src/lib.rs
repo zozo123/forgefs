@@ -1,9 +1,11 @@
 //! Canonical object encoding, hashing, and tree copy-on-write.
 
 pub mod cbor;
+pub mod contribution;
 pub mod object;
 pub mod tree;
 
+pub use contribution::{Contribution, ContributionRead};
 pub use object::{
     decode_object_type, hash_bytes, parse_file, Blob, Commit, Conflict, ConflictPath, Snapshot,
 };
@@ -85,6 +87,7 @@ mod tests {
             msg: "init".into(),
             ts: 1,
             landmark: true,
+            contrib: None,
         };
         let bytes = c.encode();
         assert_eq!(Commit::decode(&bytes).unwrap(), c);

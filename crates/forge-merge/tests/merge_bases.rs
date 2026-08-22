@@ -13,6 +13,7 @@ fn commit(s: &Store, parents: Vec<forge_types::ObjectId>, n: u64) -> forge_types
         msg: format!("c{n}"),
         ts: n,
         landmark: false,
+        contrib: None,
     })
     .unwrap()
 }

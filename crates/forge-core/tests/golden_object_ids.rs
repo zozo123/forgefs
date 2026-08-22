@@ -19,6 +19,7 @@ fn v1_object_ids_are_userspace_abi() {
         msg: "v1".into(),
         ts: 42,
         landmark: true,
+        contrib: None,
     };
     let conflict = Conflict {
         bases: vec![ObjectId([0x55; 32])],

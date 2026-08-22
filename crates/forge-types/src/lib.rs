@@ -95,6 +95,7 @@ pub enum ObjectType {
     Commit = 0x03,
     Conflict = 0x04,
     Snapshot = 0x05,
+    Contribution = 0x06,
 }
 
 impl ObjectType {
@@ -105,6 +106,7 @@ impl ObjectType {
             0x03 => Ok(Self::Commit),
             0x04 => Ok(Self::Conflict),
             0x05 => Ok(Self::Snapshot),
+            0x06 => Ok(Self::Contribution),
             other => Err(Error::Corrupt(format!("unknown object type 0x{other:02x}"))),
         }
     }
@@ -116,6 +118,7 @@ impl ObjectType {
             Self::Commit => "commit",
             Self::Conflict => "conflict",
             Self::Snapshot => "snapshot",
+            Self::Contribution => "contribution",
         }
     }
 }

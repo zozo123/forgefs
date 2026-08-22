@@ -56,6 +56,7 @@ fn typed_commit_tree_edge_is_checked() {
             msg: "bad tree edge".into(),
             ts: 1,
             landmark: false,
+            contrib: None,
         })
         .unwrap();
     store
