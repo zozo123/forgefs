@@ -73,7 +73,8 @@ impl Blob {
             }
         }
         let size = size.ok_or_else(|| Error::Corrupt("blob missing size".into()))?;
-        let size = usize::try_from(size).map_err(|_| Error::Corrupt("blob size overflow".into()))?;
+        let size =
+            usize::try_from(size).map_err(|_| Error::Corrupt("blob size overflow".into()))?;
         if size != payload.len() {
             return Err(Error::Corrupt(format!(
                 "blob size {size} != payload {}",
