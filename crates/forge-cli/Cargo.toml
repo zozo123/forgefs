@@ -1,0 +1,19 @@
+[package]
+name = "forge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "forge command-line interface"
+default-run = "forge"
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+forge-api.workspace = true
+forge-cap.workspace = true
+forge-types.workspace = true
+serde_json.workspace = true

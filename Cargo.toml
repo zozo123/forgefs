@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-types",
+    "crates/forge-core",
+    "crates/forge-store",
+    "crates/forge-cap",
+    "crates/forge-ns",
+    "crates/forge-merge",
+    "crates/forge-protocol",
+    "crates/forge-api",
+    "crates/forge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zozo123/forgefs"
+rust-version = "1.85"
+
+[workspace.dependencies]
+forge-types = { path = "crates/forge-types" }
+forge-core = { path = "crates/forge-core" }
+forge-store = { path = "crates/forge-store" }
+forge-cap = { path = "crates/forge-cap" }
+forge-ns = { path = "crates/forge-ns" }
+forge-merge = { path = "crates/forge-merge" }
+forge-protocol = { path = "crates/forge-protocol" }
+forge-api = { path = "crates/forge-api" }
+
+blake3 = "1.5.5"
+ciborium = "0.2.2"
+clap = { version = "4.5.17", features = ["derive", "env"] }
+data-encoding = "2.6.0"
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+getrandom = "0.2.15"
+hmac = "0.12.1"
+lru = "0.12.4"
+parking_lot = "0.12.3"
+rand = "0.8.5"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+sha2 = "0.10.8"
+tar = "0.4.41"
+tempfile = "3.12.0"
+thiserror = "1.0.64"
+tiny_http = "0.12.0"
+ulid = "1.1.3"

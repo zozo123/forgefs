@@ -1,0 +1,12 @@
+[package]
+name = "forge-cap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HMAC macaroon capabilities for ForgeFS"
+
+[dependencies]
+forge-types.workspace = true
+hmac.workspace = true
+sha2.workspace = true

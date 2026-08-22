@@ -1,0 +1,11 @@
+[package]
+name = "forge-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ForgeFS shared types: ObjectId, errors, CAS results"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

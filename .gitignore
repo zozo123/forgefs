@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+demo/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.forge/
+/tmp-forge*

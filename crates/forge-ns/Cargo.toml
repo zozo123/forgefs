@@ -1,0 +1,12 @@
+[package]
+name = "forge-ns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Plan 9-style namespaces and path resolution"
+
+[dependencies]
+forge-core.workspace = true
+forge-store.workspace = true
+forge-types.workspace = true
