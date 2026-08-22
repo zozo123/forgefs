@@ -230,11 +230,12 @@ impl Forge {
     }
 
     pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
-        self.check(cap, Op::Read, Some(from))?;
+        self.check_spec_read(cap, from)?;
         let (cid, commit) = self.peel_commit(from)?;
         let ns_id = ulid::Ulid::new().to_string();
         let agent = sanitize_agent(cap.agent_id());
         let live = format!("heads/agents/{agent}/{ns_id}");
+        self.check(cap, Op::Branch, Some(&live))?;
         self.store
             .meta
             .insert_namespace(&ns_id, cap.agent_id(), cid, &live)?;
@@ -754,12 +755,8 @@ impl Forge {
     }
 
     pub fn show(&self, cap: &Cap, spec: &str) -> Result<String> {
-        self.check(cap, Op::Read, None)?;
-        let oid = if spec.len() == 64 {
-            ObjectId::from_hex(spec).unwrap_or(self.resolve_spec_oid(spec)?)
-        } else {
-            self.resolve_spec_oid(spec)?
-        };
+        self.check_spec_read(cap, spec)?;
+        let oid = self.resolve_spec_oid(spec)?;
         let bytes = self.store.get_raw(oid)?;
         Ok(format!(
             "{} {} bytes",
