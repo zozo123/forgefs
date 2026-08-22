@@ -858,6 +858,34 @@ impl Meta {
         Ok(())
     }
 
+    pub fn list_namespaces(&self) -> Result<Vec<NsRow>> {
+        let conn = self.write.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, agent_id, pinned_oid, live_ref FROM namespaces ORDER BY id")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, agent_id, pinned_oid, live_ref) = row.map_err(map_sql)?;
+            out.push(NsRow {
+                id,
+                agent_id,
+                pinned_oid: pinned_oid.map(oid_from_blob).transpose()?,
+                live_ref,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn insert_namespace(
         &self,
         id: &str,
