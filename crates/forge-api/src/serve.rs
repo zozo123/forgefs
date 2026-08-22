@@ -68,11 +68,7 @@ fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
             };
             let mut r = BufReader::new(reader_stream);
             let mut w = BufWriter::new(stream);
-            loop {
-                let buf = match read_frame(&mut r) {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
+            while let Ok(buf) = read_frame(&mut r) {
                 let req: Request = match serde_json::from_slice(&buf) {
                     Ok(x) => x,
                     Err(e) => {
