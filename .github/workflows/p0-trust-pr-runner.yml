@@ -24,7 +24,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply trust P0
         run: |
-          python3 .github/scripts/p0_trust_patch.py
+          git show origin/main:.github/scripts/p0_trust_patch.py > /tmp/p0_trust_patch.py
+          python3 /tmp/p0_trust_patch.py
           git show origin/forgefs/p0-api-trust-final:crates/forge-api/tests/trust_boundary.rs > crates/forge-api/tests/trust_boundary.rs
           cargo fmt --all
           cargo test -p forge-api --test trust_boundary --locked
