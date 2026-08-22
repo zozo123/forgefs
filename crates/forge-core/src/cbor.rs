@@ -158,7 +158,8 @@ impl<'a> Reader<'a> {
     }
 
     fn bounded_len(&self, n: u64, what: &str) -> Result<usize> {
-        let n = usize::try_from(n).map_err(|_| Error::Corrupt(format!("{what} length overflow")))?;
+        let n =
+            usize::try_from(n).map_err(|_| Error::Corrupt(format!("{what} length overflow")))?;
         if n > self.remaining().len() {
             return Err(Error::Corrupt(format!("{what} length exceeds input")));
         }
