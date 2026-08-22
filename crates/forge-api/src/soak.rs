@@ -14,6 +14,10 @@ fn us(d: Duration) -> u128 {
 }
 
 /// Drive N logical private agents with at most `workers` OS threads.
+///
+/// Keeping logical agents independent from executor threads lets the harness
+/// stress repository semantics at 1K+ agents without turning the benchmark
+/// itself into an unbounded thread-creation test.
 pub fn private_checkins_bounded(
     forge: Arc<Forge>,
     root: &Cap,
