@@ -1,3 +1,4 @@
+# Branch-only worker; self-deletes after applying the product patch.
 name: autopatch-exit-code-120
 
 on:
@@ -70,7 +71,7 @@ fn cli_merge_conflict_has_stable_exit_code_four() {
 '''
           p.write_text(s)
           PY
-
+          cargo fmt --all
           git rm .github/workflows/autopatch-exit-code-120.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
