@@ -29,33 +29,45 @@ impl LocalBlobStore {
         let id = hash_bytes(bytes);
         let dest = self.object_path(id);
         if dest.exists() {
+            self.verify_existing(id, &dest)?;
             return Ok(id);
         }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
+
+        let parent = dest
+            .parent()
+            .ok_or_else(|| Error::Internal("object path has no parent".into()))?;
+        fs::create_dir_all(parent)?;
         fs::create_dir_all(self.root.join("tmp"))?;
         let tmp = self
             .root
             .join("tmp")
             .join(ulid::Ulid::new().to_string());
+
         {
             let mut f = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&tmp)?;
             f.write_all(bytes)?;
+            // The bytes themselves must reach stable storage before publication.
             f.sync_all()?;
         }
+
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
+                // Persist the new directory entry before we allow metadata to
+                // publish this OID. A file fsync alone is not sufficient for
+                // crash durability of the name.
+                sync_dir(parent)?;
                 let _ = fs::remove_file(&tmp);
                 Ok(id)
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() =>
-            {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() => {
                 let _ = fs::remove_file(&tmp);
+                // A same-name object is only acceptable if its bytes really
+                // hash to the requested OID. This catches disk corruption and
+                // accidental out-of-band modification instead of blessing it.
+                self.verify_existing(id, &dest)?;
                 Ok(id)
             }
             Err(e) => {
@@ -65,14 +77,33 @@ impl LocalBlobStore {
         }
     }
 
+    fn verify_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
+        let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
+        if hash_bytes(&bytes) != id {
+            return Err(Error::Corrupt(format!(
+                "existing object does not match its id: {id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
         let p = self.object_path(id);
-        fs::read(&p).map_err(|_| Error::NotFound(format!("object {id}")))
+        let bytes = fs::read(&p).map_err(|_| Error::NotFound(format!("object {id}")))?;
+        if hash_bytes(&bytes) != id {
+            return Err(Error::Corrupt(format!("hash mismatch {id}")));
+        }
+        Ok(bytes)
     }
 
     pub fn has(&self, id: ObjectId) -> bool {
         self.object_path(id).exists()
     }
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,5 +134,15 @@ mod tests {
         fs::write(d.path().join("tmp").join("junk"), b"nope").unwrap();
         let id = s.put(b"ok").unwrap();
         assert_eq!(s.get(id).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn corrupt_existing_object_is_rejected() {
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let id = s.put(b"good").unwrap();
+        fs::write(s.object_path(id), b"evil").unwrap();
+        assert!(matches!(s.get(id), Err(Error::Corrupt(_))));
+        assert!(matches!(s.put(b"good"), Err(Error::Corrupt(_))));
     }
 }
