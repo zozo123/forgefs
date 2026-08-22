@@ -1,0 +1,79 @@
+name: autopatch-exit-code-120
+
+on:
+  push:
+    branches: [cli/exit-code-120]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: cli/exit-code-120
+          persist-credentials: true
+      - name: Freeze exit-code ABI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-cli/src/main.rs')
+          s = p.read_text()
+          old = '''fn main() -> ExitCode {\n    match run() {\n        Ok(()) => ExitCode::SUCCESS,\n        Err(e) => {\n            eprintln!("forge: {e}");\n            ExitCode::from(1)\n        }\n    }\n}\n'''
+          new = '''fn main() -> ExitCode {\n    match run() {\n        Ok(()) => ExitCode::SUCCESS,\n        Err(e) => {\n            eprintln!("forge: {e}");\n            ExitCode::from(error_exit_code(&e))\n        }\n    }\n}\n\n/// Stable CLI error ABI for agent/shell callers. Never key automation on prose.\nfn error_exit_code(error: &Error) -> u8 {\n    match error {\n        Error::Denied(_) | Error::Cap(_) | Error::Invalid(_) | Error::InvalidBase | Error::NotFound(_) => 1,\n        Error::Corrupt(_) | Error::Sealed(_) => 2,\n        Error::Busy(_) => 3,\n        Error::StaleObservation { .. } | Error::MergeConflict(_) => 4,\n        Error::Io(_) | Error::Sqlite(_) | Error::Internal(_) => 5,\n    }\n}\n'''
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+
+          p = Path('crates/forge-cli/tests/e2e.rs')
+          s = p.read_text()
+          s = s.replace(
+              '    assert!(!out.status.success());\n    let err = String::from_utf8_lossy(&out.stderr);',
+              '    assert_eq!(out.status.code(), Some(1));\n    let err = String::from_utf8_lossy(&out.stderr);',
+              1,
+          )
+          s += r'''
+
+#[test]
+fn cli_merge_conflict_has_stable_exit_code_four() {
+    let d = tempdir().unwrap();
+    run(forge().arg("init").current_dir(d.path()));
+    let dir = d.path().to_str().unwrap();
+    let root = d.path().join(".forge/keys/root.cap");
+    let integ = d.path().join(".forge/keys/integrator.cap");
+    let root = root.to_str().unwrap();
+    let integ = integ.to_str().unwrap();
+
+    let a = run(forge().args(["--dir", dir, "--cap", root, "session", "open", "--from=main"]));
+    let b = run(forge().args(["--dir", dir, "--cap", root, "session", "open", "--from=main"]));
+    let a = a.trim();
+    let b = b.trim();
+    run(forge().args(["--dir", dir, "--cap", root, "write", "--ns", a, "/same.txt", "--text", "ours"]));
+    run(forge().args(["--dir", dir, "--cap", root, "write", "--ns", b, "/same.txt", "--text", "theirs"]));
+    run(forge().args(["--dir", dir, "--cap", root, "checkin", "--ns", a, "-m", "ours"]));
+    run(forge().args(["--dir", dir, "--cap", root, "checkin", "--ns", b, "-m", "theirs"]));
+
+    let ref_a = format!("heads/agents/anon/{a}");
+    let ref_b = format!("heads/agents/anon/{b}");
+    run(forge().args(["--dir", dir, "--cap", integ, "merge", "--into=main", "--from", &ref_a]));
+    let out = forge()
+        .args(["--dir", dir, "--cap", integ, "merge", "--into=main", "--from", &ref_b])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("conflict"));
+}
+'''
+          p.write_text(s)
+          PY
+
+          git rm .github/workflows/autopatch-exit-code-120.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-cli/src/main.rs crates/forge-cli/tests/e2e.rs
+          git commit -m 'cli: freeze machine-stable error exit codes (#120)'
+          git push origin HEAD:cli/exit-code-120
