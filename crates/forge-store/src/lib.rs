@@ -10,6 +10,7 @@ pub use meta::{
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};
 use forge_core::tree::{Tree, TreeStore};
+use forge_core::Contribution;
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -32,6 +33,11 @@ pub struct StorePublishBatch<'a> {
 impl StorePublishBatch<'_> {
     pub fn put_commit(&self, commit: &Commit) -> Result<ObjectId> {
         self.objects.lock().put(&commit.encode())
+    }
+
+    pub fn put_contribution(&self, contribution: &Contribution) -> Result<ObjectId> {
+        let bytes = contribution.encode()?;
+        self.objects.lock().put(&bytes)
     }
 
     pub fn finish(self) -> Result<()> {
@@ -133,6 +139,14 @@ impl Store {
 
     pub fn get_commit(&self, id: ObjectId) -> Result<Commit> {
         Commit::decode(&self.get_raw(id)?)
+    }
+
+    pub fn put_contribution(&self, contribution: &Contribution) -> Result<ObjectId> {
+        self.put_raw(&contribution.encode()?)
+    }
+
+    pub fn get_contribution(&self, id: ObjectId) -> Result<Contribution> {
+        Contribution::decode(&self.get_raw(id)?)
     }
 
     pub fn put_conflict(&self, c: &Conflict) -> Result<ObjectId> {

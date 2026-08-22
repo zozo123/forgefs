@@ -17,7 +17,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use forge_cap::{attenuate, mint_integrator, mint_root, verify, Cap, Op};
 use forge_core::cbor::{encode_map_sorted, encode_text};
 use forge_core::tree::{apply_overlay, split_path};
-use forge_core::{hash_bytes, now_ms, Blob, Commit, Conflict, Snapshot, Tree};
+use forge_core::{
+    hash_bytes, now_ms, Blob, Commit, Conflict, Contribution, ContributionRead, Snapshot, Tree,
+};
 use forge_merge::{merge_bases, three_way, MergeOutcome};
 use forge_ns::{
     longest_mount, ls as ns_ls, normalize_abs, overlay_map, parse_spec, rel_of, resolve, Mode,
@@ -562,6 +564,7 @@ impl Forge {
             .ok_or_else(|| Error::NotFound(ref_name.clone()))?;
         let base_commit = self.store.get_commit(pin)?;
         let ov_rows = self.store.meta.overlay_list(ns, &m.path)?;
+        let observations = self.store.meta.observations(ns)?;
         let ov = overlay_map(&ov_rows);
         self.check_observations(ns, &m.path, &ov, pin, &mounts)?;
         let batch = self.store.begin_publish_batch();
@@ -574,14 +577,48 @@ impl Forge {
                 oid: row.oid,
             });
         }
+        let mut reads = observations
+            .into_iter()
+            .map(|obs| ContributionRead {
+                path: contribution_path(&obs.mount, &obs.path),
+                id: obs.oid,
+            })
+            .collect::<Vec<_>>();
+        reads.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        for pair in reads.windows(2) {
+            if pair[0].path == pair[1].path {
+                return Err(Error::Invalid(format!(
+                    "ambiguous contribution read path {}",
+                    pair[0].path
+                )));
+            }
+        }
+        let mut writes = ov_rows
+            .iter()
+            .map(|row| contribution_path(&m.path, &row.path))
+            .collect::<Vec<_>>();
+        writes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        writes.dedup();
+
+        let ts = now_ms();
+        let contribution = Contribution {
+            base: pin,
+            tree: new_tree,
+            parents: vec![pin],
+            reads,
+            writes,
+            agent: cap.agent_id().into(),
+            ts,
+        };
+        let contribution_oid = batch.put_contribution(&contribution)?;
         let commit = Commit {
             tree: new_tree,
             parents: vec![pin],
             agent: cap.agent_id().into(),
             msg: msg.into(),
-            ts: now_ms(),
+            ts,
             landmark: false,
-            contrib: None,
+            contrib: Some(contribution_oid),
         };
         let cid = batch.put_commit(&commit)?;
         // I4: metadata CAS is strictly after every referenced object's file and
@@ -943,6 +980,30 @@ impl Forge {
         self.check_spec_read(cap, spec)?;
         let oid = self.resolve_spec_oid(spec)?;
         let ty = self.store.object_type(oid)?;
+        if ty == ObjectType::Contribution {
+            let contribution = self.store.get_contribution(oid)?;
+            let mut out = String::new();
+            out.push_str(&format!("contribution {oid}\n"));
+            out.push_str(&format!("agent {}\n", contribution.agent));
+            out.push_str(&format!("base {}\n", contribution.base));
+            out.push_str(&format!("tree {}\n", contribution.tree));
+            out.push_str(&format!(
+                "parents {}\n",
+                contribution
+                    .parents
+                    .iter()
+                    .map(ObjectId::hex)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            for read in contribution.reads {
+                out.push_str(&format!("read {} {}\n", read.id, read.path));
+            }
+            for path in contribution.writes {
+                out.push_str(&format!("write {path}\n"));
+            }
+            return Ok(out.trim_end().to_string());
+        }
         if ty == ObjectType::Conflict {
             let conflict = self.store.get_conflict(oid)?;
             let fmt_oid = |id: Option<ObjectId>| id.map(|v| v.hex()).unwrap_or_else(|| "-".into());
@@ -987,6 +1048,17 @@ impl Forge {
         }
         let bytes = self.store.get_raw(oid)?;
         Ok(format!("{} {} bytes", ty.as_str(), bytes.len()))
+    }
+}
+
+fn contribution_path(mount: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        return mount.to_string();
+    }
+    if mount == "/" {
+        format!("/{rel}")
+    } else {
+        format!("{}/{}", mount.trim_end_matches('/'), rel)
     }
 }
 
