@@ -1,5 +1,6 @@
 use forge_core::hash_bytes;
 use forge_types::{Error, ObjectId, Result};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,16 @@ pub struct LocalBlobStore {
     stats: Arc<BlobStoreCounters>,
 }
 
+/// Checkin-scoped durable publication. Every object is file-fsynced before its
+/// immutable final name is linked. Final shard-directory barriers are deferred
+/// until `finish`; metadata CAS is allowed only after `finish` succeeds. A crash
+/// before CAS may leave durable orphan objects, which is safe.
+pub struct PublishBatch<'a> {
+    store: &'a LocalBlobStore,
+    dirs: BTreeSet<PathBuf>,
+    new_puts: u64,
+}
+
 impl LocalBlobStore {
     pub fn new(root: PathBuf) -> Result<Self> {
         let stats = Arc::new(BlobStoreCounters::default());
@@ -53,58 +64,19 @@ impl LocalBlobStore {
         self.root.join("objects").join(a).join(b).join(id.hex())
     }
 
+    pub fn begin_batch(&self) -> PublishBatch<'_> {
+        PublishBatch {
+            store: self,
+            dirs: BTreeSet::new(),
+            new_puts: 0,
+        }
+    }
+
     pub fn put(&self, bytes: &[u8]) -> Result<ObjectId> {
-        let id = hash_bytes(bytes);
-        let dest = self.object_path(id);
-        if dest.exists() {
-            self.verify_existing(id, &dest)?;
-            return Ok(id);
-        }
-
-        // Create each shard one level at a time and fsync the parent that owns
-        // its new directory entry. Otherwise a power loss can retain the file
-        // fsync while losing a newly created shard path.
-        let (a, b) = id.shard_dirs();
-        let objects = self.root.join("objects");
-        let shard_a = objects.join(a);
-        let shard_b = shard_a.join(b);
-        ensure_dir_durable(&objects, &shard_a, &self.stats)?;
-        ensure_dir_durable(&shard_a, &shard_b, &self.stats)?;
-
-        let tmp_dir = self.root.join("tmp");
-        ensure_dir_durable(&self.root, &tmp_dir, &self.stats)?;
-        let tmp = tmp_dir.join(ulid::Ulid::new().to_string());
-
-        {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            f.write_all(bytes)?;
-            // The bytes themselves must reach stable storage before publication.
-            f.sync_all()?;
-            self.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
-        }
-
-        match fs::hard_link(&tmp, &dest) {
-            Ok(()) => {
-                // Persist the final directory entry before metadata can publish
-                // the OID. At this point every shard directory is durable too.
-                sync_dir_counted(&shard_b, &self.stats)?;
-                self.stats.puts.fetch_add(1, Ordering::Relaxed);
-                let _ = fs::remove_file(&tmp);
-                Ok(id)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() => {
-                let _ = fs::remove_file(&tmp);
-                // A same-name object is only acceptable if its bytes really
-                // hash to the requested OID. This catches disk corruption and
-                // accidental out-of-band modification instead of blessing it.
-                self.verify_existing(id, &dest)?;
-                Ok(id)
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                Err(Error::Io(e.to_string()))
-            }
-        }
+        let mut batch = self.begin_batch();
+        let id = batch.put(bytes)?;
+        batch.finish()?;
+        Ok(id)
     }
 
     fn verify_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
@@ -136,6 +108,63 @@ impl LocalBlobStore {
             fsync_file: self.stats.fsync_file.load(Ordering::Relaxed),
             fsync_dir: self.stats.fsync_dir.load(Ordering::Relaxed),
         }
+    }
+}
+
+impl PublishBatch<'_> {
+    pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
+        let id = hash_bytes(bytes);
+        let dest = self.store.object_path(id);
+        if dest.exists() {
+            self.store.verify_existing(id, &dest)?;
+            return Ok(id);
+        }
+
+        let (a, b) = id.shard_dirs();
+        let objects = self.store.root.join("objects");
+        let shard_a = objects.join(a);
+        let shard_b = shard_a.join(b);
+        ensure_dir_durable(&objects, &shard_a, &self.store.stats)?;
+        ensure_dir_durable(&shard_a, &shard_b, &self.store.stats)?;
+
+        let tmp_dir = self.store.root.join("tmp");
+        ensure_dir_durable(&self.store.root, &tmp_dir, &self.store.stats)?;
+        let tmp = tmp_dir.join(ulid::Ulid::new().to_string());
+        {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            self.store.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
+        }
+
+        match fs::hard_link(&tmp, &dest) {
+            Ok(()) => {
+                self.dirs.insert(shard_b);
+                self.new_puts += 1;
+                let _ = fs::remove_file(&tmp);
+                Ok(id)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() => {
+                let _ = fs::remove_file(&tmp);
+                self.store.verify_existing(id, &dest)?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(Error::Io(e.to_string()))
+            }
+        }
+    }
+
+    pub fn finish(self) -> Result<()> {
+        for dir in &self.dirs {
+            sync_dir_counted(dir, &self.store.stats)?;
+        }
+        self.store
+            .stats
+            .puts
+            .fetch_add(self.new_puts, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -270,6 +299,53 @@ mod tests {
         s.put(b"measured").unwrap();
         assert_eq!(s.stats(), after);
         assert_eq!(s.get(id).unwrap(), b"measured");
+    }
+
+    fn same_shard_pair() -> (Vec<u8>, Vec<u8>) {
+        let mut seen = std::collections::BTreeMap::new();
+        for i in 0..200_000u64 {
+            let bytes = format!("same-shard-{i}").into_bytes();
+            let id = hash_bytes(&bytes);
+            let shard = id.shard_dirs();
+            if let Some(first) = seen.insert(shard, bytes.clone()) {
+                if first != bytes {
+                    return (first, bytes);
+                }
+            }
+        }
+        panic!("failed to find deterministic shard collision");
+    }
+
+    #[test]
+    fn batch_coalesces_same_shard_directory_barrier() {
+        let d = tempdir().unwrap();
+        let (a, b) = same_shard_pair();
+
+        let serial_root = d.path().join("serial");
+        std::fs::create_dir(&serial_root).unwrap();
+        let serial = LocalBlobStore::new(serial_root).unwrap();
+        let serial_before = serial.stats();
+        serial.put(&a).unwrap();
+        serial.put(&b).unwrap();
+        let serial_after = serial.stats();
+        let serial_dirs = serial_after.fsync_dir - serial_before.fsync_dir;
+
+        let batched_root = d.path().join("batched");
+        std::fs::create_dir(&batched_root).unwrap();
+        let batched = LocalBlobStore::new(batched_root).unwrap();
+        let batch_before = batched.stats();
+        let mut batch = batched.begin_batch();
+        batch.put(&a).unwrap();
+        batch.put(&b).unwrap();
+        let mid = batched.stats();
+        assert_eq!(mid.puts, batch_before.puts);
+        batch.finish().unwrap();
+        let batch_after = batched.stats();
+        let batch_dirs = batch_after.fsync_dir - batch_before.fsync_dir;
+
+        assert_eq!(batch_after.puts - batch_before.puts, 2);
+        assert_eq!(batch_after.fsync_file - batch_before.fsync_file, 2);
+        assert_eq!(serial_dirs, batch_dirs + 1);
     }
 
     #[test]

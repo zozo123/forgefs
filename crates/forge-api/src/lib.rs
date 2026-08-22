@@ -500,8 +500,10 @@ impl Forge {
         let ov_rows = self.store.meta.overlay_list(ns, &m.path)?;
         let ov = overlay_map(&ov_rows);
         self.check_observations(ns, &m.path, &ov, pin, &mounts)?;
-        let new_tree = apply_overlay(Some(base_commit.tree), &ov, &self.store)?;
+        let batch = self.store.begin_publish_batch();
+        let new_tree = apply_overlay(Some(base_commit.tree), &ov, &batch)?;
         if new_tree == base_commit.tree && pin == row.oid {
+            batch.finish()?;
             self.store.meta.complete_noop_session(ns, &m.path, pin)?;
             return Ok(CasResult::Noop {
                 name: ref_name,
@@ -516,7 +518,10 @@ impl Forge {
             ts: now_ms(),
             landmark: false,
         };
-        let cid = self.store.put_commit(&commit)?;
+        let cid = batch.put_commit(&commit)?;
+        // I4: metadata CAS is strictly after every referenced object's file and
+        // containing directory entry is durable. Orphans before CAS are safe.
+        batch.finish()?;
         let intro_oids = self
             .store
             .collect_intros(Some(base_commit.tree), new_tree)?;
