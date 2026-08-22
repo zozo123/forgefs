@@ -1,0 +1,37 @@
+# TEMPORARY owner-only execution fabric for the current hardening swarm.
+# Security boundary: exact internal branches + repository owner actor only.
+# Remove this workflow as soon as the listed worker branches are complete.
+name: internal-swarm
+
+on:
+  push:
+    branches:
+      - objects/contribution-108
+      - perf/durability-batch-102
+      - cli/show-conflict-106
+      - agents/inbox-111
+      - compat/portable-export-38
+
+permissions:
+  contents: write
+
+jobs:
+  run-worker:
+    if: github.repository == 'zozo123/forgefs' && github.actor == 'zozo123'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt,clippy
+      - name: Run exact branch worker
+        run: |
+          test -f .github/swarm-worker.sh
+          test ! -L .github/swarm-worker.sh
+          bash .github/swarm-worker.sh
