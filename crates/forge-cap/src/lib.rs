@@ -56,8 +56,6 @@ pub struct Cap {
     pub sig: [u8; 32],
     pub ops: HashSet<Op>,
     /// Positive reference caveats. Each inner set is OR; all sets are ANDed.
-    /// Example: `ref=main,tags/*` permits either; appending `ref=main` narrows
-    /// that authority to main only.
     pub ref_sets: Vec<Vec<String>>,
     pub ref_not: Vec<String>,
     pub time_le: Option<u64>,
@@ -251,12 +249,7 @@ fn parse_caveats(caveats: &[String]) -> Result<ParsedCaveats> {
     })
 }
 
-fn cap_from_parts(
-    loc: String,
-    id: String,
-    caveats: Vec<String>,
-    sig: [u8; 32],
-) -> Result<Cap> {
+fn cap_from_parts(loc: String, id: String, caveats: Vec<String>, sig: [u8; 32]) -> Result<Cap> {
     let parsed = parse_caveats(&caveats)?;
     Ok(Cap {
         loc,
@@ -340,10 +333,8 @@ pub fn mint(root: &[u8], loc: &str, id: &str, caveats: Vec<String>) -> Result<Ca
     cap_from_parts(loc.to_string(), id.to_string(), caveats, sig)
 }
 
-/// Attenuate by appending caveats using the current signature as the MAC key.
-/// This is the central macaroon property: delegation does not reveal or require
-/// the root secret, and appended caveats can only reduce authority.
-pub fn attenuate(cap: &Cap, extra: Vec<String>) -> Result<Cap> {
+/// Root-secret-free attenuation for callers that already hold a capability.
+pub fn attenuate_holder(cap: &Cap, extra: Vec<String>) -> Result<Cap> {
     if cap.caveats.len() + extra.len() > MAX_CAVEATS {
         return Err(Error::Cap("too many caveats".into()));
     }
@@ -355,6 +346,12 @@ pub fn attenuate(cap: &Cap, extra: Vec<String>) -> Result<Cap> {
         caveats.push(c);
     }
     cap_from_parts(cap.loc.clone(), cap.id.clone(), caveats, sig)
+}
+
+/// Compatibility wrapper. The root argument is deliberately unused: holders
+/// attenuate from the current signature, never by re-signing from the root.
+pub fn attenuate(_root: &[u8], cap: &Cap, extra: Vec<String>) -> Result<Cap> {
+    attenuate_holder(cap, extra)
 }
 
 pub fn mint_root(root: &[u8]) -> Result<Cap> {
@@ -398,7 +395,7 @@ mod tests {
     fn holder_attenuates_without_root_key() {
         let key = [7u8; 32];
         let root = mint_root(&key).unwrap();
-        let agent = attenuate(
+        let agent = attenuate_holder(
             &root,
             vec![
                 "ops=read,write,branch".into(),
@@ -431,7 +428,7 @@ mod tests {
         .unwrap();
         broad.allows(Op::Read, Some("main"), 0).unwrap();
         broad.allows(Op::Read, Some("heads/a"), 0).unwrap();
-        let narrow = attenuate(&broad, vec!["ref=heads/alice/*".into()]).unwrap();
+        let narrow = attenuate_holder(&broad, vec!["ref=heads/alice/*".into()]).unwrap();
         narrow.allows(Op::Read, Some("heads/alice/1"), 0).unwrap();
         assert!(narrow.allows(Op::Read, Some("main"), 0).is_err());
         assert!(narrow.allows(Op::Read, Some("heads/bob/1"), 0).is_err());
@@ -447,10 +444,10 @@ mod tests {
             vec!["ops=read".into(), "time<=100".into()],
         )
         .unwrap();
-        let later = attenuate(&c, vec!["time<=1000".into()]).unwrap();
+        let later = attenuate_holder(&c, vec!["time<=1000".into()]).unwrap();
         assert_eq!(later.time_le, Some(100));
         assert!(later.allows(Op::Read, None, 101).is_err());
-        let earlier = attenuate(&c, vec!["time<=50".into()]).unwrap();
+        let earlier = attenuate_holder(&c, vec!["time<=50".into()]).unwrap();
         assert_eq!(earlier.time_le, Some(50));
     }
 
@@ -464,7 +461,7 @@ mod tests {
             vec!["ops=read".into(), "agent=alice".into()],
         )
         .unwrap();
-        let impossible = attenuate(&alice, vec!["agent=bob".into()]).unwrap();
+        let impossible = attenuate_holder(&alice, vec!["agent=bob".into()]).unwrap();
         verify(&key, &impossible).unwrap();
         assert!(impossible.allows(Op::Read, None, 0).is_err());
     }
