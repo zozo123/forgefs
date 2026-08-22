@@ -1058,19 +1058,31 @@ fn publish_noreplace(from: &Path, to: &Path) -> Result<()> {
         )
     };
 
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    return Err(Error::Invalid(
-        "atomic no-replace repository publication is unsupported on this platform".into(),
-    ));
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(Error::Invalid(format!("already a forge: {}", to.display())));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            return Err(Error::Invalid(
+                "filesystem does not support atomic no-replace repository publication".into(),
+            ));
+        }
+        Err(error.into())
+    }
 
-    if rc == 0 {
-        return Ok(());
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = (from_c, to_c);
+        Err(Error::Invalid(
+            "atomic no-replace repository publication is unsupported on this platform".into(),
+        ))
     }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::AlreadyExists {
-        return Err(Error::Invalid(format!("already a forge: {}", to.display())));
-    }
-    Err(error.into())
 }
 
 fn acquire_cell_lock(root: &Path, exclusive: bool) -> Result<File> {

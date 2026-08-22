@@ -1,4 +1,4 @@
-use forge_store::Meta;
+use forge_store::{Meta, CURRENT_SCHEMA_VERSION};
 use forge_types::Error;
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -31,8 +31,8 @@ fn newer_metadata_schema_fails_closed() {
 
     let conn = Connection::open(&path).unwrap();
     conn.execute(
-        "INSERT INTO schema_migrations (version, applied_ms) VALUES (2, 0)",
-        [],
+        "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, 0)",
+        [CURRENT_SCHEMA_VERSION + 1],
     )
     .unwrap();
     drop(conn);
@@ -65,8 +65,12 @@ fn newer_schema_rejection_does_not_mutate_journal_mode() {
     let path = d.path().join("future.sqlite");
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL);\
-         INSERT INTO schema_migrations (version, applied_ms) VALUES (2, 0);",
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, 0)",
+        [CURRENT_SCHEMA_VERSION + 1],
     )
     .unwrap();
     let before: String = conn
