@@ -84,10 +84,17 @@ impl Forge {
             landmark: true,
         };
         let cid = store.put_commit(&commit)?;
-        store.record_intros(None, empty, cid, "init")?;
-        store
-            .meta
-            .insert_ref("main", cid, "commit", true, false, "init", "init")?;
+        let intro_oids = store.collect_intros(None, empty)?;
+        store.meta.insert_ref_with_intros(
+            "main",
+            cid,
+            "commit",
+            true,
+            false,
+            "init",
+            "init",
+            &intro_oids,
+        )?;
         store.meta.landmark(cid, "commit", "init")?;
 
         Ok(Self {
@@ -233,32 +240,15 @@ impl Forge {
 
     pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
         self.check_spec_read(cap, from)?;
-        let (cid, commit) = self.peel_commit(from)?;
+        let (cid, _) = self.peel_commit(from)?;
         let ns_id = ulid::Ulid::new().to_string();
         let agent = sanitize_agent(cap.agent_id());
         let live = format!("heads/agents/{agent}/{ns_id}");
         self.check(cap, Op::Branch, Some(&live))?;
+        let mount_main = cap.allows(Op::Read, Some("main"), now_ms()).is_ok();
         self.store
             .meta
-            .insert_namespace(&ns_id, cap.agent_id(), cid, &live)?;
-        self.store.meta.insert_ref(
-            &live,
-            cid,
-            "commit",
-            false,
-            false,
-            cap.agent_id(),
-            "session",
-        )?;
-        self.store
-            .meta
-            .insert_mount(&ns_id, "/", &format!("ref:{live}"), "rw")?;
-        if cap.allows(Op::Read, Some("main"), now_ms()).is_ok() {
-            self.store
-                .meta
-                .insert_mount(&ns_id, "/main", "ref:main", "ro")?;
-        }
-        let _ = commit;
+            .create_session(&ns_id, cap.agent_id(), cid, &live, mount_main)?;
         Ok(ns_id)
     }
 
@@ -427,6 +417,7 @@ impl Forge {
         self.check_observations(ns, &m.path, &ov, pin, &mounts)?;
         let new_tree = apply_overlay(Some(base_commit.tree), &ov, &self.store)?;
         if new_tree == base_commit.tree && pin == row.oid {
+            self.store.meta.complete_noop_session(ns, &m.path, pin)?;
             return Ok(CasResult::Noop {
                 name: ref_name,
                 oid: row.oid,
@@ -441,34 +432,19 @@ impl Forge {
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store
-            .record_intros(Some(base_commit.tree), new_tree, cid, cap.agent_id())?;
-        let result = self.store.meta.cas_ref(
+        let intro_oids = self
+            .store
+            .collect_intros(Some(base_commit.tree), new_tree)?;
+        let result = self.store.meta.cas_ref_session(
             &ref_name,
             pin,
             cid,
-            "commit",
             cap.agent_id(),
             cap.agent_id(),
-            false,
+            ns,
+            &m.path,
+            &intro_oids,
         )?;
-        match &result {
-            CasResult::Updated { .. } | CasResult::Forked { .. } => {
-                self.store.meta.overlay_clear(ns, &m.path)?;
-            }
-            CasResult::Noop { .. } => {}
-        }
-        if let CasResult::Forked { fork, ours, .. } = &result {
-            self.store
-                .meta
-                .update_mount_spec(ns, &m.path, &format!("ref:{fork}"))?;
-            self.store.meta.set_pin(ns, *ours)?;
-            self.store.meta.observations_clear(ns)?;
-        }
-        if let CasResult::Updated { oid, .. } = &result {
-            self.store.meta.set_pin(ns, *oid)?;
-            self.store.meta.observations_clear(ns)?;
-        }
         Ok(result)
     }
 
@@ -599,9 +575,8 @@ impl Forge {
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store
-            .record_intros(Some(ours_c.tree), tree, cid, cap.agent_id())?;
-        self.store.meta.cas_ref(
+        let intro_oids = self.store.collect_intros(Some(ours_c.tree), tree)?;
+        self.store.meta.cas_ref_with_intros(
             into,
             into_row.oid,
             cid,
@@ -609,6 +584,7 @@ impl Forge {
             cap.agent_id(),
             cap.agent_id(),
             into_row.protected,
+            &intro_oids,
         )
     }
 
@@ -756,15 +732,12 @@ impl Forge {
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store.record_intros(
-            previous_commit.as_ref().map(|c| c.tree),
-            tree,
-            cid,
-            cap.agent_id(),
-        )?;
+        let intro_oids = self
+            .store
+            .collect_intros(previous_commit.as_ref().map(|c| c.tree), tree)?;
         match previous {
             Some(row) => {
-                self.store.meta.cas_ref(
+                self.store.meta.cas_ref_with_intros(
                     r#ref,
                     row.oid,
                     cid,
@@ -772,10 +745,11 @@ impl Forge {
                     cap.agent_id(),
                     cap.agent_id(),
                     false,
+                    &intro_oids,
                 )?;
             }
             None => {
-                self.store.meta.insert_ref(
+                self.store.meta.insert_ref_with_intros(
                     r#ref,
                     cid,
                     "commit",
@@ -783,6 +757,7 @@ impl Forge {
                     false,
                     cap.agent_id(),
                     "import",
+                    &intro_oids,
                 )?;
             }
         }
