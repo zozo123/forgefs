@@ -312,6 +312,52 @@ impl Forge {
         Ok(out)
     }
 
+    /// Publish a sealed snapshot to a recipient-owned inbox ref.
+    /// ForgeFS stores only the durable pointer; scheduling stays above the core.
+    pub fn inbox_push(&self, cap: &Cap, to: &str, snapshot: &str) -> Result<CasResult> {
+        let recipient = sanitize_agent(to);
+        if recipient != to || recipient == "anon" {
+            return Err(Error::Invalid(format!("invalid inbox recipient {to:?}")));
+        }
+        self.check_spec_read(cap, snapshot)?;
+        let oid = self.resolve_spec_oid(snapshot)?;
+        if self.store.object_type(oid)? != ObjectType::Snapshot {
+            return Err(Error::Invalid(
+                "inbox payload must be a sealed snapshot".into(),
+            ));
+        }
+        let name = format!("inbox/{recipient}/{}", ulid::Ulid::new());
+        self.check(cap, Op::Write, Some(&name))?;
+        self.store.meta.cas_ref(
+            &name,
+            ObjectId::ZERO,
+            oid,
+            "snapshot",
+            cap.agent_id(),
+            cap.agent_id(),
+            false,
+        )
+    }
+
+    /// List only the calling agent's concrete inbox refs that its cap can read.
+    pub fn inbox_list(&self, cap: &Cap) -> Result<Vec<RefRow>> {
+        self.check(cap, Op::Read, None)?;
+        let agent = cap.agent_id();
+        if sanitize_agent(agent) != agent || agent == "anon" {
+            return Err(Error::Invalid(format!("invalid inbox agent {agent:?}")));
+        }
+        let prefix = format!("inbox/{agent}/");
+        let mut out = Vec::new();
+        for row in self.store.meta.list_refs()? {
+            if row.name.starts_with(&prefix)
+                && cap.allows(Op::Read, Some(&row.name), now_ms()).is_ok()
+            {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn peel_commit(&self, spec: &str) -> Result<(ObjectId, Commit)> {
         let oid = self.resolve_spec_oid(spec)?;
         match self.store.object_type(oid)? {
