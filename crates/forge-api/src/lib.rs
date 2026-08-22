@@ -60,10 +60,10 @@ impl Forge {
 
         write_secret(root.join("keys/root.secret"), &hmac_key)?;
         write_secret(root.join("keys/seal.ed25519"), &seal_seed)?;
-        fs::write(root.join("keys/seal.pub"), pk)?;
+        write_public(root.join("keys/seal.pub"), &pk)?;
 
         let store = Store::open(&root)?;
-        store.meta.set_cap_root(&hmac_key, &pk)?;
+        store.meta.set_cap_root(&pk)?;
 
         let root_cap = mint_root(&hmac_key)?;
         let integ = mint_integrator(&hmac_key)?;
@@ -124,13 +124,20 @@ impl Forge {
         validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
-        let store = Store::open(&root)?;
         let sk = SigningKey::from_bytes(&seal_seed);
+        let seal_pk = sk.verifying_key().to_bytes();
+        let store = Store::open(&root)?;
+        let configured_pk = store.meta.get_seal_pub()?;
+        if configured_pk != seal_pk.to_vec() {
+            return Err(Error::Corrupt(
+                "configured seal public key does not match local signing key".into(),
+            ));
+        }
         Ok(Self {
             store,
             hmac_key: hmac,
             seal_seed,
-            seal_pk: sk.verifying_key().to_bytes(),
+            seal_pk,
             root,
         })
     }
@@ -956,6 +963,16 @@ fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
         opts.open(&path)?
     };
     #[cfg(not(unix))]
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn write_public(path: PathBuf, bytes: &[u8]) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

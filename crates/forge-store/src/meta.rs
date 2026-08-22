@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS object_intro (
 
 CREATE TABLE IF NOT EXISTS cap_root (
   id INTEGER PRIMARY KEY CHECK(id=1),
-  hmac_key BLOB NOT NULL,
+  hmac_key BLOB NOT NULL DEFAULT X'',
   seal_pub BLOB NOT NULL
 );
 "#;
@@ -189,29 +189,30 @@ impl Meta {
             .map_err(map_sql)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(map_sql)?;
+        conn.execute(
+            "UPDATE cap_root SET hmac_key=X'' WHERE length(hmac_key) != 0",
+            [],
+        )
+        .map_err(map_sql)?;
         Ok(Self {
             write: Mutex::new(conn),
         })
     }
 
-    pub fn set_cap_root(&self, hmac_key: &[u8], seal_pub: &[u8]) -> Result<()> {
+    pub fn set_cap_root(&self, seal_pub: &[u8]) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO cap_root (id, hmac_key, seal_pub) VALUES (1, ?1, ?2)",
-            params![hmac_key, seal_pub],
+            "INSERT OR REPLACE INTO cap_root (id, hmac_key, seal_pub) VALUES (1, X'', ?1)",
+            params![seal_pub],
         )
         .map_err(map_sql)?;
         Ok(())
     }
 
-    pub fn get_cap_root(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn get_seal_pub(&self) -> Result<Vec<u8>> {
         let conn = self.write.lock();
-        conn.query_row(
-            "SELECT hmac_key, seal_pub FROM cap_root WHERE id=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|_| Error::Corrupt("missing cap_root".into()))
+        conn.query_row("SELECT seal_pub FROM cap_root WHERE id=1", [], |r| r.get(0))
+            .map_err(|_| Error::Corrupt("missing cap_root".into()))
     }
 
     pub fn get_ref(&self, name: &str) -> Result<Option<RefRow>> {
