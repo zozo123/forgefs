@@ -2,11 +2,13 @@
 
 mod bench;
 mod export;
+mod fsck;
 mod serve;
 
 pub use bench::{
     merge_all_and_seal, private_checkins, run as run_bench, shared_stampede, BenchReport,
 };
+pub use fsck::{FsckFinding, FsckReport};
 pub use serve::serve;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

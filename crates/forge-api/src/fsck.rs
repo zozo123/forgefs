@@ -127,11 +127,9 @@ impl Forge {
                 let mount_resource = format!("{ns_resource}:mount:{}", mount.path);
                 match parse_spec(&mount.spec) {
                     Ok(Spec::Ref(name)) => match ref_types.get(&name) {
-                        Some((oid, ty)) => roots.push((
-                            *oid,
-                            Some(*ty),
-                            format!("{mount_resource}:ref:{name}"),
-                        )),
+                        Some((oid, ty)) => {
+                            roots.push((*oid, Some(*ty), format!("{mount_resource}:ref:{name}")))
+                        }
                         None => report.finding(
                             "MOUNT_REF",
                             &mount_resource,
@@ -315,11 +313,7 @@ fn verify_graph(
             }),
             ObjectType::Conflict => Conflict::decode(&bytes).map(|conflict| {
                 for base in conflict.bases {
-                    queue.push_back((
-                        base,
-                        Some(ObjectType::Tree),
-                        format!("conflict:{id}:base"),
-                    ));
+                    queue.push_back((base, Some(ObjectType::Tree), format!("conflict:{id}:base")));
                 }
                 queue.push_back((
                     conflict.ours,

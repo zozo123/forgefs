@@ -119,6 +119,15 @@ enum Cmd {
     Show {
         spec: String,
     },
+    /// Verify repository metadata and durable object integrity without repair.
+    Fsck {
+        /// Scan every object file, including unreachable/orphan objects.
+        #[arg(long)]
+        full: bool,
+        /// Emit the structured report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Timed concurrent checkin / shared-ref stampede / merge+seal+verify.
     Bench {
         #[arg(long, default_value_t = 32)]
@@ -322,6 +331,37 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
         }
         Cmd::Show { spec } => {
             println!("{}", f.show(cap, &spec)?);
+        }
+        Cmd::Fsck { full, json } => {
+            let report = f.fsck(cap, full)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| Error::Internal(e.to_string()))?
+                );
+            } else {
+                let mode = if full { "full" } else { "reachable" };
+                println!(
+                    "{} ({mode}): {} refs, {} objects, {} namespaces",
+                    if report.ok { "ok" } else { "FAILED" },
+                    report.checked_refs,
+                    report.checked_objects,
+                    report.checked_namespaces
+                );
+                for finding in &report.findings {
+                    println!(
+                        "[{}] {}: {}",
+                        finding.code, finding.resource, finding.detail
+                    );
+                }
+            }
+            if !report.ok {
+                return Err(Error::Corrupt(format!(
+                    "fsck found {} problem(s)",
+                    report.findings.len()
+                )));
+            }
         }
         Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Bench { .. } => unreachable!(),
     }

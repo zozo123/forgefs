@@ -74,9 +74,9 @@ fn typed_commit_tree_edge_is_checked() {
     let r = f.fsck(&root, false).unwrap();
     assert!(!r.ok);
     assert!(
-        r.findings.iter().any(|f| {
-            f.code == "TYPE_MISMATCH" && f.resource.contains("commit:")
-        }),
+        r.findings
+            .iter()
+            .any(|f| { f.code == "TYPE_MISMATCH" && f.resource.contains("commit:") }),
         "{:#?}",
         r.findings
     );
