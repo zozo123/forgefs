@@ -187,6 +187,7 @@ pub struct Commit {
     pub msg: String,
     pub ts: u64,
     pub landmark: bool,
+    pub contrib: Option<ObjectId>,
 }
 
 impl Commit {
@@ -206,18 +207,21 @@ impl Commit {
         encode_u64(&mut ts_v, self.ts);
         let mut lm_v = Vec::new();
         encode_bool(&mut lm_v, self.landmark);
+        let mut fields = vec![
+            (text_key("agent"), agent_v),
+            (text_key("lm"), lm_v),
+            (text_key("msg"), msg_v),
+            (text_key("parents"), parents_v),
+            (text_key("tree"), tree_v),
+            (text_key("ts"), ts_v),
+        ];
+        if let Some(contrib) = self.contrib {
+            let mut contrib_v = Vec::new();
+            encode_bytes(&mut contrib_v, contrib.as_bytes());
+            fields.push((text_key("contrib"), contrib_v));
+        }
         let mut header = Vec::new();
-        encode_map_sorted(
-            &mut header,
-            vec![
-                (text_key("agent"), agent_v),
-                (text_key("lm"), lm_v),
-                (text_key("msg"), msg_v),
-                (text_key("parents"), parents_v),
-                (text_key("tree"), tree_v),
-                (text_key("ts"), ts_v),
-            ],
-        );
+        encode_map_sorted(&mut header, fields);
         encode_file(ObjectType::Commit, &header, &[])
     }
 
@@ -237,6 +241,7 @@ impl Commit {
         let mut msg = None;
         let mut ts = None;
         let mut lm = None;
+        let mut contrib = None;
         let mut last = None;
         for _ in 0..n {
             let k = r.text_map_key(&mut last)?;
@@ -257,6 +262,7 @@ impl Commit {
                 "msg" => msg = Some(r.text()?),
                 "ts" => ts = Some(r.u64()?),
                 "lm" => lm = Some(r.bool()?),
+                "contrib" => contrib = Some(ObjectId(r.bstr32()?)),
                 _ => return Err(Error::Corrupt(format!("unknown commit key {k}"))),
             }
         }
@@ -270,6 +276,7 @@ impl Commit {
             msg: msg.ok_or_else(|| Error::Corrupt("commit msg".into()))?,
             ts: ts.ok_or_else(|| Error::Corrupt("commit ts".into()))?,
             landmark: lm.ok_or_else(|| Error::Corrupt("commit lm".into()))?,
+            contrib,
         })
     }
 }

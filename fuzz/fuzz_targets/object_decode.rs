@@ -1,6 +1,6 @@
 #![no_main]
 
-use forge_core::{parse_file, Blob, Commit, Conflict, Snapshot, Tree};
+use forge_core::{parse_file, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -10,5 +10,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = Tree::decode(data);
     let _ = Commit::decode(data);
     let _ = Conflict::decode(data);
+    let _ = Contribution::decode(data);
     let _ = Snapshot::decode(data);
 });

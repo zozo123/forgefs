@@ -133,6 +133,7 @@ impl Forge {
                 msg: "init".into(),
                 ts: now_ms(),
                 landmark: true,
+                contrib: None,
             };
             let cid = store.put_commit(&commit)?;
             let intro_oids = store.collect_intros(None, empty)?;
@@ -534,6 +535,7 @@ impl Forge {
             msg: msg.into(),
             ts: now_ms(),
             landmark: false,
+            contrib: None,
         };
         let cid = batch.put_commit(&commit)?;
         // I4: metadata CAS is strictly after every referenced object's file and
@@ -683,6 +685,7 @@ impl Forge {
             msg: format!("merge {from} into {into}"),
             ts: now_ms(),
             landmark: false,
+            contrib: None,
         };
         let cid = self.store.put_commit(&commit)?;
         let intro_oids = self.store.collect_intros(Some(ours_c.tree), tree)?;
@@ -840,6 +843,7 @@ impl Forge {
             msg: format!("import {}", dir.display()),
             ts: now_ms(),
             landmark: false,
+            contrib: None,
         };
         let cid = self.store.put_commit(&commit)?;
         let intro_oids = self
