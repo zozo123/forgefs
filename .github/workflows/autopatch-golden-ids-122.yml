@@ -1,0 +1,159 @@
+name: autopatch-golden-ids-122
+
+on:
+  push:
+    branches: [format/golden-objectids-122]
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: format/golden-objectids-122
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - name: Generate and freeze v1 ObjectIds
+        run: |
+          mkdir -p crates/forge-core/examples testdata/canonical
+          cat > crates/forge-core/examples/generate_golden_ids.rs <<'RS'
+          use forge_core::{hash_bytes, Blob, Commit, Conflict, ConflictPath, Snapshot, Tree};
+          use forge_types::ObjectId;
+
+          fn main() {
+              let blob = Blob { data: b"forgefs-v1-golden".to_vec() };
+              let tree = Tree::new(vec![]).unwrap();
+              let commit = Commit {
+                  tree: ObjectId([0x22; 32]),
+                  parents: vec![ObjectId([0x33; 32]), ObjectId([0x44; 32])],
+                  agent: "golden".into(),
+                  msg: "v1".into(),
+                  ts: 42,
+                  landmark: true,
+              };
+              let conflict = Conflict {
+                  bases: vec![ObjectId([0x55; 32])],
+                  ours: ObjectId([0x66; 32]),
+                  theirs: ObjectId([0x77; 32]),
+                  paths: vec![ConflictPath {
+                      path: "same.txt".into(),
+                      a: Some(ObjectId([0x88; 32])),
+                      b: None,
+                      base: Some(ObjectId([0x99; 32])),
+                  }],
+                  causal: vec![ObjectId([0xaa; 32]), ObjectId([0xbb; 32])],
+              };
+              let snapshot = Snapshot {
+                  tree: ObjectId([0xcc; 32]),
+                  commit: ObjectId([0xdd; 32]),
+                  tag: "v1.0".into(),
+                  ts: 43,
+                  prov: ObjectId([0xee; 32]),
+                  pk: [0x12; 32],
+                  sig: [0x34; 64],
+              };
+
+              println!("blob {}", hash_bytes(&blob.encode()));
+              println!("empty_tree {}", hash_bytes(&tree.encode().unwrap()));
+              println!("commit {}", hash_bytes(&commit.encode()));
+              println!("conflict {}", hash_bytes(&conflict.encode()));
+              println!("snapshot {}", hash_bytes(&snapshot.encode()));
+          }
+          RS
+
+          cargo run --locked --quiet -p forge-core --example generate_golden_ids > /tmp/forgefs-golden-ids
+          python3 - <<'PY'
+          from pathlib import Path
+          ids = {}
+          for line in Path('/tmp/forgefs-golden-ids').read_text().splitlines():
+              name, oid = line.split()
+              assert len(oid) == 64
+              ids[name] = oid
+          assert set(ids) == {'blob', 'empty_tree', 'commit', 'conflict', 'snapshot'}
+          out = Path('testdata/canonical')
+          for name, oid in ids.items():
+              (out / f'{name}.oid').write_text(oid + '\n')
+          PY
+
+          cat > crates/forge-core/tests/golden_object_ids.rs <<'RS'
+          use forge_core::{hash_bytes, Blob, Commit, Conflict, ConflictPath, Snapshot, Tree};
+          use forge_types::ObjectId;
+
+          fn expected(s: &str) -> &str {
+              s.trim()
+          }
+
+          #[test]
+          fn v1_object_ids_are_userspace_abi() {
+              let blob = Blob {
+                  data: b"forgefs-v1-golden".to_vec(),
+              };
+              let tree = Tree::new(vec![]).unwrap();
+              let commit = Commit {
+                  tree: ObjectId([0x22; 32]),
+                  parents: vec![ObjectId([0x33; 32]), ObjectId([0x44; 32])],
+                  agent: "golden".into(),
+                  msg: "v1".into(),
+                  ts: 42,
+                  landmark: true,
+              };
+              let conflict = Conflict {
+                  bases: vec![ObjectId([0x55; 32])],
+                  ours: ObjectId([0x66; 32]),
+                  theirs: ObjectId([0x77; 32]),
+                  paths: vec![ConflictPath {
+                      path: "same.txt".into(),
+                      a: Some(ObjectId([0x88; 32])),
+                      b: None,
+                      base: Some(ObjectId([0x99; 32])),
+                  }],
+                  causal: vec![ObjectId([0xaa; 32]), ObjectId([0xbb; 32])],
+              };
+              let snapshot = Snapshot {
+                  tree: ObjectId([0xcc; 32]),
+                  commit: ObjectId([0xdd; 32]),
+                  tag: "v1.0".into(),
+                  ts: 43,
+                  prov: ObjectId([0xee; 32]),
+                  pk: [0x12; 32],
+                  sig: [0x34; 64],
+              };
+
+              assert_eq!(
+                  hash_bytes(&blob.encode()).hex(),
+                  expected(include_str!("../../../testdata/canonical/blob.oid"))
+              );
+              assert_eq!(
+                  hash_bytes(&tree.encode().unwrap()).hex(),
+                  expected(include_str!("../../../testdata/canonical/empty_tree.oid"))
+              );
+              assert_eq!(
+                  hash_bytes(&commit.encode()).hex(),
+                  expected(include_str!("../../../testdata/canonical/commit.oid"))
+              );
+              assert_eq!(
+                  hash_bytes(&conflict.encode()).hex(),
+                  expected(include_str!("../../../testdata/canonical/conflict.oid"))
+              );
+              assert_eq!(
+                  hash_bytes(&snapshot.encode()).hex(),
+                  expected(include_str!("../../../testdata/canonical/snapshot.oid"))
+              );
+          }
+          RS
+
+          rm crates/forge-core/examples/generate_golden_ids.rs
+          rmdir crates/forge-core/examples || true
+          git rm .github/workflows/autopatch-golden-ids-122.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add testdata/canonical/*.oid crates/forge-core/tests/golden_object_ids.rs
+          git commit -m 'format: freeze v1 ObjectId golden hashes (#122)'
+          git push origin HEAD:format/golden-objectids-122
