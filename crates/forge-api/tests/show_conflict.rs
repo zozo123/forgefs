@@ -46,15 +46,7 @@ fn show_conflict_exposes_both_sides_and_typed_path_oids() {
     let ours = commit(&s, tree(&s, b"ours"), main.oid, 1);
     let theirs = commit(&s, tree(&s, b"theirs"), main.oid, 2);
     s.meta
-        .insert_ref(
-            "heads/ours",
-            ours,
-            "commit",
-            false,
-            false,
-            "test",
-            "test",
-        )
+        .insert_ref("heads/ours", ours, "commit", false, false, "test", "test")
         .unwrap();
     s.meta
         .insert_ref(
@@ -75,7 +67,7 @@ fn show_conflict_exposes_both_sides_and_typed_path_oids() {
         panic!("expected conflict: {err:?}");
     };
     let conflict = s.get_conflict(oid).unwrap();
-    let rendered = forge.show(&root, &oid.hex()).unwrap();
+    let rendered = forge.show(&root, &format!("oid:{}", oid.hex())).unwrap();
 
     assert!(rendered.contains(&format!("conflict {oid}")));
     assert!(rendered.contains(&format!("ours {}", conflict.ours)));

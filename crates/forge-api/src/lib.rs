@@ -881,7 +881,12 @@ impl Forge {
                 if conflict.bases.is_empty() {
                     "-".into()
                 } else {
-                    conflict.bases.iter().map(ObjectId::hex).collect::<Vec<_>>().join(",")
+                    conflict
+                        .bases
+                        .iter()
+                        .map(ObjectId::hex)
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
             ));
             out.push_str(&format!("ours {}\n", conflict.ours));
@@ -898,7 +903,12 @@ impl Forge {
             if !conflict.causal.is_empty() {
                 out.push_str(&format!(
                     "causal {}\n",
-                    conflict.causal.iter().map(ObjectId::hex).collect::<Vec<_>>().join(",")
+                    conflict
+                        .causal
+                        .iter()
+                        .map(ObjectId::hex)
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ));
             }
             return Ok(out.trim_end().to_string());
