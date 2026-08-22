@@ -2,7 +2,6 @@ use crate::Forge;
 use forge_protocol::{read_frame, write_frame, Request, Response};
 use forge_types::{Error, Result};
 use serde_json::{json, Value};
-use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Read};
 use std::net::{Shutdown, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
@@ -20,29 +19,15 @@ const MAX_PENDING_UNIX: usize = 256;
 const UNIX_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
+    if !forge.has_exclusive_cell_lock() {
+        return Err(Error::Busy(
+            "forge serve requires Forge::open_for_serve exclusive cell ownership".into(),
+        ));
+    }
     let root = forge.root().to_path_buf();
-    let lock = root.join("LOCK");
-
-    // The file is only a rendezvous point; the OS-held lock is the authority.
-    // A crashed daemon may leave LOCK behind, but the kernel releases the lock
-    // with the file descriptor, so the next daemon can recover safely.
-    let lock_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock)?;
-    lock_file
-        .try_lock()
-        .map_err(|_| Error::Busy("forge daemon lock is already held".into()))?;
-    lock_file.set_len(0)?;
-    let pid = std::process::id().to_string();
-    std::io::Write::write_all(&mut &lock_file, pid.as_bytes())?;
-    lock_file.sync_all()?;
-
     let sock_path = root.join("forge.sock");
-    // We hold the exclusive daemon lock, so any remaining socket pathname is
-    // stale. Removing it here cannot race another valid Forge daemon.
+    // Exclusive cell ownership proves no live direct client or daemon exists;
+    // only now is it safe to remove a stale socket pathname.
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)?;
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
@@ -59,11 +44,11 @@ pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
             .map_err(|e| Error::Internal(format!("spawn http thread: {e}")))?;
     }
 
-    // Keep lock_file alive for the complete service lifetime.
+    // Forge owns the exclusive LOCK descriptor for the service lifetime.
+    // Keep the LOCK pathname persistent: unlinking it after unlock can split the
+    // rendezvous inode from a concurrently opening client.
     let result = accept_loop(forge, listener);
-    let _ = lock_file.unlock();
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&lock);
     result
 }
 
