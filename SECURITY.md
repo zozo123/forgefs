@@ -19,3 +19,14 @@ Until the first stable release, only the current `main` branch is supported for 
 ## Security invariants
 
 Security fixes must preserve ForgeFS's core guarantees: immutable content-addressed bytes, monotonic capability attenuation, snapshot-consistent agent work, explicit conflicts, fail-closed verification, and trusted sealed releases.
+
+## Dependency upgrades
+
+Treat major dependency upgrades on the trusted path as security-sensitive changes, not routine batch maintenance.
+
+- Land at most one major crate upgrade per pull request and rebase it onto current green `main` before evaluation.
+- Require the workspace tests with the committed lockfile plus clippy with warnings denied; the repository's Rust, MSRV, and e2e checks must be green before merge.
+- Review security/correctness call sites affected by API changes, especially CAS/ref updates, capability verification, identifiers/randomness, object encoding, and metadata durability.
+- Never merge several independently green lockfile pull requests without revalidating their combined current-`main` merge result.
+- If a generated lockfile merge conflicts or becomes invalid, recreate it from the manifests rather than hand-splicing dependency records.
+- Workflow/action-only upgrades may proceed separately when their CI is green.
