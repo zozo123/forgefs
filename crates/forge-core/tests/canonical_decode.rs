@@ -94,5 +94,8 @@ fn huge_declared_length_returns_error_without_panicking() {
         let mut r = Reader::new(&bytes);
         r.bytes()
     });
-    assert!(matches!(outcome, Ok(Err(_))), "decoder panicked or accepted impossible length");
+    assert!(
+        matches!(outcome, Ok(Err(_))),
+        "decoder panicked or accepted impossible length"
+    );
 }
