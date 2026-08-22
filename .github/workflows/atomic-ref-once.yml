@@ -1,0 +1,64 @@
+name: atomic-ref-once
+on:
+  push:
+    branches: [forgefs/p0-metadata-atomicity]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch insert_ref transaction
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+          old = '''        let conn = self.write.lock();
+        let ts = now_ms() as i64;
+        conn.execute(
+            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
+        )
+        .map_err(map_sql)?;
+        conn.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+            params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
+        )
+        .map_err(map_sql)?;
+        Ok(())
+'''
+          new = '''        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let ts = now_ms() as i64;
+        tx.execute(
+            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+            params![name, oid.as_bytes().as_slice(), agent_id, reason, ts],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(())
+'''
+          if s.count(old) != 1:
+              raise SystemExit('insert_ref anchor mismatch')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo fmt --all
+          cargo test -p forge-store --test metadata_atomicity --locked
+      - name: Commit source only
+        run: |
+          rm .github/workflows/atomic-ref-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-store/src/meta.rs .github/workflows/atomic-ref-once.yml
+          git commit -m 'Make ref and reflog publication atomic'
+          git push
