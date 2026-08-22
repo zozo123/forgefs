@@ -12,6 +12,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 forge-core = { path = "../crates/forge-core" }
 forge-cap = { path = "../crates/forge-cap" }
+forge-api = { path = "../crates/forge-api" }
+forge-protocol = { path = "../crates/forge-protocol" }
+serde_json = "1"
 
 [[bin]]
 name = "object_decode"
@@ -23,6 +26,13 @@ bench = false
 [[bin]]
 name = "cap_token"
 path = "fuzz_targets/cap_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
 test = false
 doc = false
 bench = false
