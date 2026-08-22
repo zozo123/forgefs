@@ -1,0 +1,31 @@
+name: rebase-176
+
+on:
+  push:
+    branches: [perf/durability-batch-102]
+    paths:
+      - .github/workflows/rebase-176.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/durability-batch-102
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Rebase onto current main and self-delete
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "forgefs-rebase-bot"
+          git config user.email "forgefs-rebase-bot@users.noreply.github.com"
+          git fetch origin main
+          git rebase origin/main
+          git rm .github/workflows/rebase-176.yml
+          git commit -m "chore: remove temporary rebase worker"
+          git push --force-with-lease origin HEAD:perf/durability-batch-102
