@@ -3,23 +3,43 @@ use forge_types::{Error, ObjectId, Result};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlobStoreStats {
+    pub puts: u64,
+    pub fsync_file: u64,
+    pub fsync_dir: u64,
+}
+
+#[derive(Debug, Default)]
+struct BlobStoreCounters {
+    puts: AtomicU64,
+    fsync_file: AtomicU64,
+    fsync_dir: AtomicU64,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalBlobStore {
     root: PathBuf,
+    stats: Arc<BlobStoreCounters>,
 }
 
 impl LocalBlobStore {
     pub fn new(root: PathBuf) -> Result<Self> {
+        let stats = Arc::new(BlobStoreCounters::default());
         let objects = root.join("objects");
         let tmp = root.join("tmp");
-        ensure_dir_durable(&root, &objects)?;
-        ensure_dir_durable(&root, &tmp)?;
-        cleanup_stale_tmp(&tmp)?;
-        Ok(Self { root })
+        ensure_dir_durable(&root, &objects, &stats)?;
+        ensure_dir_durable(&root, &tmp, &stats)?;
+        cleanup_stale_tmp(&tmp, &stats)?;
+        Ok(Self { root, stats })
     }
 
     pub fn root(&self) -> &Path {
@@ -46,11 +66,11 @@ impl LocalBlobStore {
         let objects = self.root.join("objects");
         let shard_a = objects.join(a);
         let shard_b = shard_a.join(b);
-        ensure_dir_durable(&objects, &shard_a)?;
-        ensure_dir_durable(&shard_a, &shard_b)?;
+        ensure_dir_durable(&objects, &shard_a, &self.stats)?;
+        ensure_dir_durable(&shard_a, &shard_b, &self.stats)?;
 
         let tmp_dir = self.root.join("tmp");
-        ensure_dir_durable(&self.root, &tmp_dir)?;
+        ensure_dir_durable(&self.root, &tmp_dir, &self.stats)?;
         let tmp = tmp_dir.join(ulid::Ulid::new().to_string());
 
         {
@@ -58,13 +78,15 @@ impl LocalBlobStore {
             f.write_all(bytes)?;
             // The bytes themselves must reach stable storage before publication.
             f.sync_all()?;
+            self.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
         }
 
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
                 // Persist the final directory entry before metadata can publish
                 // the OID. At this point every shard directory is durable too.
-                sync_dir(&shard_b)?;
+                sync_dir_counted(&shard_b, &self.stats)?;
+                self.stats.puts.fetch_add(1, Ordering::Relaxed);
                 let _ = fs::remove_file(&tmp);
                 Ok(id)
             }
@@ -105,11 +127,25 @@ impl LocalBlobStore {
     pub fn has(&self, id: ObjectId) -> bool {
         self.object_path(id).exists()
     }
+
+    pub fn stats(&self) -> BlobStoreStats {
+        BlobStoreStats {
+            puts: self.stats.puts.load(Ordering::Relaxed),
+            fsync_file: self.stats.fsync_file.load(Ordering::Relaxed),
+            fsync_dir: self.stats.fsync_dir.load(Ordering::Relaxed),
+        }
+    }
 }
 
-fn ensure_dir_durable(parent: &Path, child: &Path) -> Result<()> {
+impl crate::Store {
+    pub fn stats(&self) -> BlobStoreStats {
+        self.blobs.stats()
+    }
+}
+
+fn ensure_dir_durable(parent: &Path, child: &Path, stats: &BlobStoreCounters) -> Result<()> {
     match fs::create_dir(child) {
-        Ok(()) => sync_dir(parent),
+        Ok(()) => sync_dir_counted(parent, stats),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(Error::Io(e.to_string())),
     }
@@ -118,7 +154,7 @@ fn ensure_dir_durable(parent: &Path, child: &Path) -> Result<()> {
 /// Reclaim only crash debris old enough that it cannot plausibly be an active
 /// publication. Every Forge temp file is named by its creation-time ULID.
 /// Eagerly deleting all temp files on every Store::open races other processes.
-fn cleanup_stale_tmp(tmp: &Path) -> Result<()> {
+fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::Internal(format!("clock before unix epoch: {e}")))?
@@ -146,13 +182,14 @@ fn cleanup_stale_tmp(tmp: &Path) -> Result<()> {
         }
     }
     if removed {
-        sync_dir(tmp)?;
+        sync_dir_counted(tmp, stats)?;
     }
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
+fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
+    stats.fsync_dir.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -216,6 +253,21 @@ mod tests {
         };
         let reopened = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
         assert_eq!(reopened.get(id).unwrap(), b"durable");
+    }
+
+    #[test]
+    fn stats_count_new_durable_publications_not_dedup_hits() {
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let before = s.stats();
+        let id = s.put(b"measured").unwrap();
+        let after = s.stats();
+        assert_eq!(after.puts, before.puts + 1);
+        assert_eq!(after.fsync_file, before.fsync_file + 1);
+        assert!(after.fsync_dir > before.fsync_dir);
+        s.put(b"measured").unwrap();
+        assert_eq!(s.stats(), after);
+        assert_eq!(s.get(id).unwrap(), b"measured");
     }
 
     #[test]
