@@ -1,4 +1,5 @@
 use forge_types::{EntryKind, Error, ObjectId, Result};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,9 +111,9 @@ fn apply_level(
     overlay: &Overlay,
     store: &impl TreeStore,
 ) -> Result<ObjectId> {
-    let mut entries: BTreeMap<String, TreeEntry> = match base {
-        Some(id) => store.get_tree(id)?.as_map(),
-        None => BTreeMap::new(),
+    let base_tree = match base {
+        Some(id) => store.get_tree(id)?,
+        None => Tree::default(),
     };
 
     let mut groups: BTreeMap<String, Overlay> = BTreeMap::new();
@@ -137,29 +138,33 @@ fn apply_level(
         }
     }
 
-    for (name, op) in files {
-        match op {
-            Some((id, exec)) => {
-                entries.insert(
-                    name.clone(),
-                    TreeEntry {
-                        name,
-                        kind: EntryKind::Blob,
-                        id,
-                        exec,
-                    },
-                );
-            }
-            None => {
-                entries.remove(&name);
-            }
-        }
+    // Build only the direct-child edit set, then linearly merge it with the
+    // already-canonical base vector. This avoids cloning every unchanged
+    // directory entry into a BTreeMap for sparse updates.
+    let mut edits: BTreeMap<String, Option<TreeEntry>> = BTreeMap::new();
+    for (name, op) in &files {
+        validate_name(name)?;
+        let entry = op.map(|(id, exec)| TreeEntry {
+            name: name.clone(),
+            kind: EntryKind::Blob,
+            id,
+            exec,
+        });
+        edits.insert(name.clone(), entry);
     }
 
     for (name, sub) in groups {
-        let child_base = match entries.get(&name) {
-            Some(e) if e.kind == EntryKind::Tree => Some(e.id),
-            _ => None,
+        validate_name(&name)?;
+        // Preserve the historical direct-file-vs-nested-path precedence:
+        // direct file/tombstone first removes any tree base, then the nested
+        // edit recreates the directory and wins at this level.
+        let child_base = if files.contains_key(&name) {
+            None
+        } else {
+            base_tree
+                .get(&name)
+                .filter(|e| e.kind == EntryKind::Tree)
+                .map(|e| e.id)
         };
         let child_prefix = if prefix.is_empty() {
             name.clone()
@@ -168,23 +173,69 @@ fn apply_level(
         };
         let child_id = apply_level(child_base, &child_prefix, &sub, store)?;
         let child_tree = store.get_tree(child_id)?;
-        if child_tree.is_empty() {
-            entries.remove(&name);
+        let entry = if child_tree.is_empty() {
+            None
         } else {
-            entries.insert(
-                name.clone(),
-                TreeEntry {
-                    name,
-                    kind: EntryKind::Tree,
-                    id: child_id,
-                    exec: false,
-                },
-            );
+            Some(TreeEntry {
+                name: name.clone(),
+                kind: EntryKind::Tree,
+                id: child_id,
+                exec: false,
+            })
+        };
+        edits.insert(name, entry);
+    }
+
+    let tree = merge_canonical_entries(&base_tree.entries, edits)?;
+    store.put_tree(&tree)
+}
+
+fn merge_canonical_entries(
+    base: &[TreeEntry],
+    edits: BTreeMap<String, Option<TreeEntry>>,
+) -> Result<Tree> {
+    let mut out = Vec::with_capacity(base.len().saturating_add(edits.len()));
+    let mut base_iter = base.iter().peekable();
+    let mut edit_iter = edits.into_iter().peekable();
+
+    loop {
+        match (base_iter.peek(), edit_iter.peek()) {
+            (Some(base_entry), Some((edit_name, _))) => {
+                match base_entry.name.as_bytes().cmp(edit_name.as_bytes()) {
+                    Ordering::Less => {
+                        out.push((*base_entry).clone());
+                        base_iter.next();
+                    }
+                    Ordering::Equal => {
+                        let (_, replacement) = edit_iter.next().unwrap();
+                        if let Some(entry) = replacement {
+                            out.push(entry);
+                        }
+                        base_iter.next();
+                    }
+                    Ordering::Greater => {
+                        let (_, replacement) = edit_iter.next().unwrap();
+                        if let Some(entry) = replacement {
+                            out.push(entry);
+                        }
+                    }
+                }
+            }
+            (Some(base_entry), None) => {
+                out.push((*base_entry).clone());
+                base_iter.next();
+            }
+            (None, Some(_)) => {
+                let (_, replacement) = edit_iter.next().unwrap();
+                if let Some(entry) = replacement {
+                    out.push(entry);
+                }
+            }
+            (None, None) => break,
         }
     }
 
-    let tree = Tree::new(entries.into_values().collect())?;
-    store.put_tree(&tree)
+    Tree::from_canonical(out)
 }
 
 /// Strip a directory prefix only on a `/` boundary (`dir` does not match `dir2`).
@@ -323,5 +374,55 @@ mod apply_tests {
         assert_eq!(tree.get("middle").unwrap().id, ObjectId([3u8; 32]));
         assert_eq!(tree.get("zeta").unwrap().id, ObjectId([1u8; 32]));
         assert!(tree.get("absent").is_none());
+    }
+
+    #[test]
+    fn sparse_overlay_preserves_canonical_order_without_map_rebuild() {
+        let store = Mem(Mutex::new(HashMap::new()));
+        let base = Tree::new((0..1000)
+            .map(|i| TreeEntry {
+                name: format!("file-{i:04}"),
+                kind: EntryKind::Blob,
+                id: ObjectId([(i % 251) as u8; 32]),
+                exec: false,
+            })
+            .collect())
+            .unwrap();
+        let base_id = store.put_tree(&base).unwrap();
+
+        let replacement = ObjectId([253u8; 32]);
+        let inserted = ObjectId([254u8; 32]);
+        let mut ov = Overlay::new();
+        ov.insert("file-0500".into(), Some((replacement, true)));
+        ov.insert("file-0750".into(), None);
+        ov.insert("file-1000".into(), Some((inserted, false)));
+
+        let root = apply_overlay(Some(base_id), &ov, &store).unwrap();
+        let tree = store.get_tree(root).unwrap();
+        assert_eq!(tree.entries.len(), 1000);
+        assert_eq!(tree.get("file-0500").unwrap().id, replacement);
+        assert!(tree.get("file-0500").unwrap().exec);
+        assert!(tree.get("file-0750").is_none());
+        assert_eq!(tree.get("file-1000").unwrap().id, inserted);
+        for pair in tree.entries.windows(2) {
+            assert!(pair[0].name.as_bytes() < pair[1].name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn nested_edit_wins_over_direct_file_at_same_name() {
+        let store = Mem(Mutex::new(HashMap::new()));
+        let direct = ObjectId([9u8; 32]);
+        let nested = ObjectId([10u8; 32]);
+        let mut ov = Overlay::new();
+        ov.insert("dir".into(), Some((direct, false)));
+        ov.insert("dir/child".into(), Some((nested, false)));
+
+        let root = apply_overlay(None, &ov, &store).unwrap();
+        let tree = store.get_tree(root).unwrap();
+        let dir = tree.get("dir").unwrap();
+        assert_eq!(dir.kind, EntryKind::Tree);
+        let child_tree = store.get_tree(dir.id).unwrap();
+        assert_eq!(child_tree.get("child").unwrap().id, nested);
     }
 }
