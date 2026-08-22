@@ -1,0 +1,33 @@
+name: schema-migration-driver
+
+on:
+  push:
+    branches: [forgefs/schema-migrations-v1]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: forgefs/schema-migrations-v1
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply transactional migration contract
+        run: |
+          python3 .github/schema_migration_patch.py
+          cargo fmt --all
+          cargo test -p forge-store --test schema_migrations --locked -- --nocapture
+      - name: Commit product-only implementation
+        run: |
+          rm .github/schema_migration_patch.py .github/workflows/schema-migration-driver.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'P1: version metadata schema transactionally'
+          git push origin HEAD:forgefs/schema-migrations-v1
