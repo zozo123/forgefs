@@ -39,7 +39,7 @@ fn newer_metadata_schema_fails_closed() {
 
     let err = Meta::open(&path)
         .err()
-        .expect("v1 code must reject v2 metadata");
+        .expect("current code must reject a future metadata schema");
     assert!(matches!(err, Error::Invalid(_)), "unexpected error: {err}");
 }
 
@@ -59,6 +59,7 @@ fn reopening_current_schema_is_idempotent() {
 
 // Compatibility rejection must be side-effect free: opening a future schema
 // must not switch journal modes or create WAL state before returning the error.
+// Couple the fixture to CURRENT_SCHEMA_VERSION so migrations cannot stale it.
 #[test]
 fn newer_schema_rejection_does_not_mutate_journal_mode() {
     let d = tempdir().unwrap();
