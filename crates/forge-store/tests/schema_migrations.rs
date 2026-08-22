@@ -37,7 +37,9 @@ fn newer_metadata_schema_fails_closed() {
     .unwrap();
     drop(conn);
 
-    let err = Meta::open(&path).err().expect("v1 code must reject v2 metadata");
+    let err = Meta::open(&path)
+        .err()
+        .expect("v1 code must reject v2 metadata");
     assert!(matches!(err, Error::Invalid(_)), "unexpected error: {err}");
 }
 
