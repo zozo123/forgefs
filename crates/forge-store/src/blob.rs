@@ -3,6 +3,9 @@ use forge_types::{Error, ObjectId, Result};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct LocalBlobStore {
@@ -15,7 +18,7 @@ impl LocalBlobStore {
         let tmp = root.join("tmp");
         ensure_dir_durable(&root, &objects)?;
         ensure_dir_durable(&root, &tmp)?;
-        cleanup_tmp(&tmp)?;
+        cleanup_stale_tmp(&tmp)?;
         Ok(Self { root })
     }
 
@@ -112,14 +115,34 @@ fn ensure_dir_durable(parent: &Path, child: &Path) -> Result<()> {
     }
 }
 
-fn cleanup_tmp(tmp: &Path) -> Result<()> {
+/// Reclaim only crash debris old enough that it cannot plausibly be an active
+/// publication. Every Forge temp file is named by its creation-time ULID.
+/// Eagerly deleting all temp files on every Store::open races other processes.
+fn cleanup_stale_tmp(tmp: &Path) -> Result<()> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Internal(format!("clock before unix epoch: {e}")))?
+        .as_millis() as u64;
     let mut removed = false;
     for entry in fs::read_dir(tmp)? {
         let entry = entry?;
         let ty = entry.file_type()?;
-        if ty.is_file() || ty.is_symlink() {
-            fs::remove_file(entry.path())?;
-            removed = true;
+        if !(ty.is_file() || ty.is_symlink()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(id) = ulid::Ulid::from_string(&name) else {
+            continue;
+        };
+        if now_ms.saturating_sub(id.timestamp_ms()) < STALE_TMP_MS {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e.to_string())),
         }
     }
     if removed {
@@ -155,13 +178,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_tmp_is_cleaned_on_open() {
+    fn startup_reclaims_old_tmp_but_never_fresh_tmp() {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("tmp")).unwrap();
-        let junk = d.path().join("tmp/junk");
-        fs::write(&junk, b"partial").unwrap();
+        let stale = d.path().join("tmp").join(ulid::Ulid::nil().to_string());
+        let fresh = d.path().join("tmp").join(ulid::Ulid::new().to_string());
+        fs::write(&stale, b"crash debris").unwrap();
+        fs::write(&fresh, b"live publication").unwrap();
+
         let _s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
-        assert!(!junk.exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
     }
 
     #[test]
