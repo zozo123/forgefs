@@ -3,7 +3,7 @@
 pub mod blob;
 pub mod meta;
 
-pub use blob::LocalBlobStore;
+pub use blob::{LocalBlobStore, PublishBatch};
 pub use meta::{sanitize_agent, Meta, MetaStats, MountRow, NsRow, OverlayRow};
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};
@@ -22,7 +22,42 @@ pub struct Store {
     blob_cache: Mutex<LruCache<ObjectId, Arc<[u8]>>>,
 }
 
+pub struct StorePublishBatch<'a> {
+    store: &'a Store,
+    objects: Mutex<PublishBatch<'a>>,
+}
+
+impl StorePublishBatch<'_> {
+    pub fn put_commit(&self, commit: &Commit) -> Result<ObjectId> {
+        self.objects.lock().put(&commit.encode())
+    }
+
+    pub fn finish(self) -> Result<()> {
+        self.objects.into_inner().finish()
+    }
+}
+
+impl TreeStore for StorePublishBatch<'_> {
+    fn get_tree(&self, id: ObjectId) -> Result<Tree> {
+        self.store.get_tree(id)
+    }
+
+    fn put_tree(&self, tree: &Tree) -> Result<ObjectId> {
+        let bytes = tree.encode()?;
+        let id = self.objects.lock().put(&bytes)?;
+        self.store.trees.lock().put(id, Arc::new(tree.clone()));
+        Ok(id)
+    }
+}
+
 impl Store {
+    pub fn begin_publish_batch(&self) -> StorePublishBatch<'_> {
+        StorePublishBatch {
+            store: self,
+            objects: Mutex::new(self.blobs.begin_batch()),
+        }
+    }
+
     pub fn open(root: &Path) -> Result<Self> {
         let blobs = LocalBlobStore::new(root.to_path_buf())?;
         let meta = Meta::open(&root.join("meta.sqlite"))?;
