@@ -178,7 +178,6 @@ impl Store {
                         let old_bytes = self.get_raw(id)?;
                         match decode_object_type(&old_bytes)? {
                             ObjectType::Tree => Some(Tree::decode(&old_bytes)?),
-                            ObjectType::Blob => None,
                             other => {
                                 return Err(Error::Corrupt(format!(
                                     "unexpected {} in previous tree edge at {id}",
