@@ -85,7 +85,14 @@ CREATE TABLE IF NOT EXISTS cap_root (
   hmac_key BLOB NOT NULL DEFAULT X'',
   seal_pub BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_ms INTEGER NOT NULL
+);
 "#;
+
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct MountRow {
@@ -138,6 +145,51 @@ fn map_sql(e: rusqlite::Error) -> Error {
     }
 }
 
+fn schema_version(conn: &Connection) -> Result<i64> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_sql)?;
+    if exists == 0 {
+        return Ok(0);
+    }
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(map_sql)
+}
+
+fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
+    if from > CURRENT_SCHEMA_VERSION {
+        return Err(Error::Invalid(format!(
+            "metadata schema version {from} is newer than supported {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
+    if from == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if from != 0 {
+        return Err(Error::Invalid(format!(
+            "unsupported metadata schema migration {from} -> {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sql)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, ?2)",
+        params![CURRENT_SCHEMA_VERSION, now_ms() as i64],
+    )
+    .map_err(map_sql)?;
+    tx.commit().map_err(map_sql)
+}
+
 fn validate_ref_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 512 || name.starts_with('/') || name.ends_with('/') {
         return Err(Error::Invalid(format!("invalid ref name {name:?}")));
@@ -180,8 +232,15 @@ fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
 
 impl Meta {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).map_err(map_sql)?;
+        let mut conn = Connection::open(path).map_err(map_sql)?;
+        let version = schema_version(&conn)?;
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(Error::Invalid(format!(
+                "metadata schema version {version} is newer than supported {CURRENT_SCHEMA_VERSION}"
+            )));
+        }
         conn.execute_batch(SCHEMA).map_err(map_sql)?;
+        migrate(&mut conn, version)?;
         // execute_batch may not apply PRAGMA journal_mode via some paths; force.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
