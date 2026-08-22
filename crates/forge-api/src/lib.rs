@@ -8,7 +8,7 @@ pub use serve::serve;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use forge_cap::{attenuate, mint_integrator, mint_root, verify, Cap, Op};
 use forge_core::cbor::{encode_map_sorted, encode_text};
-use forge_core::tree::apply_overlay;
+use forge_core::tree::{apply_overlay, split_path};
 use forge_core::{hash_bytes, now_ms, Commit, Snapshot, Tree};
 use forge_merge::{lca, three_way, MergeOutcome};
 use forge_ns::{
@@ -16,7 +16,7 @@ use forge_ns::{
     Mount, Resolved, Spec,
 };
 use forge_store::{sanitize_agent, Store};
-use forge_types::{CasResult, Error, ObjectId, ObjectType, RefRow, Result};
+use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, RefRow, Result};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -147,14 +147,14 @@ impl Forge {
         cap.allows(op, r#ref, now_ms())
     }
 
-    /// Root/integrator tokens have no `agent=` caveat and may administer all sessions.
-    fn is_unscoped(cap: &Cap) -> bool {
-        cap.agent.is_none()
+    /// Unrestricted ref scope is an explicit full-ref cap (root), not "no agent".
+    fn ref_unrestricted(cap: &Cap) -> bool {
+        cap.ref_sets.is_empty() && cap.op_ref_sets.is_empty()
     }
 
     fn require_ns(&self, cap: &Cap, ns: &str) -> Result<forge_store::NsRow> {
         let row = self.store.meta.get_namespace(ns)?;
-        if Self::is_unscoped(cap) || row.agent_id == cap.agent_id() {
+        if row.agent_id == cap.agent_id() {
             Ok(row)
         } else {
             Err(Error::Denied(format!(
@@ -169,7 +169,7 @@ impl Forge {
         match parse_spec(spec)? {
             Spec::Ref(n) => self.check(cap, Op::Read, Some(&n)),
             Spec::Oid(_) => {
-                if Self::is_unscoped(cap) {
+                if Self::ref_unrestricted(cap) {
                     self.check(cap, Op::Read, None)
                 } else {
                     Err(Error::Denied(
@@ -231,7 +231,9 @@ impl Forge {
         let ns_id = ulid::Ulid::new().to_string();
         let agent = sanitize_agent(cap.agent_id());
         let live = format!("heads/agents/{agent}/{ns_id}");
-        self.store.meta.insert_namespace(&ns_id, cap.agent_id())?;
+        self.store
+            .meta
+            .insert_namespace(&ns_id, cap.agent_id(), cid, &live)?;
         self.store.meta.insert_ref(
             &live,
             cid,
@@ -260,7 +262,7 @@ impl Forge {
         if rw {
             if let Spec::Ref(n) = parse_spec(spec)? {
                 self.check(cap, Op::Write, Some(&n))?;
-            } else if Self::is_unscoped(cap) {
+            } else if Self::ref_unrestricted(cap) {
                 self.check(cap, Op::Write, None)?;
             } else {
                 return Err(Error::Denied(
@@ -332,7 +334,11 @@ impl Forge {
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
         let tree = self.mount_tree(&m.spec)?;
         match resolve(&self.store, &mounts, &ov, tree, path)? {
-            Resolved::Blob { id, .. } => self.store.get_blob_data(id),
+            Resolved::Blob { id, .. } => {
+                let rel = rel_of(&m.path, path)?;
+                self.store.meta.observe(ns, &m.path, &rel, id)?;
+                self.store.get_blob_data(id)
+            }
             Resolved::Tree(_) => Err(Error::Invalid("read of directory".into())),
         }
     }
@@ -401,16 +407,19 @@ impl Forge {
             Spec::Oid(_) => return Err(Error::Invalid("cannot checkin an oid mount".into())),
         };
         self.check(cap, Op::Write, Some(&ref_name))?;
+        let nsrow = self.store.meta.get_namespace(ns)?;
+        let pin = nsrow.pinned_oid.ok_or(Error::InvalidBase)?;
         let row = self
             .store
             .meta
             .get_ref(&ref_name)?
             .ok_or_else(|| Error::NotFound(ref_name.clone()))?;
-        let base_commit = self.store.get_commit(row.oid)?;
+        let base_commit = self.store.get_commit(pin)?;
         let ov_rows = self.store.meta.overlay_list(ns, &m.path)?;
         let ov = overlay_map(&ov_rows);
+        self.check_observations(ns, &m.path, &ov, pin, &mounts)?;
         let new_tree = apply_overlay(Some(base_commit.tree), &ov, &self.store)?;
-        if new_tree == base_commit.tree {
+        if new_tree == base_commit.tree && pin == row.oid {
             return Ok(CasResult::Noop {
                 name: ref_name,
                 oid: row.oid,
@@ -418,7 +427,7 @@ impl Forge {
         }
         let commit = Commit {
             tree: new_tree,
-            parents: vec![row.oid],
+            parents: vec![pin],
             agent: cap.agent_id().into(),
             msg: msg.into(),
             ts: now_ms(),
@@ -429,7 +438,7 @@ impl Forge {
             .record_intros(Some(base_commit.tree), new_tree, cid, cap.agent_id())?;
         let result = self.store.meta.cas_ref(
             &ref_name,
-            row.oid,
+            pin,
             cid,
             "commit",
             cap.agent_id(),
@@ -442,12 +451,50 @@ impl Forge {
             }
             CasResult::Noop { .. } => {}
         }
-        if let CasResult::Forked { fork, .. } = &result {
+        if let CasResult::Forked { fork, ours, .. } = &result {
             self.store
                 .meta
                 .update_mount_spec(ns, &m.path, &format!("ref:{fork}"))?;
+            self.store.meta.set_pin(ns, *ours)?;
+            self.store.meta.observations_clear(ns)?;
+        }
+        if let CasResult::Updated { oid, .. } = &result {
+            self.store.meta.set_pin(ns, *oid)?;
+            self.store.meta.observations_clear(ns)?;
         }
         Ok(result)
+    }
+
+    fn check_observations(
+        &self,
+        ns: &str,
+        checkin_mount: &str,
+        ov: &forge_core::Overlay,
+        pin: ObjectId,
+        mounts: &[Mount],
+    ) -> Result<()> {
+        let pin_tree = self.store.get_commit(pin)?.tree;
+        for obs in self.store.meta.observations(ns)? {
+            if obs.mount == checkin_mount && ov.contains_key(&obs.path) {
+                continue;
+            }
+            let tree = if obs.mount == checkin_mount {
+                pin_tree
+            } else if let Some(om) = mounts.iter().find(|m| m.path == obs.mount) {
+                self.mount_tree(&om.spec)?
+            } else {
+                continue;
+            };
+            let now = blob_at(&self.store, tree, &obs.path)?;
+            if now != Some(obs.oid) {
+                return Err(Error::StaleObservation {
+                    path: format!("{}:/{}", obs.mount, obs.path),
+                    expected: obs.oid.hex(),
+                    found: now.map(|id| id.hex()).unwrap_or_else(|| "missing".into()),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn branch(&self, cap: &Cap, from: &str, name: &str) -> Result<ObjectId> {
@@ -607,13 +654,9 @@ impl Forge {
         let sig = Signature::from_bytes(&snap.sig);
         pk.verify(h.as_bytes(), &sig)
             .map_err(|_| Error::Corrupt("snapshot signature".into()))?;
-        let walked = self.store.reachable_oids(snap.tree)?;
-        if !walked.iter().any(|id| *id == snap.tree) {
+        let walked = self.store.reachable_oids_verified(snap.tree)?;
+        if !walked.contains(&snap.tree) {
             return Err(Error::Corrupt("tree walk".into()));
-        }
-        // re-hash every object file
-        for id in walked {
-            let _ = self.store.get_raw(id)?;
         }
         Ok(snap_oid)
     }
@@ -706,16 +749,51 @@ impl Forge {
     }
 }
 
+fn blob_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<ObjectId>> {
+    if rel.is_empty() {
+        return Ok(None);
+    }
+    let parts = split_path(rel)?;
+    let mut cur = tree;
+    for (i, part) in parts.iter().enumerate() {
+        let t = store.get_tree(cur)?;
+        let Some(ent) = t.get(part) else {
+            return Ok(None);
+        };
+        if i + 1 == parts.len() {
+            return Ok(if ent.kind == EntryKind::Blob {
+                Some(ent.id)
+            } else {
+                None
+            });
+        }
+        if ent.kind != EntryKind::Tree {
+            return Ok(None);
+        }
+        cur = ent.id;
+    }
+    Ok(None)
+}
+
 fn import_walk(store: &Store, dir: &Path) -> Result<ObjectId> {
     let mut entries = Vec::new();
     let mut kids: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
     kids.sort_by_key(|e| e.file_name());
     for k in kids {
-        let name = k.file_name().to_string_lossy().into_owned();
+        let name = k
+            .file_name()
+            .into_string()
+            .map_err(|_| Error::Invalid(format!("non-utf8 name in {}", dir.display())))?;
         if name == ".forge" || name == ".git" {
             continue;
         }
         let ft = k.file_type()?;
+        if ft.is_symlink() {
+            return Err(Error::Invalid(format!(
+                "import refuses symlink {}",
+                k.path().display()
+            )));
+        }
         if ft.is_dir() {
             let id = import_walk(store, &k.path())?;
             entries.push(forge_core::TreeEntry {
@@ -724,7 +802,12 @@ fn import_walk(store: &Store, dir: &Path) -> Result<ObjectId> {
                 id,
                 exec: false,
             });
-        } else if ft.is_file() {
+        } else if !ft.is_file() {
+            return Err(Error::Invalid(format!(
+                "import refuses unsupported file type {}",
+                k.path().display()
+            )));
+        } else {
             let data = fs::read(k.path())?;
             let id = store.put_blob_data(&data)?;
             let exec = is_exec(&k.path());
@@ -1082,5 +1165,55 @@ mod tests {
         let f = Forge::open(d.path()).unwrap();
         let cap = f.root_cap().unwrap();
         assert!(f.verify_tag(&cap, "v1.0").is_err());
+    }
+
+    #[test]
+    fn stale_observation_of_main_is_detected() {
+        let (_d, f, cap) = setup();
+        let integ = f.integrator_cap().unwrap();
+        let alice = f
+            .grant(
+                &cap,
+                vec![
+                    "ops=read,write,branch".into(),
+                    "agent=alice".into(),
+                    "ref=heads/agents/alice/*,main".into(),
+                ],
+            )
+            .unwrap();
+        let bob = f
+            .grant(
+                &cap,
+                vec![
+                    "ops=read,write,branch".into(),
+                    "agent=bob".into(),
+                    "ref=heads/agents/bob/*,main".into(),
+                ],
+            )
+            .unwrap();
+        let a = f.session_open(&alice, "main").unwrap();
+        f.write(&alice, &a, "/x.txt", b"v1", false).unwrap();
+        let CasResult::Updated { name: aref, .. } = f.checkin(&alice, &a, "/", "x").unwrap() else {
+            panic!("alice checkin");
+        };
+        f.merge(&integ, "main", &aref, None).unwrap();
+
+        let b = f.session_open(&bob, "main").unwrap();
+        assert_eq!(f.read(&bob, &b, "/main/x.txt").unwrap(), b"v1");
+
+        let a2 = f.session_open(&alice, "main").unwrap();
+        f.write(&alice, &a2, "/x.txt", b"v2", false).unwrap();
+        let CasResult::Updated { name: aref2, .. } = f.checkin(&alice, &a2, "/", "x2").unwrap()
+        else {
+            panic!("alice2");
+        };
+        f.merge(&integ, "main", &aref2, None).unwrap();
+
+        f.write(&bob, &b, "/y.txt", b"unrelated", false).unwrap();
+        let err = f.checkin(&bob, &b, "/", "y").unwrap_err();
+        assert!(
+            matches!(err, Error::StaleObservation { .. }),
+            "expected stale observation, got {err:?}"
+        );
     }
 }

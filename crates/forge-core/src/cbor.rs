@@ -103,30 +103,68 @@ impl<'a> Reader<'a> {
     }
 
     fn take_uint(&mut self, ai: u8) -> Result<u64> {
+        // RFC 8949 §4.2.1: shortest form only. Longer encodings of the same
+        // integer would otherwise yield a different ObjectId for one value.
         match ai {
             0..=23 => Ok(ai as u64),
-            24 => Ok(self.take(1)?[0] as u64),
+            24 => {
+                let n = self.take(1)?[0] as u64;
+                if n < 24 {
+                    return Err(Error::Corrupt("non-canonical uint".into()));
+                }
+                Ok(n)
+            }
             25 => {
                 let b = self.take(2)?;
-                Ok(u16::from_be_bytes([b[0], b[1]]) as u64)
+                let n = u16::from_be_bytes([b[0], b[1]]) as u64;
+                if n <= 0xff {
+                    return Err(Error::Corrupt("non-canonical uint".into()));
+                }
+                Ok(n)
             }
             26 => {
                 let b = self.take(4)?;
-                Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64)
+                let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+                if n <= 0xffff {
+                    return Err(Error::Corrupt("non-canonical uint".into()));
+                }
+                Ok(n)
             }
             27 => {
                 let b = self.take(8)?;
-                Ok(u64::from_be_bytes([
-                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                ]))
+                let n = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                if n <= 0xffff_ffff {
+                    return Err(Error::Corrupt("non-canonical uint".into()));
+                }
+                Ok(n)
             }
+            31 => Err(Error::Corrupt("indefinite cbor is not canonical".into())),
             _ => Err(Error::Corrupt("cbor additional info".into())),
         }
     }
 
     fn header(&mut self) -> Result<(u8, u8)> {
         let b = self.take(1)?[0];
-        Ok((b >> 5, b & 0x1f))
+        let major = b >> 5;
+        let ai = b & 0x1f;
+        if major == 6 {
+            return Err(Error::Corrupt("cbor tags are not canonical here".into()));
+        }
+        Ok((major, ai))
+    }
+
+    /// Map keys must be strictly increasing by **encoded** CBOR bytes (RFC 8949).
+    pub fn text_map_key(&mut self, last: &mut Option<Vec<u8>>) -> Result<String> {
+        let start = self.pos;
+        let k = self.text()?;
+        let encoded = self.buf[start..self.pos].to_vec();
+        if let Some(prev) = last.as_ref() {
+            if encoded.as_slice() <= prev.as_slice() {
+                return Err(Error::Corrupt("cbor map keys not strictly sorted".into()));
+            }
+        }
+        *last = Some(encoded);
+        Ok(k)
     }
 
     pub fn u64(&mut self) -> Result<u64> {

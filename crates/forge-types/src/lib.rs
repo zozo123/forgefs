@@ -65,7 +65,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(Error::Invalid("odd hex length".into()));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -180,6 +180,14 @@ pub enum Error {
     Busy(String),
     #[error("conflict object {0}")]
     MergeConflict(ObjectId),
+    #[error("stale observation of {path}: expected {expected}, found {found}")]
+    StaleObservation {
+        path: String,
+        expected: String,
+        found: String,
+    },
+    #[error("invalid base")]
+    InvalidBase,
     #[error("io: {0}")]
     Io(String),
     #[error("sqlite: {0}")]
@@ -206,6 +214,8 @@ impl Error {
             Error::Corrupt(_) => "corrupt",
             Error::Busy(_) => "busy",
             Error::MergeConflict(_) => "conflict",
+            Error::StaleObservation { .. } => "stale_observation",
+            Error::InvalidBase => "invalid_base",
             Error::Io(_) => "internal",
             Error::Sqlite(_) => "internal",
             Error::Cap(_) => "denied",

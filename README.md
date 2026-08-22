@@ -1,39 +1,51 @@
 # ForgeFS
 
-A content-addressable filesystem for concurrent agents and humans.
+A **concurrency and provenance substrate for autonomous agents**.
 
-Bytes are immutable and addressed by BLAKE3. Named refs are the only mutable pointers. Colliding writes fork instead of clobbering. Authority is a capability. The official release of a project is a sealed, signed snapshot of `main`.
+Not another POSIX filesystem. Not S3 copy-in/copy-out. Bytes are immutable and content-addressed. Named refs move by compare-and-swap. Sessions pin a snapshot. Checkin fails on **overlapping writes and stale reads**. The official release is a cryptographically sealed tag.
 
-This is not Git, not IPFS, and not an S3 copy-in/copy-out workspace. It is designed so thousands of writers can check in and check out in parallel without silently overwriting each other.
+**Immutable bytes. Explicit authority. Snapshot reasoning. Deterministic integration. Loud conflicts. Verifiable releases.**
 
-## Run locally (no Docker, no network)
+## 60-second thesis
 
 ```bash
 cargo test --workspace
 cargo run -p forge-cli -- init ./demo
-NS=$(cargo run -q -p forge-cli -- --dir ./demo session open --from=main)
-cargo run -p forge-cli -- --dir ./demo write --ns "$NS" /hello.txt --text "hello"
-cargo run -p forge-cli -- --dir ./demo checkin --ns "$NS" -m "hello"
-# integrator publishes
-cargo run -p forge-cli -- --dir ./demo --cap ./demo/.forge/keys/integrator.cap \
-  merge --into=main --from=heads/agents/anon/$NS
-cargo run -p forge-cli -- --dir ./demo --cap ./demo/.forge/keys/integrator.cap \
-  seal main --tag v1.0 --attest
-cargo run -p forge-cli -- --dir ./demo export tags/v1.0 -o /tmp/v1.0.tar
+# no ambient root: pass the cap file init printed
+CAP=./demo/.forge/keys/root.cap
+INT=./demo/.forge/keys/integrator.cap
+
+A=$(cargo run -q -p forge-cli -- --dir ./demo --cap $CAP session open --from=main)
+B=$(cargo run -q -p forge-cli -- --dir ./demo --cap $CAP session open --from=main)
+cargo run -p forge-cli -- --dir ./demo --cap $CAP write --ns $A /a.txt --text "alice"
+cargo run -p forge-cli -- --dir ./demo --cap $CAP write --ns $B /b.txt --text "bob"
+cargo run -p forge-cli -- --dir ./demo --cap $CAP checkin --ns $A -m a
+cargo run -p forge-cli -- --dir ./demo --cap $CAP checkin --ns $B -m b
+# merge + seal (integrator cap)
+cargo run -p forge-cli -- --dir ./demo --cap $INT merge --into=main --from=heads/agents/anon/$A
+cargo run -p forge-cli -- --dir ./demo --cap $INT seal main --tag v1.0 --attest
+cargo run -p forge-cli -- --dir ./demo --cap $CAP verify v1.0
 ```
 
-## Shape
+Two agents, one forge, no cloud. If they both touch the same path you get a **conflict object**. If one shipped a new `/x` while the other still reasoned about the old `/x`, you get **stale observation** — even when the second agent only writes `/y`.
+
+See [INVARIANTS.md](INVARIANTS.md) for the 15-line correctness model.
+
+## Local (no Docker)
+
+```bash
+cargo test --workspace
+```
+
+## Layout
 
 | Crate | Role |
 |---|---|
-| `forge-types` | `ObjectId`, errors |
-| `forge-core` | Canonical object encode/decode, tree COW |
-| `forge-store` | Local CAS + SQLite refs/overlay |
-| `forge-cap` | HMAC macaroons |
-| `forge-ns` | Plan 9-style namespaces and mounts |
+| `forge-types` | ObjectId, errors (`StaleObservation`, `Denied`, …) |
+| `forge-core` | Canonical CBOR objects, tree COW |
+| `forge-store` | Write-once CAS + SQLite transactions |
+| `forge-cap` | `(op, resource)` macaroons; attenuation only shrinks |
+| `forge-ns` | Mount tables |
 | `forge-merge` | 3-way merge, conflict objects |
-| `forge-protocol` | Length-prefixed request ABI |
-| `forge-api` | `Forge` library + `serve` |
-| `forge-cli` | `forge` binary |
-
-See the in-repo design: every write-once object lives under `.forge/objects/`, refs live in SQLite WAL, and `forge seal main --tag v1.0` freezes a tag without freezing the future of `main`.
+| `forge-api` | Sessions, checkin, seal, serve |
+| `forge-cli` | `forge` (requires `--cap` / `FORGE_CAP`) |

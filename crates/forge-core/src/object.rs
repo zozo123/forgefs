@@ -71,6 +71,9 @@ impl Blob {
                 payload.len()
             )));
         }
+        if !r.at_end() {
+            return Err(Error::Corrupt("blob header trailing bytes".into()));
+        }
         Ok(Blob {
             data: payload.to_vec(),
         })
@@ -117,12 +120,16 @@ impl Tree {
         let mut r = Reader::new(header);
         let n = r.map()?;
         let mut entries = None;
+        let mut last_top: Option<Vec<u8>> = None;
         for _ in 0..n {
-            let k = r.text()?;
+            let k = r.text_map_key(&mut last_top)?;
             if k != "e" {
                 return Err(Error::Corrupt(format!("unknown tree key {k}")));
             }
             let m = r.array()?;
+            if m > 100_000 {
+                return Err(Error::Corrupt("tree fanout exceeds limit".into()));
+            }
             let mut v = Vec::with_capacity(m as usize);
             for _ in 0..m {
                 let kn = r.map()?;
@@ -130,8 +137,9 @@ impl Tree {
                 let mut kind = None;
                 let mut id = None;
                 let mut exec = None;
+                let mut last_ent: Option<Vec<u8>> = None;
                 for _ in 0..kn {
-                    let fk = r.text()?;
+                    let fk = r.text_map_key(&mut last_ent)?;
                     match fk.as_str() {
                         "n" => name = Some(r.text()?),
                         "k" => kind = Some(EntryKind::from_u8(r.u64()? as u8)?),
@@ -149,11 +157,10 @@ impl Tree {
             }
             entries = Some(v);
         }
-        let mut tree = Tree {
-            entries: entries.ok_or_else(|| Error::Corrupt("tree missing e".into()))?,
-        };
-        tree.sort();
-        Ok(tree)
+        if !r.at_end() {
+            return Err(Error::Corrupt("tree header trailing bytes".into()));
+        }
+        Tree::from_canonical(entries.ok_or_else(|| Error::Corrupt("tree missing e".into()))?)
     }
 }
 

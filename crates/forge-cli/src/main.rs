@@ -178,8 +178,9 @@ fn load_cap(f: &Forge, cli: &Cli) -> forge_types::Result<Cap> {
         };
         return f.load_cap(tok.trim());
     }
-    eprintln!("forge: warning: using .forge/keys/root.cap (ambient local convenience)");
-    f.root_cap()
+    Err(Error::Denied(
+        "pass --cap PATH|TOKEN or FORGE_CAP; no ambient root capability".into(),
+    ))
 }
 
 fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {

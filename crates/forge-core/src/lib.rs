@@ -58,6 +58,10 @@ mod tests {
         assert!(!header.is_empty());
         // Second encode identical.
         assert_eq!(bytes, t.encode().unwrap());
+        // Malleability: longer-form uint length in the header size is a different
+        // file; a non-canonical CBOR uint inside the header must be rejected.
+        let noncanon = vec![0x02, 0, 0, 0, 5, 0xa1, 0x61, b'e', 0x98, 0x00];
+        assert!(Tree::decode(&noncanon).is_err());
     }
 
     #[test]

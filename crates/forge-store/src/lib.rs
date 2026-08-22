@@ -6,9 +6,7 @@ pub mod meta;
 pub use blob::LocalBlobStore;
 pub use meta::{sanitize_agent, Meta, MountRow, NsRow, OverlayRow};
 
-use forge_core::object::{
-    decode_object_type, hash_bytes, parse_file, Blob, Commit, Conflict, Snapshot,
-};
+use forge_core::object::{decode_object_type, parse_file, Blob, Commit, Conflict, Snapshot};
 use forge_core::tree::{Tree, TreeStore};
 use forge_types::{Error, ObjectId, ObjectType, Result};
 use lru::LruCache;
@@ -47,14 +45,16 @@ impl Store {
                 return Ok(b.to_vec());
             }
         }
-        let bytes = self.blobs.get(id)?;
-        if hash_bytes(&bytes) != id {
-            return Err(Error::Corrupt(format!("hash mismatch {id}")));
-        }
+        let bytes = self.get_raw_verified(id)?;
         self.blob_cache
             .lock()
             .put(id, Arc::from(bytes.clone().into_boxed_slice()));
         Ok(bytes)
+    }
+
+    /// Trust-boundary read: always hits durable bytes and re-hashes (I15).
+    pub fn get_raw_verified(&self, id: ObjectId) -> Result<Vec<u8>> {
+        self.blobs.get(id)
     }
 
     pub fn put_blob_data(&self, data: &[u8]) -> Result<ObjectId> {
@@ -175,6 +175,11 @@ impl Store {
     }
 
     pub fn reachable_oids(&self, tree: ObjectId) -> Result<Vec<ObjectId>> {
+        self.reachable_oids_verified(tree)
+    }
+
+    /// Type-aware walk that fail-closes on decode errors (I15 / #35).
+    pub fn reachable_oids_verified(&self, tree: ObjectId) -> Result<Vec<ObjectId>> {
         let mut out = Vec::new();
         let mut stack = vec![tree];
         let mut seen = std::collections::HashSet::new();
@@ -183,9 +188,21 @@ impl Store {
                 continue;
             }
             out.push(id);
-            if let Ok(t) = self.get_tree(id) {
-                for e in t.entries {
-                    stack.push(e.id);
+            let bytes = self.get_raw_verified(id)?;
+            let ty = decode_object_type(&bytes)?;
+            match ty {
+                ObjectType::Tree => {
+                    let t = Tree::decode(&bytes)?;
+                    for e in t.entries {
+                        stack.push(e.id);
+                    }
+                }
+                ObjectType::Blob => {}
+                other => {
+                    return Err(Error::Corrupt(format!(
+                        "unexpected {} in tree walk at {id}",
+                        other.as_str()
+                    )));
                 }
             }
         }

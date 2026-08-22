@@ -33,6 +33,21 @@ impl Tree {
             .sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
     }
 
+    /// Decode-time constructor: reject unsorted or duplicate names (I1).
+    pub fn from_canonical(entries: Vec<TreeEntry>) -> Result<Self> {
+        for e in &entries {
+            validate_name(&e.name)?;
+        }
+        for w in entries.windows(2) {
+            if w[0].name.as_bytes() >= w[1].name.as_bytes() {
+                return Err(Error::Corrupt(
+                    "tree entries are not strictly sorted unique".into(),
+                ));
+            }
+        }
+        Ok(Tree { entries })
+    }
+
     pub fn get(&self, name: &str) -> Option<&TreeEntry> {
         self.entries.iter().find(|e| e.name == name)
     }

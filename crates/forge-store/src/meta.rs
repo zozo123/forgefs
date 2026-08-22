@@ -28,7 +28,17 @@ CREATE INDEX IF NOT EXISTS reflog_name ON reflog(name, id);
 CREATE TABLE IF NOT EXISTS namespaces (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
-  created_ms INTEGER NOT NULL
+  created_ms INTEGER NOT NULL,
+  pinned_oid BLOB,
+  live_ref TEXT
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+  ns_id TEXT NOT NULL,
+  mount TEXT NOT NULL,
+  path  TEXT NOT NULL,
+  oid   BLOB NOT NULL CHECK(length(oid)=32),
+  PRIMARY KEY (ns_id, mount, path)
 );
 
 CREATE TABLE IF NOT EXISTS mounts (
@@ -95,6 +105,15 @@ pub struct OverlayRow {
 pub struct NsRow {
     pub id: String,
     pub agent_id: String,
+    pub pinned_oid: Option<ObjectId>,
+    pub live_ref: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObservationRow {
+    pub mount: String,
+    pub path: String,
+    pub oid: ObjectId,
 }
 
 pub struct Meta {
@@ -185,6 +204,7 @@ impl Meta {
         .transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_ref(
         &self,
         name: &str,
@@ -223,6 +243,7 @@ impl Meta {
     /// Compare-and-swap. Protected refs (e.g. `main`) only move when
     /// `allow_protected` is true (merge/seal). Ordinary checkin/import never
     /// fork a protected name — they are denied.
+    #[allow(clippy::too_many_arguments)]
     pub fn cas_ref(
         &self,
         name: &str,
@@ -378,11 +399,23 @@ impl Meta {
         Ok(out)
     }
 
-    pub fn insert_namespace(&self, id: &str, agent_id: &str) -> Result<()> {
+    pub fn insert_namespace(
+        &self,
+        id: &str,
+        agent_id: &str,
+        pinned: ObjectId,
+        live_ref: &str,
+    ) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
-            "INSERT INTO namespaces (id, agent_id, created_ms) VALUES (?1,?2,?3)",
-            params![id, agent_id, now_ms() as i64],
+            "INSERT INTO namespaces (id, agent_id, created_ms, pinned_oid, live_ref) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                id,
+                agent_id,
+                now_ms() as i64,
+                pinned.as_bytes().as_slice(),
+                live_ref
+            ],
         )
         .map_err(map_sql)?;
         Ok(())
@@ -391,16 +424,81 @@ impl Meta {
     pub fn get_namespace(&self, id: &str) -> Result<NsRow> {
         let conn = self.write.lock();
         conn.query_row(
-            "SELECT id, agent_id FROM namespaces WHERE id=?1",
+            "SELECT id, agent_id, pinned_oid, live_ref FROM namespaces WHERE id=?1",
             [id],
             |r| {
-                Ok(NsRow {
-                    id: r.get(0)?,
-                    agent_id: r.get(1)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
             },
         )
-        .map_err(|_| Error::NotFound(format!("namespace {id}")))
+        .optional()
+        .map_err(map_sql)?
+        .ok_or_else(|| Error::NotFound(format!("namespace {id}")))
+        .and_then(|(id, agent_id, pin, live_ref)| {
+            Ok(NsRow {
+                id,
+                agent_id,
+                pinned_oid: pin.map(oid_from_blob).transpose()?,
+                live_ref,
+            })
+        })
+    }
+
+    pub fn set_pin(&self, ns_id: &str, oid: ObjectId) -> Result<()> {
+        let conn = self.write.lock();
+        conn.execute(
+            "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
+            params![oid.as_bytes().as_slice(), ns_id],
+        )
+        .map_err(map_sql)?;
+        Ok(())
+    }
+
+    pub fn observe(&self, ns_id: &str, mount: &str, path: &str, oid: ObjectId) -> Result<()> {
+        let conn = self.write.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO observations (ns_id, mount, path, oid) VALUES (?1,?2,?3,?4)",
+            params![ns_id, mount, path, oid.as_bytes().as_slice()],
+        )
+        .map_err(map_sql)?;
+        Ok(())
+    }
+
+    pub fn observations(&self, ns_id: &str) -> Result<Vec<ObservationRow>> {
+        let conn = self.write.lock();
+        let mut stmt = conn
+            .prepare("SELECT mount, path, oid FROM observations WHERE ns_id=?1")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([ns_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mount, path, oid) = row.map_err(map_sql)?;
+            out.push(ObservationRow {
+                mount,
+                path,
+                oid: oid_from_blob(oid)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn observations_clear(&self, ns_id: &str) -> Result<()> {
+        let conn = self.write.lock();
+        conn.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
+            .map_err(map_sql)?;
+        Ok(())
     }
 
     pub fn insert_mount(&self, ns_id: &str, path: &str, spec: &str, mode: &str) -> Result<()> {
@@ -606,6 +704,7 @@ impl Meta {
         .transpose()
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn reflog(
         &self,
         name: &str,
