@@ -1,0 +1,89 @@
+name: autopatch-protocol-fuzz-116
+
+on:
+  push:
+    branches: [fuzz/protocol-116]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fuzz/protocol-116
+          persist-credentials: true
+      - name: Add framed protocol dispatch fuzz target
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-api/src/lib.rs')
+          s = p.read_text()
+          old = 'pub use serve::serve;'
+          new = 'pub use serve::{dispatch as dispatch_request, serve};'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+
+          p = Path('fuzz/Cargo.toml')
+          s = p.read_text()
+          s = s.replace(
+              'forge-cap = { path = "../crates/forge-cap" }\n',
+              'forge-cap = { path = "../crates/forge-cap" }\nforge-api = { path = "../crates/forge-api" }\nforge-protocol = { path = "../crates/forge-protocol" }\nserde_json = "1"\n'
+          )
+          marker = '''[[bin]]\nname = "cap_token"\npath = "fuzz_targets/cap_token.rs"\ntest = false\ndoc = false\nbench = false\n'''
+          addition = marker + '''\n[[bin]]\nname = "protocol_frame"\npath = "fuzz_targets/protocol_frame.rs"\ntest = false\ndoc = false\nbench = false\n'''
+          assert s.count(marker) == 1
+          p.write_text(s.replace(marker, addition))
+          PY
+
+          cat > fuzz/fuzz_targets/protocol_frame.rs <<'RS'
+          #![no_main]
+
+          use forge_api::{dispatch_request, Forge};
+          use forge_protocol::{read_frame, Request};
+          use libfuzzer_sys::fuzz_target;
+          use std::io::Cursor;
+          use std::sync::OnceLock;
+
+          fn forge() -> &'static Forge {
+              static FORGE: OnceLock<Forge> = OnceLock::new();
+              FORGE.get_or_init(|| {
+                  let dir = std::env::temp_dir().join(format!(
+                      "forgefs-protocol-fuzz-{}",
+                      std::process::id()
+                  ));
+                  let _ = std::fs::remove_dir_all(&dir);
+                  Forge::init(&dir).expect("initialize throwaway fuzz forge")
+              })
+          }
+
+          fuzz_target!(|data: &[u8]| {
+              let mut cursor = Cursor::new(data);
+              let Ok(frame) = read_frame(&mut cursor) else {
+                  return;
+              };
+              let Ok(mut request) = serde_json::from_slice::<Request>(&frame) else {
+                  return;
+              };
+
+              // Capability parsing has its own target. Use a valid throwaway
+              // root cap here so mutations reach operation/body dispatch too.
+              request.cap = forge()
+                  .root_cap()
+                  .expect("read throwaway root cap")
+                  .to_token();
+              let _ = dispatch_request(forge(), request);
+          });
+          RS
+
+          git rm .github/workflows/autopatch-protocol-fuzz-116.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-api/src/lib.rs fuzz/Cargo.toml fuzz/fuzz_targets/protocol_frame.rs
+          git commit -m 'fuzz: exercise framed unix protocol dispatch (#116)'
+          git push origin HEAD:fuzz/protocol-116
