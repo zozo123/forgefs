@@ -1,17 +1,19 @@
 # ForgeFS
 
-A **concurrency and provenance substrate for autonomous agents**.
+A **concurrency, provenance, and convergence substrate for autonomous agents**.
 
-Not another POSIX filesystem. Not S3 copy-in/copy-out. Bytes are immutable and content-addressed. Named refs move by compare-and-swap. Sessions pin a snapshot. Checkin fails on **overlapping writes and stale reads**. The official release is a cryptographically sealed tag.
+Not another POSIX filesystem. Not S3 copy-in/copy-out. Bytes are immutable and content-addressed. Named refs move by compare-and-swap. Sessions pin a snapshot. Checkin fails on **overlapping writes and stale reads**. Lost CAS writers fork instead of clobbering. The official release is a cryptographically sealed tag.
 
-**Immutable bytes. Explicit authority. Snapshot reasoning. Deterministic integration. Loud conflicts. Verifiable releases.**
+**Immutable bytes. Explicit authority. Snapshot reasoning. Atomic publication. Loud conflicts. Verifiable releases.**
+
+> Agents may be complex; shared truth must be boring.
 
 ## 60-second thesis
 
 ```bash
 cargo test --workspace
 cargo run -p forge-cli -- init ./demo
-# no ambient root: pass the cap file init printed
+# no ambient root: pass an explicit capability
 CAP=./demo/.forge/keys/root.cap
 INT=./demo/.forge/keys/integrator.cap
 
@@ -21,40 +23,67 @@ cargo run -p forge-cli -- --dir ./demo --cap $CAP write --ns $A /a.txt --text "a
 cargo run -p forge-cli -- --dir ./demo --cap $CAP write --ns $B /b.txt --text "bob"
 cargo run -p forge-cli -- --dir ./demo --cap $CAP checkin --ns $A -m a
 cargo run -p forge-cli -- --dir ./demo --cap $CAP checkin --ns $B -m b
-# merge + seal (integrator cap)
+
+# deterministic integration + trusted release
 cargo run -p forge-cli -- --dir ./demo --cap $INT merge --into=main --from=heads/agents/anon/$A
 cargo run -p forge-cli -- --dir ./demo --cap $INT seal main --tag v1.0 --attest
 cargo run -p forge-cli -- --dir ./demo --cap $CAP verify v1.0
 ```
 
-Two agents, one forge, no cloud. If they both touch the same path you get a **conflict object**. If one shipped a new `/x` while the other still reasoned about the old `/x`, you get **stale observation** — even when the second agent only writes `/y`.
+Two agents, one forge, no cloud. If they touch the same path you get a **Conflict object**. If one changed `/x` while another still reasoned about the old `/x`, the second gets **StaleObservation** even if it only writes `/y`.
 
-See [INVARIANTS.md](INVARIANTS.md) for the 15-line correctness model.
+For hundreds or thousands of agents, the model stays the same: each agent works on a pinned namespace/private ref; immutable objects are written in parallel; only tiny ref/session metadata transitions serialize. Shared-ref races become **one winner + explicit forks**, never silent overwrite.
 
-## Speed model (honest)
+See [INVARIANTS.md](INVARIANTS.md) for the correctness model and [THREAT_MODEL.md](THREAT_MODEL.md) for the explicit security boundary.
 
-Puts are **durable**: write → fsync(file) → exclusive link → fsync(dir). That is ~1 ms per object on SSD, by design (crash-safe). Checkin cost is that times (1 blob + directories on the COW spine) plus one SQLite `BEGIN IMMEDIATE`.
+## Many-agent architecture
 
-Private agents do **not** fight over `main`. Each owns a ref row. SQLite serializes the tiny CAS txn; object bytes do not go through SQLite. A shared-ref stampede becomes **1 update + N forks**, not a lock convoy.
+```text
+ agent A ---- pinned namespace ----\
+ agent B ---- pinned namespace -----+--> immutable Merkle objects
+ agent C ---- pinned namespace ----/              |
+                                                  v
+                                      commit / contribution
+                                                  |
+                                   tiny atomic CAS/ref publish
+                                      /           |          \
+                                  updated       forked     conflict
+                                      \           |          /
+                                       deterministic integrator
+                                                  |
+                                           sealed release
+```
+
+Orchestrators, sandboxes, model runtimes, and future swarm handoff layers are **clients** of ForgeFS, not part of the filesystem core.
+
+## Speed model
+
+Object publication is crash-durable: write temp -> fsync(file) -> exclusive link -> fsync(destination directory). Metadata publication uses small SQLite `BEGIN IMMEDIATE` transactions. Object bytes do not flow through SQLite.
 
 ```bash
 cargo run -p forge-cli -- bench --agents 32 --shared 16
 ```
 
-Measured on this Mac (debug, APFS, durable fsync) @ `f5b6617` lineage:
+A recent Ubuntu CI sample on the transactional #77 lineage produced:
 
-| Workload | Result |
-|---|---|
-| Serial checkin (grant+session+write+CAS) | p50 **38 ms** |
-| 32 private agents | **32/32 Updated**, **35 Hz**, wall 0.9 s |
-| 128 private | **128/128**, **42 Hz**, wall 3.1 s |
-| 256 private | **256/256**, **40 Hz**, wall 6.4 s |
-| 16/32/64 shared-ref stampede | **1 Updated + N-1 Forked** every time |
-| verify after seal | **1–10 ms** |
+| Workload | Observed sample |
+|---|---:|
+| Serial durable checkin | p50 **7.87 ms**, p95 **9.69 ms** |
+| 32 private agents | **32/32 updated**, **278 checkins/s**, wall **0.115 s** |
+| Loaded private-agent latency | p50 **96.84 ms**, p95 **110.62 ms** |
+| 16-agent shared-ref stampede | **1 updated + 15 forked**, wall **23 ms** |
+| Merge + seal | **190 ms** |
+| Verify sealed release | **12 ms** |
 
-Throughput is ~40 durable checkins/s because each object put fsyncs the file *and* its directory (I4). p50 under load ≈ wall clock: threads convoy on fsync + SQLite `BEGIN IMMEDIATE`, they do **not** clobber. Scale-out is more private refs, not a faster `main`.
+CI runners vary, so these are samples rather than promises. The important semantic result is invariant: private writers scale through immutable object work, while a shared-ref stampede converges without clobbering.
 
-## Local (no Docker)
+## Security boundary
+
+Capabilities protect untrusted clients that use the **Forge API/protocol**. `Forge::store` is private, but `forge-store` is still a trusted systems-layer crate. An OS principal or native component with direct read/write access to `.forge` is an administrator, not an untrusted capability client.
+
+For adversarial agent code, do not expose `.forge` inside the sandbox. Give the sandbox only the Forge socket/API and a least-authority `(operation x resource)` capability. See [THREAT_MODEL.md](THREAT_MODEL.md).
+
+## Local development
 
 ```bash
 cargo test --workspace
@@ -65,11 +94,15 @@ cargo run -p forge-cli -- bench --agents 32 --shared 16
 
 | Crate | Role |
 |---|---|
-| `forge-types` | ObjectId, errors (`StaleObservation`, `Denied`, …) |
-| `forge-core` | Canonical CBOR objects, tree COW |
-| `forge-store` | Write-once CAS + SQLite transactions |
-| `forge-cap` | `(op, resource)` macaroons; attenuation only shrinks |
-| `forge-ns` | Mount tables |
-| `forge-merge` | 3-way merge, conflict objects |
-| `forge-api` | Sessions, checkin, seal, serve |
-| `forge-cli` | `forge` (requires `--cap` / `FORGE_CAP`) |
+| `forge-types` | Object IDs, entry kinds, structured errors |
+| `forge-core` | Canonical objects and Merkle tree COW |
+| `forge-store` | Write-once CAS + transactional trusted metadata layer |
+| `forge-cap` | `(operation, resource)` macaroons; attenuation only shrinks |
+| `forge-ns` | Namespace/mount resolution |
+| `forge-merge` | DAG merge-bases, 3-way merge, Conflict objects |
+| `forge-api` | Capability-checked sessions, checkin, merge, seal, serve |
+| `forge-cli` | `forge`; explicit `--cap` / `FORGE_CAP` |
+
+## Direction
+
+ForgeFS deliberately does **not** become an agent scheduler. The high-value extensions are filesystem primitives: `fsck/doctor`, actionable conflict resolution, contribution/observation receipts, tiny inbox refs for agent handoffs, GC/leases, and measured durability/throughput optimization.
