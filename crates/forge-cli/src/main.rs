@@ -161,7 +161,11 @@ fn main() -> ExitCode {
 /// Stable CLI error ABI for agents and shell callers. Never key automation on prose.
 fn error_exit_code(error: &Error) -> u8 {
     match error {
-        Error::Denied(_) | Error::Cap(_) | Error::Invalid(_) | Error::InvalidBase | Error::NotFound(_) => 1,
+        Error::Denied(_)
+        | Error::Cap(_)
+        | Error::Invalid(_)
+        | Error::InvalidBase
+        | Error::NotFound(_) => 1,
         Error::Corrupt(_) | Error::Sealed(_) => 2,
         Error::Busy(_) => 3,
         Error::StaleObservation { .. } | Error::MergeConflict(_) => 4,
