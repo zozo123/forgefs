@@ -385,7 +385,12 @@ impl Meta {
         conn.query_row(
             "SELECT id, agent_id FROM namespaces WHERE id=?1",
             [id],
-            |r| Ok(NsRow { id: r.get(0)?, agent_id: r.get(1)? }),
+            |r| {
+                Ok(NsRow {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                })
+            },
         )
         .map_err(|_| Error::NotFound(format!("namespace {id}")))
     }
@@ -478,12 +483,7 @@ impl Meta {
         Ok(())
     }
 
-    pub fn intro_insert(
-        &self,
-        oid: ObjectId,
-        commit: ObjectId,
-        agent_id: &str,
-    ) -> Result<()> {
+    pub fn intro_insert(&self, oid: ObjectId, commit: ObjectId, agent_id: &str) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
             "INSERT OR IGNORE INTO object_intro (oid, commit_oid, agent_id, ts_ms) VALUES (?1,?2,?3,?4)",
@@ -561,7 +561,11 @@ impl Meta {
         .transpose()
     }
 
-    pub fn reflog(&self, name: &str, limit: usize) -> Result<Vec<(Option<ObjectId>, ObjectId, String, String)>> {
+    pub fn reflog(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<(Option<ObjectId>, ObjectId, String, String)>> {
         let conn = self.write.lock();
         let mut stmt = conn
             .prepare(

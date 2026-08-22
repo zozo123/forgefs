@@ -191,9 +191,7 @@ pub fn ls(
         let mut cur = tree_oid;
         for p in parts {
             let t = store.get_tree(cur)?;
-            let e = t
-                .get(&p)
-                .ok_or_else(|| Error::NotFound(p.clone()))?;
+            let e = t.get(&p).ok_or_else(|| Error::NotFound(p.clone()))?;
             if e.kind != EntryKind::Tree {
                 return Err(Error::Invalid("ls on blob".into()));
             }

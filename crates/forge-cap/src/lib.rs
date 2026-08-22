@@ -313,16 +313,16 @@ fn decode_cap(raw: &[u8]) -> Result<Cap> {
     if i + loc_len + 2 + 32 > raw.len() {
         return Err(Error::Cap("cap loc".into()));
     }
-    let loc = String::from_utf8(raw[i..i + loc_len].to_vec())
-        .map_err(|_| Error::Cap("utf8".into()))?;
+    let loc =
+        String::from_utf8(raw[i..i + loc_len].to_vec()).map_err(|_| Error::Cap("utf8".into()))?;
     i += loc_len;
     let id_len = u16::from_be_bytes([raw[i], raw[i + 1]]) as usize;
     i += 2;
     if i + id_len + 32 > raw.len() {
         return Err(Error::Cap("cap id".into()));
     }
-    let id = String::from_utf8(raw[i..i + id_len].to_vec())
-        .map_err(|_| Error::Cap("utf8".into()))?;
+    let id =
+        String::from_utf8(raw[i..i + id_len].to_vec()).map_err(|_| Error::Cap("utf8".into()))?;
     i += id_len;
 
     let mut caveats = Vec::new();
@@ -336,8 +336,7 @@ fn decode_cap(raw: &[u8]) -> Result<Cap> {
             return Err(Error::Cap("cap caveat".into()));
         }
         caveats.push(
-            String::from_utf8(raw[i..i + n].to_vec())
-                .map_err(|_| Error::Cap("utf8".into()))?,
+            String::from_utf8(raw[i..i + n].to_vec()).map_err(|_| Error::Cap("utf8".into()))?,
         );
         i += n;
     }
@@ -501,9 +500,7 @@ mod tests {
         )
         .unwrap();
         let narrow = attenuate_holder(&broad, vec!["allow=read:heads/alice/*".into()]).unwrap();
-        narrow
-            .allows(Op::Read, Some("heads/alice/1"), 0)
-            .unwrap();
+        narrow.allows(Op::Read, Some("heads/alice/1"), 0).unwrap();
         assert!(narrow.allows(Op::Read, Some("heads/bob/1"), 0).is_err());
         assert!(narrow.allows(Op::Read, Some("main"), 0).is_err());
     }
@@ -544,8 +541,7 @@ mod tests {
     fn integrator_has_asymmetric_authority() {
         let key = [1u8; 32];
         let c = mint_integrator(&key).unwrap();
-        c.allows(Op::Read, Some("heads/agents/alice/1"), 0)
-            .unwrap();
+        c.allows(Op::Read, Some("heads/agents/alice/1"), 0).unwrap();
         c.allows(Op::Read, Some("forks/main/alice/1"), 0).unwrap();
         c.allows(Op::Merge, Some("main"), 0).unwrap();
         c.allows(Op::Seal, Some("main"), 0).unwrap();
@@ -553,9 +549,7 @@ mod tests {
         assert!(c
             .allows(Op::Merge, Some("heads/agents/alice/1"), 0)
             .is_err());
-        assert!(c
-            .allows(Op::Seal, Some("heads/agents/alice/1"), 0)
-            .is_err());
+        assert!(c.allows(Op::Seal, Some("heads/agents/alice/1"), 0).is_err());
         assert!(c.allows(Op::Write, Some("main"), 0).is_err());
     }
 

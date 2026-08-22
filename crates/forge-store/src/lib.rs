@@ -58,7 +58,10 @@ impl Store {
     }
 
     pub fn put_blob_data(&self, data: &[u8]) -> Result<ObjectId> {
-        let file = Blob { data: data.to_vec() }.encode();
+        let file = Blob {
+            data: data.to_vec(),
+        }
+        .encode();
         self.put_raw(&file)
     }
 
@@ -198,4 +201,3 @@ impl TreeStore for Store {
         Store::put_tree(self, tree)
     }
 }
-

@@ -115,7 +115,10 @@ fn apply_level(
         }
         if rest.contains('/') {
             let (first, _) = rest.split_once('/').unwrap();
-            groups.entry(first.to_string()).or_default().insert(path.clone(), *op);
+            groups
+                .entry(first.to_string())
+                .or_default()
+                .insert(path.clone(), *op);
         } else {
             files.insert(rest.to_string(), *op);
         }

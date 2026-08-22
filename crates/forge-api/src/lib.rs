@@ -33,7 +33,10 @@ impl Forge {
     pub fn init(dir: &Path) -> Result<Self> {
         let root = forge_root(dir);
         if root.join("VERSION").exists() {
-            return Err(Error::Invalid(format!("already a forge: {}", root.display())));
+            return Err(Error::Invalid(format!(
+                "already a forge: {}",
+                root.display()
+            )));
         }
         fs::create_dir_all(root.join("keys"))?;
         fs::create_dir_all(root.join("objects"))?;
@@ -231,14 +234,16 @@ impl Forge {
             ObjectType::Commit => Ok(self.store.get_commit(oid)?.tree),
             ObjectType::Snapshot => Ok(self.store.get_snapshot(oid)?.tree),
             ObjectType::Tree => Ok(oid),
-            other => Err(Error::Invalid(format!(
-                "cannot mount {}",
-                other.as_str()
-            ))),
+            other => Err(Error::Invalid(format!("cannot mount {}", other.as_str()))),
         }
     }
 
-    pub fn ls(&self, cap: &Cap, ns: &str, path: &str) -> Result<Vec<(String, String, String, bool)>> {
+    pub fn ls(
+        &self,
+        cap: &Cap,
+        ns: &str,
+        path: &str,
+    ) -> Result<Vec<(String, String, String, bool)>> {
         self.check(cap, Op::Read, None)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
@@ -274,7 +279,14 @@ impl Forge {
         }
     }
 
-    pub fn write(&self, cap: &Cap, ns: &str, path: &str, data: &[u8], exec: bool) -> Result<ObjectId> {
+    pub fn write(
+        &self,
+        cap: &Cap,
+        ns: &str,
+        path: &str,
+        data: &[u8],
+        exec: bool,
+    ) -> Result<ObjectId> {
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         if m.mode != Mode::Rw {
@@ -311,7 +323,9 @@ impl Forge {
             self.check(cap, Op::Write, None)?;
         }
         let rel = rel_of(&m.path, path)?;
-        self.store.meta.overlay_upsert(ns, &m.path, &rel, None, false)?;
+        self.store
+            .meta
+            .overlay_upsert(ns, &m.path, &rel, None, false)?;
         Ok(())
     }
 
@@ -530,8 +544,7 @@ impl Forge {
         }
         let unsigned = snap.encode_unsigned();
         let h = hash_bytes(&unsigned);
-        let pk = VerifyingKey::from_bytes(&snap.pk)
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
+        let pk = VerifyingKey::from_bytes(&snap.pk).map_err(|e| Error::Corrupt(e.to_string()))?;
         let sig = Signature::from_bytes(&snap.sig);
         pk.verify(h.as_bytes(), &sig)
             .map_err(|_| Error::Corrupt("snapshot signature".into()))?;
@@ -625,7 +638,11 @@ impl Forge {
             self.resolve_spec_oid(spec)?
         };
         let bytes = self.store.get_raw(oid)?;
-        Ok(format!("{} {} bytes", self.store.object_type(oid)?.as_str(), bytes.len()))
+        Ok(format!(
+            "{} {} bytes",
+            self.store.object_type(oid)?.as_str(),
+            bytes.len()
+        ))
     }
 }
 
@@ -725,7 +742,10 @@ fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
 fn read32(path: &Path) -> Result<[u8; 32]> {
     let v = fs::read(path)?;
     if v.len() != 32 {
-        return Err(Error::Corrupt(format!("expected 32 bytes in {}", path.display())));
+        return Err(Error::Corrupt(format!(
+            "expected 32 bytes in {}",
+            path.display()
+        )));
     }
     let mut a = [0u8; 32];
     a.copy_from_slice(&v);

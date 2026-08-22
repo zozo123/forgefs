@@ -76,10 +76,8 @@ fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
                 let req: Request = match serde_json::from_slice(&buf) {
                     Ok(x) => x,
                     Err(e) => {
-                        let _ = write_frame(
-                            &mut w,
-                            &Response::err(0, &Error::Invalid(e.to_string())),
-                        );
+                        let _ =
+                            write_frame(&mut w, &Response::err(0, &Error::Invalid(e.to_string())));
                         continue;
                     }
                 };
@@ -128,7 +126,8 @@ fn serve_http(forge: Arc<Forge>, addr: &str) -> Result<()> {
             limited.read_to_end(&mut body)?;
         }
         if body.len() > MAX_HTTP_BODY {
-            let r = tiny_http::Response::from_string("request body too large").with_status_code(413);
+            let r =
+                tiny_http::Response::from_string("request body too large").with_status_code(413);
             let _ = req.respond(r);
             continue;
         }
@@ -225,10 +224,7 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
             let ents = forge.ls(
                 &cap,
                 s(&req.body, "ns")?,
-                req.body
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/"),
+                req.body.get("path").and_then(|v| v.as_str()).unwrap_or("/"),
             )?;
             Ok(json!(ents
                 .into_iter()
@@ -243,10 +239,7 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
                     .get("mount")
                     .and_then(|v| v.as_str())
                     .unwrap_or("/"),
-                req.body
-                    .get("msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
+                req.body.get("msg").and_then(|v| v.as_str()).unwrap_or(""),
             )?;
             Ok(json!(format!("{r:?}")))
         }
