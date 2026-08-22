@@ -1,0 +1,185 @@
+name: autopatch-meta-metrics-100
+
+on:
+  push:
+    branches: [metrics/meta-100-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: metrics/meta-100-v2
+          persist-credentials: true
+      - name: Instrument metadata transactions and CAS outcomes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/forge-store/src/meta.rs')
+          s = p.read_text()
+          s = s.replace(
+              'use std::path::Path;\n',
+              'use std::path::Path;\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::time::Instant;\n'
+          )
+          marker = '''pub struct Meta {\n    write: Mutex<Connection>,\n}'''
+          replacement = '''#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]\npub struct MetaStats {\n    pub txn_us: u64,\n    pub busy: u64,\n    pub cas_updated: u64,\n    pub cas_forked: u64,\n    pub cas_denied: u64,\n}\n\n#[derive(Debug, Default)]\nstruct MetaCounters {\n    txn_us: AtomicU64,\n    busy: AtomicU64,\n    cas_updated: AtomicU64,\n    cas_forked: AtomicU64,\n    cas_denied: AtomicU64,\n}\n\nstruct TxnTimer<'a> {\n    started: Instant,\n    total_us: &'a AtomicU64,\n}\n\nimpl Drop for TxnTimer<'_> {\n    fn drop(&mut self) {\n        let elapsed = self.started.elapsed().as_micros();\n        self.total_us.fetch_add(\n            u64::try_from(elapsed).unwrap_or(u64::MAX),\n            Ordering::Relaxed,\n        );\n    }\n}\n\npub struct Meta {\n    write: Mutex<Connection>,\n    stats: MetaCounters,\n}'''
+          assert s.count(marker) == 1
+          s = s.replace(marker, replacement)
+          s = s.replace(
+              '''        Ok(Self {\n            write: Mutex::new(conn),\n        })''',
+              '''        Ok(Self {\n            write: Mutex::new(conn),\n            stats: MetaCounters::default(),\n        })'''
+          )
+
+          impl_marker = '''impl Meta {\n    pub fn open(path: &Path) -> Result<Self> {'''
+          impl_repl = '''impl Meta {\n    pub fn stats(&self) -> MetaStats {\n        MetaStats {\n            txn_us: self.stats.txn_us.load(Ordering::Relaxed),\n            busy: self.stats.busy.load(Ordering::Relaxed),\n            cas_updated: self.stats.cas_updated.load(Ordering::Relaxed),\n            cas_forked: self.stats.cas_forked.load(Ordering::Relaxed),\n            cas_denied: self.stats.cas_denied.load(Ordering::Relaxed),\n        }\n    }\n\n    fn map_sql_counted(&self, error: rusqlite::Error) -> Error {\n        let error = map_sql(error);\n        if matches!(error, Error::Busy(_)) {\n            self.stats.busy.fetch_add(1, Ordering::Relaxed);\n        }\n        error\n    }\n\n    fn begin_tx<'a>(&self, conn: &'a mut Connection) -> Result<rusqlite::Transaction<'a>> {\n        conn.transaction_with_behavior(TransactionBehavior::Immediate)\n            .map_err(|error| self.map_sql_counted(error))\n    }\n\n    fn txn_timer(&self) -> TxnTimer<'_> {\n        TxnTimer {\n            started: Instant::now(),\n            total_us: &self.stats.txn_us,\n        }\n    }\n\n    pub fn open(path: &Path) -> Result<Self> {'''
+          assert s.count(impl_marker) == 1
+          s = s.replace(impl_marker, impl_repl)
+
+          # Patch only the three CAS transaction methods. This keeps txn_us focused
+          # on the metadata critical path used by checkin/merge benchmarks.
+          methods = [
+              ('    pub fn cas_ref(\n', '    #[allow(clippy::too_many_arguments)]\n    pub fn cas_ref_with_intros('),
+              ('    pub fn cas_ref_with_intros(\n', '    #[allow(clippy::too_many_arguments)]\n    pub fn cas_ref_session('),
+              ('    pub fn cas_ref_session(\n', '    pub fn complete_noop_session('),
+          ]
+          for start, end in methods:
+              a = s.index(start)
+              b = s.index(end, a)
+              block = s[a:b]
+              old = '''        let tx = conn\n            .transaction_with_behavior(TransactionBehavior::Immediate)\n            .map_err(map_sql)?;'''
+              assert block.count(old) == 1, start
+              block = block.replace(old, '''        let tx = self.begin_tx(&mut conn)?;\n        let _txn_timer = self.txn_timer();''')
+              block = block.replace('.map_err(map_sql)?', '.map_err(|error| self.map_sql_counted(error))?')
+              s = s[:a] + block + s[b:]
+
+          # CAS policy denials: tag/protected paths are explicit machine outcomes.
+          for method_start, method_end in methods:
+              a = s.index(method_start)
+              b = s.index(method_end, a)
+              block = s[a:b]
+              block = block.replace(
+                  '            return Err(Error::Denied(',
+                  '            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);\n            return Err(Error::Denied('
+              )
+              s = s[:a] + block + s[b:]
+
+          # First two CAS methods return directly on update/fork.
+          for method_start, method_end in methods[:2]:
+              a = s.index(method_start)
+              b = s.index(method_end, a)
+              block = s[a:b]
+              block = block.replace(
+                  '            return Ok(CasResult::Updated {',
+                  '            self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);\n            return Ok(CasResult::Updated {'
+              )
+              block = block.replace(
+                  '        Ok(CasResult::Forked {',
+                  '        self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);\n        Ok(CasResult::Forked {'
+              )
+              s = s[:a] + block + s[b:]
+
+          # Session CAS builds a result and commits cleanup atomically; classify only
+          # after commit succeeds, so failed metadata transactions are never counted.
+          a = s.index('    pub fn cas_ref_session(\n')
+          b = s.index('    pub fn complete_noop_session(', a)
+          block = s[a:b]
+          busy = '''            if n != 1 {\n                return Err(Error::Busy(format!("ref {name} changed during checkin")));\n            }'''
+          assert block.count(busy) == 1
+          block = block.replace(busy, '''            if n != 1 {\n                self.stats.busy.fetch_add(1, Ordering::Relaxed);\n                return Err(Error::Busy(format!("ref {name} changed during checkin")));\n            }''')
+          tail = '''        tx.commit().map_err(|error| self.map_sql_counted(error))?;\n        Ok(result)'''
+          assert block.count(tail) == 1
+          block = block.replace(tail, '''        tx.commit().map_err(|error| self.map_sql_counted(error))?;\n        match &result {\n            CasResult::Updated { .. } => {\n                self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);\n            }\n            CasResult::Forked { .. } => {\n                self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);\n            }\n            CasResult::Noop { .. } => {}\n        }\n        Ok(result)''')
+          s = s[:a] + block + s[b:]
+          p.write_text(s)
+
+          p = Path('crates/forge-store/src/lib.rs')
+          s = p.read_text()
+          old = 'pub use meta::{sanitize_agent, Meta, MountRow, NsRow, OverlayRow};'
+          new = 'pub use meta::{sanitize_agent, Meta, MetaStats, MountRow, NsRow, OverlayRow};'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+
+          p = Path('crates/forge-api/src/bench.rs')
+          s = p.read_text()
+          s = s.replace('use forge_store::blob::BlobStoreStats;', 'use forge_store::{blob::BlobStoreStats, MetaStats};')
+          s = s.replace(
+              '    pub store: Option<BlobStoreStats>,\n}',
+              '    pub store: Option<BlobStoreStats>,\n    pub meta: Option<MetaStats>,\n}'
+          )
+          render = '''        if let Some(stats) = self.store {\n            s.push_str(&format!(\n                "storage          puts={} fsync_file={} fsync_dir={}\\n",\n                stats.puts, stats.fsync_file, stats.fsync_dir\n            ));\n        }'''
+          assert s.count(render) == 1
+          s = s.replace(render, render + '''\n        if let Some(stats) = self.meta {\n            s.push_str(&format!(\n                "sqlite           txn={:.3}ms busy={} updated={} forked={} denied={}\\n",\n                stats.txn_us as f64 / 1000.0,\n                stats.busy,\n                stats.cas_updated,\n                stats.cas_forked,\n                stats.cas_denied,\n            ));\n        }''')
+          tail = '''        store: Some(store),\n    })'''
+          assert s.count(tail) == 1
+          s = s.replace(tail, '''        store: Some(store),\n        meta: Some(forge.store.meta.stats()),\n    })''')
+          p.write_text(s)
+
+          p = Path('crates/forge-api/src/soak.rs')
+          s = p.read_text()
+          tail = '''        store: Some(store),\n    })'''
+          assert s.count(tail) == 1
+          s = s.replace(tail, '''        store: Some(store),\n        meta: Some(forge.store.meta.stats()),\n    })''')
+          p.write_text(s)
+          PY
+
+          cat > crates/forge-store/tests/meta_stats.rs <<'RS'
+          use forge_store::Meta;
+          use forge_types::{CasResult, Error, ObjectId};
+          use tempfile::tempdir;
+
+          #[test]
+          fn cas_stats_classify_committed_outcomes() {
+              let d = tempdir().unwrap();
+              let meta = Meta::open(&d.path().join("meta.sqlite")).unwrap();
+              let a = ObjectId([1; 32]);
+              let b = ObjectId([2; 32]);
+              let c = ObjectId([3; 32]);
+              meta.insert_ref("heads/test", a, "commit", false, false, "test", "init")
+                  .unwrap();
+
+              let updated = meta
+                  .cas_ref("heads/test", a, b, "commit", "test", "test", false)
+                  .unwrap();
+              assert!(matches!(updated, CasResult::Updated { .. }));
+              let forked = meta
+                  .cas_ref("heads/test", a, c, "commit", "test", "test", false)
+                  .unwrap();
+              assert!(matches!(forked, CasResult::Forked { .. }));
+
+              meta.insert_ref("heads/protected", a, "commit", true, false, "test", "init")
+                  .unwrap();
+              let denied = meta
+                  .cas_ref(
+                      "heads/protected",
+                      a,
+                      b,
+                      "commit",
+                      "test",
+                      "test",
+                      false,
+                  )
+                  .unwrap_err();
+              assert!(matches!(denied, Error::Denied(_)));
+
+              let stats = meta.stats();
+              assert_eq!(stats.cas_updated, 1);
+              assert_eq!(stats.cas_forked, 1);
+              assert_eq!(stats.cas_denied, 1);
+              assert!(stats.txn_us > 0);
+          }
+          RS
+
+          cargo fmt --all
+          git rm .github/workflows/autopatch-meta-metrics-100.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/forge-store/src/meta.rs crates/forge-store/src/lib.rs crates/forge-store/tests/meta_stats.rs crates/forge-api/src/bench.rs crates/forge-api/src/soak.rs
+          git commit -m 'metrics: measure SQLite CAS transactions and outcomes (#100)'
+          git push origin HEAD:metrics/meta-100-v2
