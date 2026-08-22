@@ -1,3 +1,4 @@
+use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,15 +29,18 @@ fn spawn_serve(dir: &str) -> Child {
         .expect("spawn forge serve")
 }
 
-fn wait_for_socket(path: &std::path::Path) {
+fn wait_for_server(path: &std::path::Path, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if path.exists() {
+        if UnixStream::connect(path).is_ok() {
             return;
+        }
+        if let Some(status) = child.try_wait().expect("poll daemon") {
+            panic!("daemon exited before serving: {status}");
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("daemon socket did not appear: {}", path.display());
+    panic!("daemon did not accept socket connections: {}", path.display());
 }
 
 #[test]
@@ -49,7 +53,7 @@ fn daemon_and_direct_clients_cannot_split_brain() {
     let socket = temp.path().join(".forge/forge.sock");
 
     let mut daemon = spawn_serve(dir);
-    wait_for_socket(&socket);
+    wait_for_server(&socket, &mut daemon);
 
     let direct = forge()
         .args(["--dir", dir, "--cap", cap, "refs"])
@@ -75,9 +79,13 @@ fn daemon_and_direct_clients_cannot_split_brain() {
     // Kernel ownership, not the stale socket/LOCK pathname, decides authority.
     run_ok(forge().args(["--dir", dir, "--cap", cap, "refs"]));
     assert!(temp.path().join(".forge/LOCK").exists());
+    assert!(
+        UnixStream::connect(&socket).is_err(),
+        "SIGKILL should leave at most a stale, non-serving socket pathname"
+    );
 
     let mut restarted = spawn_serve(dir);
-    wait_for_socket(&socket);
+    wait_for_server(&socket, &mut restarted);
     restarted.kill().unwrap();
     restarted.wait().unwrap();
 }
