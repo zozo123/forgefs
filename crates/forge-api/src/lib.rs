@@ -503,6 +503,7 @@ impl Forge {
 
     pub fn branch(&self, cap: &Cap, from: &str, name: &str) -> Result<ObjectId> {
         self.check(cap, Op::Branch, Some(name))?;
+        self.check_spec_read(cap, from)?;
         let (oid, _) = self.peel_commit(from)?;
         self.store
             .meta
@@ -527,6 +528,7 @@ impl Forge {
         } else {
             self.check(cap, Op::Write, Some(into))?;
         }
+        self.check_spec_read(cap, from)?;
         let ours_c = self.store.get_commit(into_row.oid)?;
         let (theirs_oid, theirs_c) = self.peel_commit(from)?;
         let tree = if let Some(t) = resolved {
@@ -684,18 +686,32 @@ impl Forge {
 
     pub fn import_dir(&self, cap: &Cap, dir: &Path, r#ref: &str) -> Result<ObjectId> {
         self.check(cap, Op::Write, Some(r#ref))?;
+        let previous = self.store.meta.get_ref(r#ref)?;
+        let previous_commit = match previous.as_ref() {
+            Some(row) => Some(self.store.get_commit(row.oid)?),
+            None => None,
+        };
         let tree = import_walk(&self.store, dir)?;
+        let parents = previous
+            .as_ref()
+            .map(|row| vec![row.oid])
+            .unwrap_or_default();
         let commit = Commit {
             tree,
-            parents: vec![],
+            parents,
             agent: cap.agent_id().into(),
             msg: format!("import {}", dir.display()),
             ts: now_ms(),
             landmark: false,
         };
         let cid = self.store.put_commit(&commit)?;
-        self.store.record_intros(None, tree, cid, cap.agent_id())?;
-        match self.store.meta.get_ref(r#ref)? {
+        self.store.record_intros(
+            previous_commit.as_ref().map(|c| c.tree),
+            tree,
+            cid,
+            cap.agent_id(),
+        )?;
+        match previous {
             Some(row) => {
                 self.store.meta.cas_ref(
                     r#ref,
