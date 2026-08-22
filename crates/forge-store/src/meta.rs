@@ -97,6 +97,8 @@ pub struct NsRow {
     pub agent_id: String,
 }
 
+pub type ReflogEntry = (Option<ObjectId>, ObjectId, String, String);
+
 pub struct Meta {
     write: Mutex<Connection>,
 }
@@ -185,6 +187,7 @@ impl Meta {
         .transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_ref(
         &self,
         name: &str,
@@ -561,11 +564,7 @@ impl Meta {
         .transpose()
     }
 
-    pub fn reflog(
-        &self,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<(Option<ObjectId>, ObjectId, String, String)>> {
+    pub fn reflog(&self, name: &str, limit: usize) -> Result<Vec<ReflogEntry>> {
         let conn = self.write.lock();
         let mut stmt = conn
             .prepare(
