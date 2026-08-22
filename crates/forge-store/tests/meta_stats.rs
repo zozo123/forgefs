@@ -28,6 +28,7 @@ fn cas_stats_classify_committed_outcomes() {
         .unwrap_err();
     assert!(matches!(denied, Error::Denied(_)));
 
+    // Only committed CAS outcomes are counted; failed policy checks are separate.
     let stats = meta.stats();
     assert_eq!(stats.cas_updated, 1);
     assert_eq!(stats.cas_forked, 1);
