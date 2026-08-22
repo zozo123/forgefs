@@ -118,6 +118,11 @@ fn e2e_stale_read_is_not_a_silent_success() {
     };
     f.merge(&integ, "main", &n2, None).unwrap();
     f.write(&bob, &b, "/notes.txt", b"hi", false).unwrap();
+
+    // This API outcome stays exact even when SQLite and storage counters are enabled too.
+    let before = f.api_stats();
     let err = f.checkin(&bob, &b, "/", "notes").unwrap_err();
     assert!(matches!(err, Error::StaleObservation { .. }), "{err:?}");
+    let after = f.api_stats();
+    assert_eq!(after.stale_observation, before.stale_observation + 1);
 }

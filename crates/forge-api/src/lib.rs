@@ -28,6 +28,19 @@ use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, RefRow, Res
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApiStats {
+    pub stale_observation: u64,
+    pub merge_conflict: u64,
+}
+
+#[derive(Debug, Default)]
+struct ApiCounters {
+    stale_observation: AtomicU64,
+    merge_conflict: AtomicU64,
+}
 
 pub struct Forge {
     store: Store,
@@ -35,6 +48,7 @@ pub struct Forge {
     seal_seed: [u8; 32],
     seal_pk: [u8; 32],
     root: PathBuf,
+    stats: ApiCounters,
 }
 
 impl Forge {
@@ -107,6 +121,7 @@ impl Forge {
             seal_seed,
             seal_pk: pk,
             root,
+            stats: ApiCounters::default(),
         })
     }
 
@@ -143,11 +158,19 @@ impl Forge {
             seal_seed,
             seal_pk,
             root,
+            stats: ApiCounters::default(),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn api_stats(&self) -> ApiStats {
+        ApiStats {
+            stale_observation: self.stats.stale_observation.load(Ordering::Relaxed),
+            merge_conflict: self.stats.merge_conflict.load(Ordering::Relaxed),
+        }
     }
 
     pub fn load_cap(&self, token: &str) -> Result<Cap> {
@@ -481,6 +504,7 @@ impl Forge {
             };
             let now = blob_at(&self.store, tree, &obs.path)?;
             if now != Some(obs.oid) {
+                self.stats.stale_observation.fetch_add(1, Ordering::Relaxed);
                 return Err(Error::StaleObservation {
                     path: format!("{}:/{}", obs.mount, obs.path),
                     expected: obs.oid.hex(),
@@ -551,6 +575,7 @@ impl Forge {
                     cap.agent_id(),
                     "multiple-merge-bases",
                 )?;
+                self.stats.merge_conflict.fetch_add(1, Ordering::Relaxed);
                 return Err(Error::MergeConflict(oid));
             }
             let base_tree = match bases.as_slice() {
@@ -573,6 +598,7 @@ impl Forge {
                         cap.agent_id(),
                         "conflict",
                     )?;
+                    self.stats.merge_conflict.fetch_add(1, Ordering::Relaxed);
                     return Err(Error::MergeConflict(oid));
                 }
             }

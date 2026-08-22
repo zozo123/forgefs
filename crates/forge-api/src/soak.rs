@@ -211,5 +211,6 @@ pub fn run_bench_with_workers(
         verify: Some(verify),
         store: Some(store),
         meta: Some(forge.store.meta.stats()),
+        api: Some(forge.api_stats()),
     })
 }
