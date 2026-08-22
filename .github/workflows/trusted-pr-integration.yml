@@ -40,3 +40,17 @@ jobs:
       - name: Run trusted inbox integrator from main
         shell: bash
         run: git show origin/main:.github/integration/inbox-v3.sh | bash
+
+  import-lossless:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'fix/import-lossless-28'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Run trusted import-lossless integrator from main
+        shell: bash
+        run: git show origin/main:.github/integration/import-lossless-28.sh | bash
