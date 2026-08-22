@@ -57,6 +57,8 @@ fn reopening_current_schema_is_idempotent() {
     assert_eq!(n, 1);
 }
 
+// Compatibility rejection must be side-effect free: opening a future schema
+// must not switch journal modes or create WAL state before returning the error.
 #[test]
 fn newer_schema_rejection_does_not_mutate_journal_mode() {
     let d = tempdir().unwrap();
