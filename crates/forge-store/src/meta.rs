@@ -1,6 +1,7 @@
+use crate::metrics::TimingCounter;
 use forge_core::now_ms;
 use forge_types::{CasResult, Error, ObjectId, RefRow, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,11 +128,31 @@ pub struct ObservationRow {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetaStats {
+    /// Cumulative time spent in explicit `BEGIN IMMEDIATE` attempts, including
+    /// their statements, COMMIT, or implicit rollback. Repository open and
+    /// SQLite autocommit statements are not included.
     pub txn_us: u64,
+    /// Number of explicit transaction attempts represented by `txn_us`.
+    pub txn_count: u64,
+    /// Cumulative time waiting to acquire ForgeFS's process-local SQLite
+    /// connection mutex. This does not include SQLite's cross-process busy
+    /// wait, which is part of `txn_us`.
+    pub lock_wait_us: u64,
+    /// Every acquisition of the process-local SQLite connection mutex,
+    /// including reads and autocommit writes.
+    pub lock_acquires: u64,
     pub busy: u64,
     pub cas_updated: u64,
     pub cas_forked: u64,
     pub cas_denied: u64,
+}
+
+impl MetaStats {
+    /// Saturating sum over this process-lifetime snapshot: local mutex wait
+    /// plus explicit transaction time. It is not a per-checkin measurement.
+    pub fn sqlite_accounted_us(&self) -> u64 {
+        self.lock_wait_us.saturating_add(self.txn_us)
+    }
 }
 
 /// Effective SQLite settings that define the mutable catalog's durability
@@ -154,7 +175,7 @@ pub struct CheckpointResult {
 
 #[derive(Debug, Default)]
 struct MetaCounters {
-    txn_us: AtomicU64,
+    txn: TimingCounter,
     busy: AtomicU64,
     cas_updated: AtomicU64,
     cas_forked: AtomicU64,
@@ -163,21 +184,53 @@ struct MetaCounters {
 
 struct TxnTimer<'a> {
     started: Instant,
-    total_us: &'a AtomicU64,
+    timing: &'a TimingCounter,
+    observed: bool,
+}
+
+impl TxnTimer<'_> {
+    fn finish(mut self) {
+        self.observe_once();
+    }
+
+    fn observe_once(&mut self) {
+        if !self.observed {
+            self.timing.observe(self.started.elapsed());
+            self.observed = true;
+        }
+    }
 }
 
 impl Drop for TxnTimer<'_> {
     fn drop(&mut self) {
-        let elapsed = self.started.elapsed().as_micros();
-        self.total_us.fetch_add(
-            u64::try_from(elapsed).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        self.observe_once();
+    }
+}
+
+#[derive(Debug)]
+struct TimedMutex<T> {
+    inner: Mutex<T>,
+    wait: TimingCounter,
+}
+
+impl<T> TimedMutex<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+            wait: TimingCounter::default(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, T> {
+        let started = Instant::now();
+        let guard = self.inner.lock();
+        self.wait.observe(started.elapsed());
+        guard
     }
 }
 
 pub struct Meta {
-    write: Mutex<Connection>,
+    write: TimedMutex<Connection>,
     stats: MetaCounters,
     durability: DurabilityPolicy,
 }
@@ -304,8 +357,13 @@ fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
 
 impl Meta {
     pub fn stats(&self) -> MetaStats {
+        let txn = self.stats.txn.snapshot();
+        let lock_wait = self.write.wait.snapshot();
         MetaStats {
-            txn_us: self.stats.txn_us.load(Ordering::Relaxed),
+            txn_us: txn.total_us,
+            txn_count: txn.count,
+            lock_wait_us: lock_wait.total_us,
+            lock_acquires: lock_wait.count,
             busy: self.stats.busy.load(Ordering::Relaxed),
             cas_updated: self.stats.cas_updated.load(Ordering::Relaxed),
             cas_forked: self.stats.cas_forked.load(Ordering::Relaxed),
@@ -355,7 +413,8 @@ impl Meta {
     fn txn_timer(&self) -> TxnTimer<'_> {
         TxnTimer {
             started: Instant::now(),
-            total_us: &self.stats.txn_us,
+            timing: &self.stats.txn,
+            observed: false,
         }
     }
 
@@ -430,7 +489,7 @@ impl Meta {
         )
         .map_err(map_sql)?;
         Ok(Self {
-            write: Mutex::new(conn),
+            write: TimedMutex::new(conn),
             stats: MetaCounters::default(),
             durability: DurabilityPolicy {
                 journal_mode: journal_mode.to_ascii_lowercase(),
@@ -519,9 +578,8 @@ impl Meta {
             return Err(Error::Denied("tags may only be created by seal".into()));
         }
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
         let ts = now_ms() as i64;
         tx.execute(
         "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -534,6 +592,7 @@ impl Meta {
     )
     .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
+        txn_timer.finish();
         Ok(())
     }
 
@@ -554,9 +613,8 @@ impl Meta {
             return Err(Error::Denied("tags may only be created by seal".into()));
         }
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
         let ts = now_ms() as i64;
         tx.execute(
         "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -570,6 +628,7 @@ impl Meta {
     .map_err(map_sql)?;
         Self::insert_intros_tx(&tx, intro_oids, oid, agent_id, ts)?;
         tx.commit().map_err(map_sql)?;
+        txn_timer.finish();
         Ok(())
     }
 
@@ -605,8 +664,8 @@ impl Meta {
             ));
         }
         let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
         let tx = self.begin_tx(&mut conn)?;
-        let _txn_timer = self.txn_timer();
         let row = tx
             .query_row(
                 "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
@@ -637,6 +696,7 @@ impl Meta {
             )
             .map_err(|error| self.map_sql_counted(error))?;
             tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
@@ -687,6 +747,7 @@ impl Meta {
             )
             .map_err(|error| self.map_sql_counted(error))?;
             tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
@@ -719,6 +780,7 @@ impl Meta {
         )
         .map_err(|error| self.map_sql_counted(error))?;
         tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        txn_timer.finish();
         self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
         Ok(CasResult::Forked {
             requested: name.to_string(),
@@ -748,8 +810,8 @@ impl Meta {
             ));
         }
         let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
         let tx = self.begin_tx(&mut conn)?;
-        let _txn_timer = self.txn_timer();
         let row = tx
             .query_row(
                 "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
@@ -781,6 +843,7 @@ impl Meta {
             .map_err(|error| self.map_sql_counted(error))?;
             Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
             tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
@@ -832,6 +895,7 @@ impl Meta {
             .map_err(|error| self.map_sql_counted(error))?;
             Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
             tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
                 name: name.to_string(),
@@ -865,6 +929,7 @@ impl Meta {
         .map_err(|error| self.map_sql_counted(error))?;
         Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
         tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        txn_timer.finish();
         self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
         Ok(CasResult::Forked {
             requested: name.to_string(),
@@ -888,8 +953,8 @@ impl Meta {
     ) -> Result<CasResult> {
         validate_ref_kind(name, "commit")?;
         let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
         let tx = self.begin_tx(&mut conn)?;
-        let _txn_timer = self.txn_timer();
         let row = tx
             .query_row(
                 "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
@@ -998,6 +1063,7 @@ impl Meta {
             .map_err(|error| self.map_sql_counted(error))?;
         Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
         tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        txn_timer.finish();
         match &result {
             CasResult::Updated { .. } => {
                 self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
@@ -1017,9 +1083,8 @@ impl Meta {
         pinned: ObjectId,
     ) -> Result<()> {
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
         tx.execute(
             "DELETE FROM overlay WHERE ns_id=?1 AND mount=?2",
             params![ns_id, mount_path],
@@ -1037,6 +1102,7 @@ impl Meta {
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
             .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
+        txn_timer.finish();
         Ok(())
     }
 
@@ -1081,9 +1147,8 @@ impl Meta {
     ) -> Result<()> {
         validate_ref_kind(live_ref, "commit")?;
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
         let ts = now_ms() as i64;
         tx.execute(
             "INSERT INTO namespaces (id, agent_id, created_ms, pinned_oid, live_ref) VALUES (?1,?2,?3,?4,?5)",
@@ -1114,6 +1179,7 @@ impl Meta {
             .map_err(map_sql)?;
         }
         tx.commit().map_err(map_sql)?;
+        txn_timer.finish();
         Ok(())
     }
 
@@ -1357,12 +1423,12 @@ impl Meta {
         agent_id: &str,
     ) -> Result<()> {
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
         let ts = now_ms() as i64;
         Self::insert_intros_tx(&tx, oids, commit, agent_id, ts)?;
         tx.commit().map_err(map_sql)?;
+        txn_timer.finish();
         Ok(())
     }
     pub fn intro_get(&self, oid: ObjectId) -> Result<Option<String>> {
@@ -1406,9 +1472,8 @@ impl Meta {
         agent_id: &str,
     ) -> Result<()> {
         let mut conn = self.write.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql)?;
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
         let ts = now_ms() as i64;
         let tag_ref = format!("tags/{tag}");
         validate_ref_kind(&tag_ref, "snapshot")?;
@@ -1444,6 +1509,7 @@ impl Meta {
         )
         .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
+        txn_timer.finish();
         Ok(())
     }
 

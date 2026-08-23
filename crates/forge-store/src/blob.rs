@@ -1,3 +1,4 @@
+use crate::metrics::TimingCounter;
 use forge_core::hash_bytes;
 use forge_types::{Error, ObjectId, Result};
 use lru::LruCache;
@@ -11,7 +12,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
 const DURABLE_DIR_CACHE_CAPACITY: usize = 65_536;
@@ -22,15 +23,29 @@ const DURABLE_OID_CACHE_CAPACITY: usize = 65_536;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlobStoreStats {
     pub puts: u64,
+    /// Successful file durability barriers.
     pub fsync_file: u64,
+    /// Cumulative elapsed time for successful file durability barriers.
+    pub fsync_file_us: u64,
+    /// Successful directory durability barriers.
     pub fsync_dir: u64,
+    /// Cumulative elapsed time for successful directory durability barriers.
+    pub fsync_dir_us: u64,
+}
+
+impl BlobStoreStats {
+    /// Saturating sum over this process-lifetime snapshot. It is not a
+    /// per-publication or per-checkin measurement.
+    pub fn barrier_us(&self) -> u64 {
+        self.fsync_file_us.saturating_add(self.fsync_dir_us)
+    }
 }
 
 #[derive(Debug, Default)]
 struct BlobStoreCounters {
     puts: AtomicU64,
-    fsync_file: AtomicU64,
-    fsync_dir: AtomicU64,
+    fsync_file: TimingCounter,
+    fsync_dir: TimingCounter,
 }
 
 #[derive(Clone, Debug)]
@@ -125,8 +140,7 @@ impl LocalBlobStore {
                 "existing object does not match its id: {id}"
             )));
         }
-        crate::durable_sync_file(&file)?;
-        self.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
+        sync_file_counted(&file, &self.stats)?;
         Ok(())
     }
 
@@ -148,10 +162,14 @@ impl LocalBlobStore {
     }
 
     pub fn stats(&self) -> BlobStoreStats {
+        let fsync_file = self.stats.fsync_file.snapshot();
+        let fsync_dir = self.stats.fsync_dir.snapshot();
         BlobStoreStats {
             puts: self.stats.puts.load(Ordering::Relaxed),
-            fsync_file: self.stats.fsync_file.load(Ordering::Relaxed),
-            fsync_dir: self.stats.fsync_dir.load(Ordering::Relaxed),
+            fsync_file: fsync_file.count,
+            fsync_file_us: fsync_file.total_us,
+            fsync_dir: fsync_dir.count,
+            fsync_dir_us: fsync_dir.total_us,
         }
     }
 }
@@ -203,8 +221,7 @@ impl PublishBatch<'_> {
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
-            crate::durable_sync_file(&f)?;
-            self.store.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
+            sync_file_counted(&f, &self.store.stats)?;
         }
 
         match fs::hard_link(&tmp, &dest) {
@@ -328,8 +345,16 @@ fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {
 }
 
 fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {
+    let started = Instant::now();
     crate::durable_sync_dir(path)?;
-    stats.fsync_dir.fetch_add(1, Ordering::Relaxed);
+    stats.fsync_dir.observe(started.elapsed());
+    Ok(())
+}
+
+fn sync_file_counted(file: &std::fs::File, stats: &BlobStoreCounters) -> Result<()> {
+    let started = Instant::now();
+    crate::durable_sync_file(file)?;
+    stats.fsync_file.observe(started.elapsed());
     Ok(())
 }
 
@@ -423,10 +448,10 @@ mod tests {
 
         ensure_dir_durable(&parent, &child, &stats, &durable_dirs).unwrap();
 
-        assert_eq!(stats.fsync_dir.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.fsync_dir.snapshot().count, 1);
         ensure_dir_durable(&parent, &child, &stats, &durable_dirs).unwrap();
         assert_eq!(
-            stats.fsync_dir.load(Ordering::Relaxed),
+            stats.fsync_dir.snapshot().count,
             1,
             "a successful positive proof is reusable within one Store"
         );

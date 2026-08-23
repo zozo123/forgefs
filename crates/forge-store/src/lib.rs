@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod meta;
+mod metrics;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use meta::{
