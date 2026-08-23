@@ -140,7 +140,9 @@ fn cli_sigkill_during_large_blob_put_reopens_without_dangling_state() {
     let mut child = write.spawn().expect("spawn large forge write");
 
     assert!(
-        wait_while_running(&mut child, Duration::from_secs(15), || directory_has_file(&tmp)),
+        wait_while_running(&mut child, Duration::from_secs(15), || directory_has_file(
+            &tmp
+        )),
         "never observed the real CAS temporary file while the writer was alive"
     );
     kill_and_require_sigkill(&mut child);
@@ -150,7 +152,11 @@ fn cli_sigkill_during_large_blob_put_reopens_without_dangling_state() {
     fsck_full(d.path(), &root);
     let mut refs_after = authenticated(d.path(), &root);
     refs_after.arg("refs");
-    assert_eq!(run_text(&mut refs_after), refs_before, "SIGKILL changed a ref");
+    assert_eq!(
+        run_text(&mut refs_after),
+        refs_before,
+        "SIGKILL changed a ref"
+    );
 
     // The persisted session is still internally consistent. Depending on the
     // exact kill instant the overlay is either absent (noop) or fully durable
@@ -205,7 +211,10 @@ fn cli_sigkill_during_live_concurrent_workload_reopens_and_accepts_new_work() {
     kill_and_require_sigkill(&mut child);
 
     let root = forge_root.join("keys/root.cap");
-    assert!(root.is_file(), "killed benchmark never published a valid repository");
+    assert!(
+        root.is_file(),
+        "killed benchmark never published a valid repository"
+    );
     fsck_full(&cell, &root);
 
     // Recovery is not merely readable: a fresh binary must be able to create
@@ -228,6 +237,9 @@ fn cli_sigkill_during_live_concurrent_workload_reopens_and_accepts_new_work() {
         .arg("-m")
         .arg("post-SIGKILL recovery");
     let result = run_text(&mut checkin);
-    assert!(result.contains("updated"), "post-kill checkin failed: {result}");
+    assert!(
+        result.contains("updated"),
+        "post-kill checkin failed: {result}"
+    );
     fsck_full(&cell, &root);
 }
