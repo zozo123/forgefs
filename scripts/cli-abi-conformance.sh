@@ -300,48 +300,48 @@ check abi/4-stale-observation blocking 4 "" -- \
 
 # --- exit 5: I/O, SQLite, or internal failure -----------------------------
 # Contract: exit 5 is for genuine I/O, SQLite or internal failure. It must NOT
-# be reachable from caller-controlled input. #237 records that it currently is.
-# These rows therefore encode the contract value, are reported, and do not
-# block the release until #237 lands.
-check abi/1-duplicate-branch-name known_failing 1 \
-	"#237: existing ref name hits the refs PRIMARY KEY and surfaces as Error::Sqlite -> exit 5; a caller-supplied duplicate name is an input error (exit 1)" -- \
+# be reachable from caller-controlled input. These rows enforce that rule, so a
+# regression that reintroduces an exit 5 (or a silent exit 0) from ordinary
+# caller input fails the release.
+check abi/1-duplicate-branch-name blocking 1 \
+	"a caller-supplied duplicate ref name is an input error; insert_ref names the condition instead of leaking the refs PRIMARY KEY" -- \
 	--dir "$A" --cap "$A_ROOT" branch main heads/abi-dup
-check abi/2-duplicate-seal-tag known_failing 2 \
-	"#237: re-sealing a frozen tag hits the seals PRIMARY KEY and surfaces as Error::Sqlite -> exit 5; a frozen tag is a sealed-state violation (exit 2, see INVARIANTS I5/I7)" -- \
+check abi/2-duplicate-seal-tag blocking 2 \
+	"a frozen tag is a sealed-state violation (INVARIANTS I5/I7); commit_seal returns Error::Sealed instead of a PRIMARY KEY violation" -- \
 	--dir "$A" --cap "$A_INT" seal main --tag abi-seal
-check abi/1-non-utf8-cap-file known_failing 1 \
-	"#237: load_cap uses read_to_string, so non-UTF-8 --cap bytes surface as Error::Io -> exit 5; malformed caller input is an input error (exit 1)" -- \
+check abi/1-non-utf8-cap-file blocking 1 \
+	"malformed caller input; load_cap reads bytes and maps non-UTF-8 to Error::Cap, matching forge-cap" -- \
 	--dir "$A" --cap "$A_NONUTF8" refs
-check abi/1-write-file-missing known_failing 1 \
-	"#237: a --file path the caller got wrong surfaces as Error::Io -> exit 5; a bad argument is an input error (exit 1)" -- \
+check abi/1-write-file-missing blocking 1 \
+	"a --file path the caller got wrong is a bad argument, validated before the read" -- \
 	--dir "$F" --cap "$F_ROOT" write --ns "$F_NS" /p.txt --file "$F_MISSING_FILE"
-check abi/1-import-not-a-directory known_failing 1 \
-	"#237: importing a plain file where a directory is required surfaces as Error::Io -> exit 5; wrong argument kind is an input error (exit 1)" -- \
+check abi/1-import-not-a-directory blocking 1 \
+	"wrong argument kind, validated before the import (needs the import arg-id rename, otherwise open() fails with ENOTDIR first)" -- \
 	--dir "$F" --cap "$F_ROOT" import "$F_PLAIN_FILE" --ref heads/imported-abi
 
-# clap's own usage errors bypass error_exit_code() entirely and exit 2, which
-# CLI_ABI.md defines as "corruption or sealed-state violation". An agent that
-# mistypes a subcommand is therefore indistinguishable from a corrupt
-# repository - the single most dangerous confusion in the whole table, because
-# automation is told to key on exit codes and not on prose.
-check abi/1-unknown-subcommand known_failing 1 \
-	"#237: clap usage errors exit 2, colliding with the corruption code; a bad argv is an input error (exit 1). Needs an explicit clap error-code mapping in main()" -- \
+# clap used to exit the process itself with its own default code 2, which
+# CLI_ABI.md defines as "corruption or sealed-state violation" - so a mistyped
+# subcommand was indistinguishable from a corrupt repository, the most
+# dangerous confusion in the table. main() now parses explicitly and maps
+# clap's ErrorKind, leaving 2 to mean only what the contract says.
+check abi/1-unknown-subcommand blocking 1 \
+	"clap usage errors are input errors; main() parses with try_parse and maps ErrorKind, so 2 stays reserved for corruption" -- \
 	--dir "$F" --cap "$F_ROOT" no-such-subcommand
-check abi/1-unknown-flag known_failing 1 \
-	"#237: clap usage errors exit 2, colliding with the corruption code; a bad flag is an input error (exit 1)" -- \
+check abi/1-unknown-flag blocking 1 \
+	"clap usage errors are input errors; see abi/1-unknown-subcommand" -- \
 	--dir "$F" --cap "$F_ROOT" refs --bogus-flag
 
-# Silent successes. These are worse than a wrong non-zero code: automation
-# keyed on exit codes cannot see them at all.
-check abi/1-log-unknown-ref known_failing 1 \
-	"#237-class: log of a ref that does not exist exits 0 and prints nothing; CLI_ABI.md classes not-found as exit 1" -- \
+# Absent things. A silent exit 0 is worse than a wrong non-zero code, because
+# automation keyed on exit codes cannot see it at all.
+check abi/1-log-unknown-ref blocking 1 \
+	"not-found is exit 1; log used to exit 0 with no output, hiding the difference between no history and no such ref" -- \
 	--dir "$F" --cap "$F_ROOT" log no/such/ref
-check abi/1-landmark-absent-oid known_failing 1 \
-	"#237-class: landmark of a well-formed but absent ObjectId exits 0, prints a success line, and persists a landmarks row for an object that does not exist" -- \
+check abi/1-landmark-absent-oid blocking 1 \
+	"not-found is exit 1; landmark verifies the object exists and records its real type instead of hardcoding 'commit'" -- \
 	--dir "$F" --cap "$F_ROOT" landmark "$ZERO_OID"
 # Keep this row last: it leaves the fixture in a state fsck calls corruption.
-check abi/1-mount-unknown-ref known_failing 1 \
-	"#237-class: mount accepts a ref that does not exist and exits 0. Worse, fsck --full then reports [MOUNT_REF] corruption (exit 2) on a repository whose bytes are intact - so any holder of read+branch authority can make a release gate keyed on fsck fail, with no corrupt byte anywhere. Fixing either side (mount rejects the ref, or fsck stops classing a dangling mount as corruption) resolves the pair" -- \
+check abi/1-mount-unknown-ref blocking 1 \
+	"not-found is exit 1; mount resolves its spec before persisting, so a dangling mount can no longer make fsck --full report corruption on intact bytes" -- \
 	--dir "$F" --cap "$F_ROOT" mount --ns "$F_NS" /dangling no-such-ref-at-all
 
 echo

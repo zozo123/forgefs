@@ -93,49 +93,53 @@ the harness is broken.
 The gate writes its artifacts, including on failure, and the workflow uploads
 them with `if: always()`. A red release is diagnosable from the artifacts alone.
 
-## The CLI ABI table and `known_failing`
+## The CLI ABI table
 
 `scripts/cli-abi-conformance.sh` is the conformance test #237 says is missing.
 Each row encodes the **contract** in `CLI_ABI.md`, never today's behaviour.
 
-Ten rows are contract-correct but currently violated, so they sit in a
-`known_failing` set that is reported and non-blocking. Every one was reproduced
-against a real `forge` binary before being written down:
+All 29 exercised rows are now **blocking**. Ten of them began life in a
+`known_failing` set - contract-correct but violated by the implementation - and
+were promoted once the code was fixed:
 
-| Row | Contract | Observed | Why |
+| Row | Contract | Was | Fixed by |
 |---|---|---|---|
-| `abi/1-duplicate-branch-name` | 1 | 5 | an existing ref name hits the `refs` PRIMARY KEY and surfaces as `Error::Sqlite` |
-| `abi/2-duplicate-seal-tag` | 2 | 5 | re-sealing a frozen tag hits the `seals` PRIMARY KEY and surfaces as `Error::Sqlite` |
-| `abi/1-non-utf8-cap-file` | 1 | 5 | `load_cap` uses `read_to_string`, so non-UTF-8 `--cap` bytes surface as `Error::Io` |
-| `abi/1-write-file-missing` | 1 | 5 | a `--file` path the caller got wrong surfaces as `Error::Io` |
-| `abi/1-import-not-a-directory` | 1 | 5 | importing a plain file where a directory is required surfaces as `Error::Io` |
-| `abi/1-unknown-subcommand` | 1 | **2** | clap's usage error bypasses `error_exit_code()` |
+| `abi/1-duplicate-branch-name` | 1 | 5 | `insert_ref` names the condition instead of leaking the `refs` PRIMARY KEY |
+| `abi/2-duplicate-seal-tag` | 2 | 5 | `commit_seal` returns `Error::Sealed` for a frozen tag |
+| `abi/1-non-utf8-cap-file` | 1 | 5 | `load_cap` reads bytes and maps to `Error::Cap`, matching `forge-cap` |
+| `abi/1-write-file-missing` | 1 | 5 | validated before the read |
+| `abi/1-import-not-a-directory` | 1 | 5 | validated before the import (needed the `import` arg-id rename first) |
+| `abi/1-unknown-subcommand` | 1 | **2** | `main()` parses with `try_parse` and maps clap's `ErrorKind` |
 | `abi/1-unknown-flag` | 1 | **2** | same |
-| `abi/1-log-unknown-ref` | 1 | **0** | `log` of a ref that does not exist exits 0 and prints nothing |
-| `abi/1-landmark-absent-oid` | 1 | **0** | exits 0, prints a success line, and persists a `landmarks` row for an object that does not exist |
-| `abi/1-mount-unknown-ref` | 1 | **0** | `mount` accepts a ref that does not exist |
+| `abi/1-log-unknown-ref` | 1 | **0** | `log` returns `NotFound` |
+| `abi/1-landmark-absent-oid` | 1 | **0** | `landmark` verifies the object exists and records its real type |
+| `abi/1-mount-unknown-ref` | 1 | **0** | `mount` resolves its spec before persisting |
 
-Two of these deserve to be read as more than exit-code pedantry.
+Two of those were more than exit-code pedantry, and are worth keeping in mind
+as the shapes to watch for:
 
-**clap usage errors exit 2, which `CLI_ABI.md` defines as "corruption or
-sealed-state violation."** An agent that mistypes a subcommand is therefore
-indistinguishable, to automation keyed on exit codes exactly as `CLI_ABI.md`
-instructs, from a repository whose durable bytes are corrupt. The fix is a clap
-error mapping in `main()`, so usage errors land in class 1.
+**clap usage errors exited 2, which `CLI_ABI.md` defines as "corruption or
+sealed-state violation."** An agent that mistyped a subcommand was
+indistinguishable - to automation keyed on exit codes exactly as `CLI_ABI.md`
+instructs - from a repository whose durable bytes are corrupt.
 
-**`mount` of a non-existent ref exits 0 and then poisons `fsck`.** After that
-mount, `fsck --full` reports `[MOUNT_REF]` and exits 2 on a repository whose
-bytes are entirely intact. Any holder of read+branch authority can therefore
-make a release gate keyed on `fsck`/`verify` fail with no corrupt byte anywhere.
-Fixing either side resolves the pair: `mount` rejects the missing ref (exit 1),
-or `fsck` stops classing a dangling mount as corruption. This pipeline is not
-exposed to it - `release-gate.sh` builds its own forge and never mounts - but a
-gate that ran `fsck` over an operator-supplied repository would be.
+**`mount` of a non-existent ref exited 0 and then poisoned `fsck`.** After such
+a mount, `fsck --full` reported `[MOUNT_REF]` and exited 2 on a repository whose
+bytes were entirely intact, so any holder of read+branch authority could make a
+gate keyed on `fsck`/`verify` fail with no corrupt byte anywhere. This pipeline
+was never exposed to it - `release-gate.sh` builds its own forge and never
+mounts - but a gate running `fsck` over an operator-supplied repository would
+have been.
 
-The marker is self-cleaning. A `known_failing` row that starts *matching* its
-contract is reported as a hard error - "stale known_failing row" - which fails
-the gate until someone deletes the marker. Fixing #237 therefore promotes these
-rows to blocking automatically; nobody has to remember.
+The marker is self-cleaning, and that is what promoted these rows: a
+`known_failing` row that starts *matching* its contract is reported as a hard
+error - "stale known_failing row" - which fails the gate until someone deletes
+the marker. Nobody had to remember to come back; the script demanded it.
+
+Adopted rule, worth stating because it is machine-checkable: **exit 5 must be
+unreachable from caller-controlled input.** Exit 5 means the machine or the code
+is broken, so any input a caller can supply that produces it is a mis-mapped
+error by definition. New rows should be added with that in mind.
 
 One row, `abi/3-busy` (exit 3, transient contention), is declared
 `unexercised` rather than faked: producing it deterministically needs a second
