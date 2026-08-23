@@ -1,5 +1,5 @@
 use forge_core::{hash_bytes, Blob, Commit, Conflict, ConflictPath, Snapshot, Tree};
-use forge_types::ObjectId;
+use forge_types::{hex_decode, ObjectId, ObjectType};
 
 fn expected(s: &str) -> &str {
     s.trim()
@@ -21,6 +21,27 @@ fn v1_object_ids_are_userspace_abi() {
         landmark: true,
         contrib: None,
     };
+    let commit_bytes =
+        hex_decode(include_str!("../../../testdata/canonical/commit.hex").trim()).unwrap();
+    assert_eq!(commit.encode(), commit_bytes);
+    assert_eq!(Commit::decode(&commit_bytes).unwrap(), commit);
+
+    let commit_with_contribution = Commit {
+        contrib: Some(ObjectId([0x55; 32])),
+        ..commit.clone()
+    };
+    let commit_with_contribution_bytes = hex_decode(
+        include_str!("../../../testdata/canonical/commit_with_contribution.hex").trim(),
+    )
+    .unwrap();
+    assert_eq!(
+        commit_with_contribution.encode(),
+        commit_with_contribution_bytes
+    );
+    assert_eq!(
+        Commit::decode(&commit_with_contribution_bytes).unwrap(),
+        commit_with_contribution
+    );
     let conflict = Conflict {
         bases: vec![ObjectId([0x55; 32])],
         ours: ObjectId([0x66; 32]),
@@ -52,8 +73,19 @@ fn v1_object_ids_are_userspace_abi() {
         expected(include_str!("../../../testdata/canonical/empty_tree.oid"))
     );
     assert_eq!(
-        hash_bytes(&commit.encode()).hex(),
+        hash_bytes(&commit_bytes).hex(),
         expected(include_str!("../../../testdata/canonical/commit.oid"))
+    );
+    assert_eq!(
+        hash_bytes(&commit_with_contribution_bytes).hex(),
+        expected(include_str!(
+            "../../../testdata/canonical/commit_with_contribution.oid"
+        ))
+    );
+    assert_ne!(
+        hash_bytes(&commit_bytes),
+        hash_bytes(&commit_with_contribution_bytes),
+        "the optional Contribution edge participates in Commit identity"
     );
     assert_eq!(
         hash_bytes(&conflict.encode()).hex(),
@@ -63,4 +95,27 @@ fn v1_object_ids_are_userspace_abi() {
         hash_bytes(&snapshot.encode()).hex(),
         expected(include_str!("../../../testdata/canonical/snapshot.oid"))
     );
+}
+
+#[test]
+fn v1_object_type_registry_is_frozen() {
+    let assigned = [
+        (0x01, ObjectType::Blob),
+        (0x02, ObjectType::Tree),
+        (0x03, ObjectType::Commit),
+        (0x04, ObjectType::Conflict),
+        (0x05, ObjectType::Snapshot),
+        (0x06, ObjectType::Contribution),
+    ];
+    for (tag, expected) in assigned {
+        assert_eq!(expected as u8, tag);
+        assert_eq!(ObjectType::from_u8(tag).unwrap(), expected);
+    }
+
+    for unassigned in [0x00, 0x07, 0xff] {
+        assert!(
+            ObjectType::from_u8(unassigned).is_err(),
+            "VERSION 1 must reject unassigned type 0x{unassigned:02x}"
+        );
+    }
 }
