@@ -141,6 +141,10 @@ enum Cmd {
     },
     /// Timed concurrent checkin / shared-ref stampede / merge+seal+verify.
     Bench {
+        /// New, dedicated benchmark workspace to preserve after the run.
+        /// Must not already exist. Omit to use an owned temporary directory.
+        #[arg(long)]
+        scratch: Option<PathBuf>,
         #[arg(long, default_value_t = 32)]
         agents: usize,
         #[arg(long, default_value_t = 16)]
@@ -228,15 +232,37 @@ fn restore_default_sigpipe() {
 fn run(cli: Cli) -> forge_types::Result<()> {
     match cli.cmd {
         Cmd::Bench {
+            scratch,
             agents,
             shared,
             workers,
         } => {
-            let dir = cli.dir.clone().unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("forge-bench-{}", std::process::id()))
-            });
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir)?;
+            if cli.dir.is_some() {
+                return Err(Error::Invalid(
+                    "bench does not accept --dir/FORGE_DIR; use --scratch <new-path> or omit it"
+                        .into(),
+                ));
+            }
+            let (_scratch_guard, dir) = match scratch {
+                Some(dir) => {
+                    match std::fs::symlink_metadata(&dir) {
+                        Ok(_) => {
+                            return Err(Error::Invalid(format!(
+                                "benchmark scratch path already exists: {}",
+                                dir.display()
+                            )))
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    (None, dir)
+                }
+                None => {
+                    let guard = tempfile::Builder::new().prefix("forge-bench-").tempdir()?;
+                    let dir = guard.path().to_path_buf();
+                    (Some(guard), dir)
+                }
+            };
             eprintln!(
                 "forge bench dir={} agents={agents} shared={shared} workers={workers}",
                 dir.display()
