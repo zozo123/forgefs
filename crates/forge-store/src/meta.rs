@@ -757,6 +757,22 @@ impl Meta {
     /// The durability pragmas are read and reported exactly as found. A
     /// read-only handle establishes no contract, so it must not fake one.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        // The wal-index hazard is not about writing, it is about whether SQLite
+        // will MAP one. A read-only open of a WAL catalog on writable media
+        // still creates and maps .forge/meta.sqlite-shm, so it can fault into an
+        // unbacked page and die by SIGBUS exactly like a writable open -- the
+        // probe caught `fsck` doing so at 9216 and 8192 bytes free.
+        //
+        // Only the `immutable=1` path below is genuinely exempt, because it
+        // skips the -shm entirely. That is also the case that matters most:
+        // read-only MEDIA keeps working, while a nearly-full writable
+        // filesystem gets a clear exit 5 instead of a signal death.
+        if !media_is_read_only(path) {
+            let dir = path.parent().unwrap_or_else(|| Path::new("."));
+            if let Some(available) = available_bytes(dir) {
+                wal_index_space_check(available)?;
+            }
+        }
         let conn = match connect_read_only(path) {
             Ok(conn) => conn,
             // A WAL database is unreadable without its shared-memory index, and
