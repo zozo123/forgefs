@@ -94,15 +94,7 @@ fn cli_attenuated_cap_is_not_root() {
         "alice",
     ]));
     let checked_in = run(forge().args([
-        "--dir",
-        dir,
-        "--cap",
-        &alice,
-        "checkin",
-        "--ns",
-        &alice_ns,
-        "-m",
-        "alice",
+        "--dir", dir, "--cap", &alice, "checkin", "--ns", &alice_ns, "-m", "alice",
     ]));
     assert!(checked_in.contains("updated"), "{checked_in}");
 
@@ -117,16 +109,7 @@ fn cli_attenuated_cap_is_not_root() {
     ]));
     let bob_ns = bob_ns.trim().to_string();
     run(forge().args([
-        "--dir",
-        dir,
-        "--cap",
-        &bob,
-        "write",
-        "--ns",
-        &bob_ns,
-        "/bob.txt",
-        "--text",
-        "bob",
+        "--dir", dir, "--cap", &bob, "write", "--ns", &bob_ns, "/bob.txt", "--text", "bob",
     ]));
     run(forge().args([
         "--dir", dir, "--cap", &bob, "checkin", "--ns", &bob_ns, "-m", "bob",
