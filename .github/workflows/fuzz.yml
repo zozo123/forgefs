@@ -10,7 +10,8 @@ on:
       - 'crates/forge-api/src/**'
       - '.github/workflows/fuzz.yml'
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - 'fuzz/**'
       - 'crates/forge-core/src/**'

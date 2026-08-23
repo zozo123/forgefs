@@ -9,6 +9,7 @@ description = "Local CAS blob store and SQLite metadata for ForgeFS"
 [dependencies]
 forge-core.workspace = true
 forge-types.workspace = true
+libc.workspace = true
 lru.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true

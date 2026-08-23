@@ -8,7 +8,8 @@ on:
       - 'crates/**/Cargo.toml'
       - '.github/workflows/security.yml'
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - Cargo.toml
       - Cargo.lock

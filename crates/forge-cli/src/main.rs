@@ -83,6 +83,7 @@ enum Cmd {
         into: String,
         #[arg(long)]
         from: String,
+        /// Reserved for conflict-bound resolution; raw tree OIDs are rejected.
         #[arg(long)]
         resolved: Option<String>,
     },

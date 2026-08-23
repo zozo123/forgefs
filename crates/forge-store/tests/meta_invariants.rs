@@ -22,6 +22,40 @@ fn ref_and_reflog_publish_atomically() {
 }
 
 #[test]
+fn committed_ref_survives_wal_checkpoint_and_reopen() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("m.sqlite");
+    let expected = oid(7);
+
+    let meta = Meta::open(&db).unwrap();
+    meta.insert_ref(
+        "heads/checkpoint",
+        expected,
+        "commit",
+        false,
+        false,
+        "checkpoint-test",
+        "durability regression",
+    )
+    .unwrap();
+
+    // Checkpoint through the connection whose durability policy ForgeFS
+    // verified. The method inspects SQLite's result row, where a busy/partial
+    // checkpoint is reported without necessarily raising an execution error.
+    let checkpoint = meta.checkpoint_truncate().unwrap();
+    assert_eq!(checkpoint.log_frames, checkpoint.checkpointed_frames);
+    drop(meta);
+
+    let reopened = Meta::open(&db).unwrap();
+    let row = reopened
+        .get_ref("heads/checkpoint")
+        .unwrap()
+        .expect("committed ref after checkpoint/reopen");
+    assert_eq!(row.oid, expected);
+    assert_eq!(row.kind, "commit");
+}
+
+#[test]
 fn reserved_names_are_typed_and_tags_are_seal_only() {
     let d = tempdir().unwrap();
     let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();

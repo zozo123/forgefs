@@ -82,6 +82,10 @@ Existing local and GitHub-hosted results are regression signals, not a universal
 4. exploit canonical sorted trees before inventing a new index/tree format;
 5. add chunking when large-file workloads demonstrate the need.
 
+See [`docs/BENCH.md`](docs/BENCH.md) for the reproducible workload/reporting
+protocol and [`docs/RECOVERY.md`](docs/RECOVERY.md) for the exact object +
+SQLite crash-durability contract.
+
 ## Local validation
 
 ```bash
