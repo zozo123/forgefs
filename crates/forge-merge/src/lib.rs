@@ -173,8 +173,10 @@ fn merge_trees(
         match (pa, pb, pg) {
             (None, None, _) => {}
             (Some(x), None, g) => {
-                if g.map(|g| g.id) == Some(x.id) {
-                    // deleted on theirs, unchanged ours → take delete
+                // A TreeEntry is the merge atom: kind, OID, and executable bit.
+                // Treat deletion as clean only when ours is exactly the base entry.
+                if g == Some(x) {
+                    // deleted on theirs, unchanged ours -> take delete
                 } else if g.is_none() {
                     out.push(x.clone());
                 } else {
@@ -187,8 +189,8 @@ fn merge_trees(
                 }
             }
             (None, Some(x), g) => {
-                if g.map(|g| g.id) == Some(x.id) {
-                    // deleted on ours
+                if g == Some(x) {
+                    // deleted on ours, unchanged theirs -> take delete
                 } else if g.is_none() {
                     out.push(x.clone());
                 } else {
@@ -201,15 +203,18 @@ fn merge_trees(
                 }
             }
             (Some(x), Some(y), g) => {
-                if x.id == y.id && x.kind == y.kind {
+                // Entry identity includes metadata. Comparing only OID/kind silently
+                // discarded chmod-only changes and made merge output depend on which
+                // side happened to be named `ours`.
+                if x == y {
                     out.push(x.clone());
                     continue;
                 }
-                if g.map(|g| g.id) == Some(x.id) {
+                if g == Some(x) {
                     out.push(y.clone());
                     continue;
                 }
-                if g.map(|g| g.id) == Some(y.id) {
+                if g == Some(y) {
                     out.push(x.clone());
                     continue;
                 }
@@ -254,68 +259,43 @@ mod tests {
         (d, s)
     }
 
+    fn blob(name: &str, id: ObjectId, exec: bool) -> TreeEntry {
+        TreeEntry {
+            name: name.into(),
+            kind: EntryKind::Blob,
+            id,
+            exec,
+        }
+    }
+
+    fn put_tree(store: &Store, entries: Vec<TreeEntry>) -> ObjectId {
+        store.put_tree(&Tree::new(entries).unwrap()).unwrap()
+    }
+
+    fn merged_tree(outcome: MergeOutcome) -> ObjectId {
+        match outcome {
+            MergeOutcome::Tree(id) => id,
+            MergeOutcome::Conflict(conflict) => panic!("unexpected conflict {conflict:?}"),
+        }
+    }
+
     #[test]
     fn disjoint_auto_merge() {
         let (_d, s) = setup();
         let ba = s.put_blob_data(b"a").unwrap();
         let bb = s.put_blob_data(b"b").unwrap();
         let bc = s.put_blob_data(b"c").unwrap();
-        let base = s
-            .put_tree(
-                &Tree::new(vec![TreeEntry {
-                    name: "keep.txt".into(),
-                    kind: EntryKind::Blob,
-                    id: bc,
-                    exec: false,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let ours = s
-            .put_tree(
-                &Tree::new(vec![
-                    TreeEntry {
-                        name: "keep.txt".into(),
-                        kind: EntryKind::Blob,
-                        id: bc,
-                        exec: false,
-                    },
-                    TreeEntry {
-                        name: "a.txt".into(),
-                        kind: EntryKind::Blob,
-                        id: ba,
-                        exec: false,
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        let theirs = s
-            .put_tree(
-                &Tree::new(vec![
-                    TreeEntry {
-                        name: "keep.txt".into(),
-                        kind: EntryKind::Blob,
-                        id: bc,
-                        exec: false,
-                    },
-                    TreeEntry {
-                        name: "b.txt".into(),
-                        kind: EntryKind::Blob,
-                        id: bb,
-                        exec: false,
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        match three_way(&s, Some(base), ours, theirs).unwrap() {
-            MergeOutcome::Tree(t) => {
-                let tree = s.get_tree(t).unwrap();
-                assert_eq!(tree.entries.len(), 3);
-            }
-            MergeOutcome::Conflict(c) => panic!("unexpected {c:?}"),
-        }
+        let base = put_tree(&s, vec![blob("keep.txt", bc, false)]);
+        let ours = put_tree(
+            &s,
+            vec![blob("keep.txt", bc, false), blob("a.txt", ba, false)],
+        );
+        let theirs = put_tree(
+            &s,
+            vec![blob("keep.txt", bc, false), blob("b.txt", bb, false)],
+        );
+        let tree = merged_tree(three_way(&s, Some(base), ours, theirs).unwrap());
+        assert_eq!(s.get_tree(tree).unwrap().entries.len(), 3);
     }
 
     #[test]
@@ -324,21 +304,55 @@ mod tests {
         let b0 = s.put_blob_data(b"0").unwrap();
         let b1 = s.put_blob_data(b"1").unwrap();
         let b2 = s.put_blob_data(b"2").unwrap();
-        let e = |id| TreeEntry {
-            name: "f.txt".into(),
-            kind: EntryKind::Blob,
-            id,
-            exec: false,
-        };
-        let base = s.put_tree(&Tree::new(vec![e(b0)]).unwrap()).unwrap();
-        let ours = s.put_tree(&Tree::new(vec![e(b1)]).unwrap()).unwrap();
-        let theirs = s.put_tree(&Tree::new(vec![e(b2)]).unwrap()).unwrap();
+        let base = put_tree(&s, vec![blob("f.txt", b0, false)]);
+        let ours = put_tree(&s, vec![blob("f.txt", b1, false)]);
+        let theirs = put_tree(&s, vec![blob("f.txt", b2, false)]);
         match three_way(&s, Some(base), ours, theirs).unwrap() {
             MergeOutcome::Conflict(c) => {
                 assert_eq!(c.paths.len(), 1);
                 assert_eq!(c.paths[0].path, "f.txt");
             }
             MergeOutcome::Tree(_) => panic!("expected conflict"),
+        }
+    }
+
+    #[test]
+    fn mode_only_change_survives_disjoint_merge_in_both_directions() {
+        let (_d, s) = setup();
+        let tool = s.put_blob_data(b"#!/bin/sh\n").unwrap();
+        let added = s.put_blob_data(b"new\n").unwrap();
+
+        let base = put_tree(&s, vec![blob("tool.sh", tool, false)]);
+        let ours = put_tree(
+            &s,
+            vec![blob("tool.sh", tool, false), blob("a.txt", added, false)],
+        );
+        let theirs = put_tree(&s, vec![blob("tool.sh", tool, true)]);
+
+        let forward = merged_tree(three_way(&s, Some(base), ours, theirs).unwrap());
+        let reverse = merged_tree(three_way(&s, Some(base), theirs, ours).unwrap());
+
+        assert_eq!(forward, reverse, "I12: clean merge must be direction-independent");
+        let merged = s.get_tree(forward).unwrap();
+        assert_eq!(merged.entries.len(), 2);
+        assert!(merged.get("tool.sh").unwrap().exec);
+        assert_eq!(merged.get("a.txt").unwrap().id, added);
+    }
+
+    #[test]
+    fn conflicting_additions_with_same_bytes_but_different_mode_are_loud() {
+        let (_d, s) = setup();
+        let tool = s.put_blob_data(b"#!/bin/sh\n").unwrap();
+        let base = put_tree(&s, vec![]);
+        let ours = put_tree(&s, vec![blob("tool.sh", tool, false)]);
+        let theirs = put_tree(&s, vec![blob("tool.sh", tool, true)]);
+
+        match three_way(&s, Some(base), ours, theirs).unwrap() {
+            MergeOutcome::Conflict(c) => {
+                assert_eq!(c.paths.len(), 1);
+                assert_eq!(c.paths[0].path, "tool.sh");
+            }
+            MergeOutcome::Tree(_) => panic!("mode-divergent additions must conflict"),
         }
     }
 }
