@@ -78,6 +78,32 @@ def scalar(value: str) -> str:
     return value
 
 
+def is_complete_quoted_scalar(value: str) -> bool:
+    """Return whether a quoted scalar opens and closes on this source line."""
+    value = value.strip()
+    if not value or value[0] not in {'"', "'"}:
+        return True
+    quote = value[0]
+    escaped = False
+    index = 1
+    while index < len(value):
+        char = value[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                return index == len(value) - 1
+        elif char == quote:
+            if index + 1 < len(value) and value[index + 1] == quote:
+                index += 1
+            else:
+                return index == len(value) - 1
+        index += 1
+    return False
+
+
 def has_flow_yaml(line: str) -> bool:
     if FLOW_NODE.search(line):
         return True
@@ -351,6 +377,13 @@ def check_workflow(path: Path, errors: list[str]) -> None:
             continue
 
         item_indent, key, value = item
+        if not is_complete_quoted_scalar(value):
+            error(
+                errors,
+                path,
+                index,
+                "multiline or compound quoted YAML scalars are forbidden",
+            )
         if BLOCK_SCALAR.fullmatch(value):
             # In a compact sequence mapping (`- name: |`) sibling keys are two
             # columns deeper than the dash.  They are not scalar content.

