@@ -1,5 +1,5 @@
 use forge_api::Forge;
-use forge_core::Commit;
+use forge_core::{Commit, Contribution, ContributionRead};
 use forge_store::Store;
 use tempfile::tempdir;
 
@@ -80,6 +80,66 @@ fn typed_commit_tree_edge_is_checked() {
             .any(|f| { f.code == "TYPE_MISMATCH" && f.resource.contains("commit:") }),
         "{:#?}",
         r.findings
+    );
+}
+
+#[test]
+fn contribution_read_edges_must_reference_blobs() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+    let store = Store::open(&d.path().join(".forge")).unwrap();
+
+    let main = store.meta.get_ref("main").unwrap().unwrap();
+    let base = store.get_commit(main.oid).unwrap();
+    let contribution = store
+        .put_contribution(&Contribution {
+            base: main.oid,
+            tree: base.tree,
+            parents: vec![],
+            reads: vec![ContributionRead {
+                path: "/not-a-blob".into(),
+                id: base.tree,
+            }],
+            writes: vec![],
+            agent: "test".into(),
+            ts: 1,
+        })
+        .unwrap();
+    let bad_commit = store
+        .put_commit(&Commit {
+            tree: base.tree,
+            parents: vec![main.oid],
+            agent: "test".into(),
+            msg: "bad contribution read edge".into(),
+            ts: 2,
+            landmark: false,
+            contrib: Some(contribution),
+        })
+        .unwrap();
+    store
+        .meta
+        .insert_ref(
+            "heads/bad-contribution-read",
+            bad_commit,
+            "commit",
+            false,
+            false,
+            "test",
+            "fsck-test",
+        )
+        .unwrap();
+
+    let report = f.fsck(&root, false).unwrap();
+    assert!(!report.ok);
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.code == "TYPE_MISMATCH"
+                && finding.resource.contains("contribution:")
+                && finding.resource.contains(":read:/not-a-blob")
+        }),
+        "{:#?}",
+        report.findings
     );
 }
 
