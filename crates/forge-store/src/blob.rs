@@ -51,6 +51,9 @@ struct BlobStoreCounters {
 #[derive(Clone, Debug)]
 pub struct LocalBlobStore {
     root: PathBuf,
+    /// A read-only store refuses every publication instead of discovering that
+    /// the media is immutable halfway through one.
+    read_only: bool,
     stats: Arc<BlobStoreCounters>,
     // Positive durability proofs only. A directory is inserted after its
     // parent barrier succeeds; an OID is inserted only after the batch's leaf
@@ -87,10 +90,39 @@ impl LocalBlobStore {
         cleanup_stale_tmp(&tmp, &stats)?;
         Ok(Self {
             root,
+            read_only: false,
             stats,
             durable_dirs,
             durable_oids,
         })
+    }
+
+    /// Open an existing object store without writing anything: no directory
+    /// creation, no directory fsync barrier, and no stale-tmp reclamation.
+    /// `objects/` must already exist, because nothing here may create it.
+    pub fn open_read_only(root: PathBuf) -> Result<Self> {
+        let objects = root.join("objects");
+        if !objects.is_dir() {
+            return Err(Error::Invalid(format!(
+                "missing object directory {}",
+                objects.display()
+            )));
+        }
+        Ok(Self {
+            root,
+            read_only: true,
+            stats: Arc::new(BlobStoreCounters::default()),
+            durable_dirs: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(DURABLE_DIR_CACHE_CAPACITY).expect("non-zero directory cache"),
+            ))),
+            durable_oids: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(DURABLE_OID_CACHE_CAPACITY).expect("non-zero OID cache"),
+            ))),
+        })
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn root(&self) -> &Path {
@@ -179,6 +211,13 @@ impl LocalBlobStore {
 
 impl PublishBatch<'_> {
     pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
+        // Every object write in the process funnels through here, so this is
+        // the whole write boundary for a read-only store.
+        if self.store.read_only {
+            return Err(Error::Denied(
+                "repository is open read-only; objects cannot be published".into(),
+            ));
+        }
         let id = hash_bytes(bytes);
         let dest = self.store.object_path(id);
         let (a, b) = id.shard_dirs();

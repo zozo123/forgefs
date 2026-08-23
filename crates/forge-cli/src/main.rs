@@ -268,8 +268,17 @@ fn run(cli: Cli) -> forge_types::Result<()> {
     }
 }
 
+/// `fsck` and `verify` are documented as read-only, so they take the read-only
+/// open path unconditionally -- not only when the media happens to be
+/// read-only. That makes the documented guarantee structural (SQLite itself
+/// refuses writes on the connection) instead of something a reviewer has to
+/// re-derive, and it is the only open that works on read-only media. Every
+/// other command opens for writing exactly as before.
 fn open(cli: &Cli) -> forge_types::Result<Forge> {
     let dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    if matches!(cli.cmd, Cmd::Fsck { .. } | Cmd::Verify { .. }) {
+        return Forge::open_read_only(&dir);
+    }
     Forge::open(&dir)
 }
 
