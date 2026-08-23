@@ -1,0 +1,18 @@
+name: one-shot-1f916-final
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  publish:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'relay/1f916-final-1710'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Placeholder
+        run: echo ready
