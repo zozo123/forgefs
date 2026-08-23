@@ -1,0 +1,61 @@
+name: Publish v0.1.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-v0.1.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish ForgeFS v0.1.0 if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view v0.1.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "ForgeFS v0.1.0 already exists; nothing to do."
+            exit 0
+          fi
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          # ForgeFS v0.1.0
+
+          First public development release of ForgeFS: a concurrency, isolation, and provenance substrate for autonomous agents.
+
+          ## Highlights
+
+          - Immutable, content-addressed typed objects with crash-durable publication.
+          - Snapshot-based agent sessions with explicit capability-scoped authority.
+          - Compare-and-swap refs: one writer wins and losing races fork instead of losing work.
+          - Checkin validation for both write conflicts and stale observations.
+          - Deterministic three-way integration with explicit Conflict objects.
+          - Cryptographically sealed tags and verification from durable bytes.
+          - Read-only `fsck` / `fsck --full` integrity validation, including unreachable objects.
+          - CLI and E2E coverage for concurrent publication, merges, sealing, initialization, and cross-cell capability isolation.
+
+          ## Validate locally
+
+          ```bash
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --all-targets --locked
+          ```
+
+          Requires Rust 1.89 or newer. This is an early `0.1.0` release; the on-disk/CLI surface should still be treated as pre-1.0.
+          EOF
+
+          gh release create v0.1.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ForgeFS v0.1.0" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
