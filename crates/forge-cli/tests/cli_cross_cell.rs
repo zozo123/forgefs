@@ -101,7 +101,10 @@ fn cli_cross_cell_capability_isolation_survives_identical_object_ids() {
     let a_token = a_token.trim();
     let b_token = b_token.trim();
 
-    assert_ne!(a_token, b_token, "independent cells reused a root capability");
+    assert_ne!(
+        a_token, b_token,
+        "independent cells reused a root capability"
+    );
     assert_ne!(
         fs::read(a.join(".forge/keys/root.secret")).unwrap(),
         fs::read(b.join(".forge/keys/root.secret")).unwrap(),
