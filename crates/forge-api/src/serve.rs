@@ -14,6 +14,14 @@ use std::thread;
 use std::time::Duration;
 
 const MAX_HTTP_BODY: usize = 1024 * 1024;
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:4077";
+
+/// Listen address for `serve --http`. Two forges with `--http` on one host
+/// cannot share the default port, and the bind failure is now reported at
+/// startup rather than silently ignored, so give operators a way out.
+fn http_addr() -> String {
+    std::env::var("FORGE_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string())
+}
 const MAX_UNIX_WORKERS: usize = 64;
 const MAX_PENDING_UNIX: usize = 256;
 const UNIX_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,12 +41,21 @@ pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
 
     if http {
+        // Bind HERE, on the caller's thread, so a failure to take the port is a
+        // startup error the operator sees immediately. Binding inside the
+        // spawned thread meant `--http` could be accepted while the listener
+        // never existed -- a second forge on the same host lost the bind, kept
+        // running, and port 4077 went on answering for the FIRST forge.
+        let server = http_listener(&http_addr())?;
         let f = forge.clone();
         thread::Builder::new()
             .name("forge-http".into())
             .spawn(move || {
-                if let Err(e) = serve_http(f, "127.0.0.1:4077") {
-                    eprintln!("forge http: {e}");
+                // The accept loop no longer aborts on a bad request, so reaching
+                // here means something structural. Say so; do not leave `--http`
+                // silently meaning "no HTTP".
+                if let Err(e) = http_accept_loop(f, server) {
+                    eprintln!("forge http: listener stopped: {e}");
                 }
             })
             .map_err(|e| Error::Internal(format!("spawn http thread: {e}")))?;
@@ -124,13 +141,15 @@ fn handle_unix(forge: &Forge, stream: UnixStream) {
     }
 }
 
-fn serve_http(forge: Arc<Forge>, addr: &str) -> Result<()> {
-    let server = tiny_http::Server::http(
+fn http_listener(addr: &str) -> Result<tiny_http::Server> {
+    tiny_http::Server::http(
         addr.parse::<SocketAddr>()
             .map_err(|e| Error::Invalid(e.to_string()))?,
     )
-    .map_err(|e| Error::Io(e.to_string()))?;
+    .map_err(|e| Error::Io(format!("cannot listen on {addr}: {e}")))
+}
 
+fn http_accept_loop(forge: Arc<Forge>, server: tiny_http::Server) -> Result<()> {
     for mut req in server.incoming_requests() {
         if req.method() != &tiny_http::Method::Post {
             let r = tiny_http::Response::from_string("method not allowed").with_status_code(405);
@@ -155,8 +174,22 @@ fn serve_http(forge: Arc<Forge>, addr: &str) -> Result<()> {
 
         let mut body = Vec::new();
         {
+            // A client that promises a body and then disappears is one bad
+            // request, not a reason to stop serving. Propagating this error with
+            // `?` returned it out of the accept loop, so serve_http exited and
+            // the listener socket closed: every later connect got
+            // ECONNREFUSED, permanently, from one unauthenticated aborted
+            // request. The body is read before the capability header is parsed,
+            // so no credential was needed either.
             let mut limited = req.as_reader().take((MAX_HTTP_BODY + 1) as u64);
-            limited.read_to_end(&mut body)?;
+            if let Err(error) = limited.read_to_end(&mut body) {
+                let r = tiny_http::Response::from_string(format!(
+                    "could not read request body: {error}"
+                ))
+                .with_status_code(400);
+                let _ = req.respond(r);
+                continue;
+            }
         }
         if body.len() > MAX_HTTP_BODY {
             let r =
