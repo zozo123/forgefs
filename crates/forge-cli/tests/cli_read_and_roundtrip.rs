@@ -83,10 +83,7 @@ fn checkin(dir: &Path, cap: &str, ns: &str, message: &str) -> String {
 
 fn merge(dir: &Path, integrator: &str, from: &str) {
     let mut cmd = authenticated(dir, integrator);
-    cmd.arg("merge")
-        .arg("--into=main")
-        .arg("--from")
-        .arg(from);
+    cmd.arg("merge").arg("--into=main").arg("--from").arg(from);
     run(&mut cmd);
 }
 
@@ -156,7 +153,11 @@ fn cli_stale_observation_blocks_disjoint_checkin() {
         .arg(&bob_fresh)
         .arg("/main/notes.txt");
     let absent = output(&mut absent);
-    assert_eq!(absent.status.code(), Some(1), "stale overlay leaked to main");
+    assert_eq!(
+        absent.status.code(),
+        Some(1),
+        "stale overlay leaked to main"
+    );
 
     let carol_ns = open_session(d.path(), &carol, "main");
     write_text(d.path(), &carol, &carol_ns, "/other.txt", "independent");
@@ -202,11 +203,7 @@ fn cli_export_import_roundtrip_preserves_names_and_bytes() {
     }
 
     assert!(checkin(src.path(), src_root, &ns, "roundtrip").contains("updated"));
-    merge(
-        src.path(),
-        integrator,
-        &format!("heads/agents/anon/{ns}"),
-    );
+    merge(src.path(), integrator, &format!("heads/agents/anon/{ns}"));
 
     let mut seal = authenticated(src.path(), integrator);
     seal.arg("seal")
@@ -218,11 +215,7 @@ fn cli_export_import_roundtrip_preserves_names_and_bytes() {
 
     let tar_path = src.path().join("v1.tar");
     let mut export = authenticated(src.path(), src_root);
-    export
-        .arg("export")
-        .arg("tags/v1")
-        .arg("-o")
-        .arg(&tar_path);
+    export.arg("export").arg("tags/v1").arg("-o").arg(&tar_path);
     run(&mut export);
     fsck_full(src.path(), src_root);
 
@@ -253,8 +246,14 @@ fn cli_export_import_roundtrip_preserves_names_and_bytes() {
     run(&mut import);
 
     let imported = open_session(dst.path(), dst_root, "heads/import");
-    assert_eq!(read(dst.path(), dst_root, &imported, "/hello.txt"), b"hello\n");
-    assert_eq!(read(dst.path(), dst_root, &imported, "/sub/a.txt"), b"nested");
+    assert_eq!(
+        read(dst.path(), dst_root, &imported, "/hello.txt"),
+        b"hello\n"
+    );
+    assert_eq!(
+        read(dst.path(), dst_root, &imported, "/sub/a.txt"),
+        b"nested"
+    );
     assert_eq!(
         read(dst.path(), dst_root, &imported, "/space name.txt"),
         b"spaced"
@@ -262,12 +261,7 @@ fn cli_export_import_roundtrip_preserves_names_and_bytes() {
     assert_eq!(read(dst.path(), dst_root, &imported, "/bin.dat"), binary);
     if cfg!(target_os = "linux") {
         assert_eq!(
-            read(
-                dst.path(),
-                dst_root,
-                &imported,
-                &format!("/{decomposed}")
-            ),
+            read(dst.path(), dst_root, &imported, &format!("/{decomposed}")),
             b"decomposed"
         );
     }
