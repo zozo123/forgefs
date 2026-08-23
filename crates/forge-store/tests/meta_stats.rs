@@ -33,5 +33,10 @@ fn cas_stats_classify_committed_outcomes() {
     assert_eq!(stats.cas_updated, 1);
     assert_eq!(stats.cas_forked, 1);
     assert_eq!(stats.cas_denied, 1);
-    assert!(stats.txn_us > 0);
+    assert_eq!(stats.txn_count, 5);
+    assert_eq!(stats.lock_acquires, 5);
+    assert_eq!(
+        stats.sqlite_accounted_us(),
+        stats.lock_wait_us.saturating_add(stats.txn_us)
+    );
 }

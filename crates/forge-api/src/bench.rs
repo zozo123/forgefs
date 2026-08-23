@@ -68,8 +68,11 @@ pub struct BenchReport {
     pub merge_seal: Option<Duration>,
     pub verify: Option<Duration>,
     pub durability: Option<DurabilityPolicy>,
+    /// Process-lifetime snapshot, not a delta for any one benchmark phase.
     pub store: Option<BlobStoreStats>,
+    /// Process-lifetime snapshot, not a delta for any one benchmark phase.
     pub meta: Option<MetaStats>,
+    /// Process-lifetime snapshot, not a delta for any one benchmark phase.
     pub api: Option<ApiStats>,
 }
 
@@ -79,7 +82,11 @@ impl BenchReport {
             "ForgeFS e2e bench (durable puts: fsync file+dir)\n\
              serial = one agent at a time (true op latency).\n\
              private = N threads, private refs (throughput; p50 includes convoy wait).\n\
-             shared  = N threads, one ref; I8 pin ⇒ 1 Updated + N-1 Forked.\n",
+             shared  = N threads, one ref; I8 pin ⇒ 1 Updated + N-1 Forked.\n\
+             counter scope = cumulative whole-run process lifetime, never per-checkin.\n\
+             counter start = storage at blob-store construction; sqlite/api post-open.\n\
+             counter end   = after init + all workloads + merge/seal + verify (+ worker fsck).\n\
+             per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals.\n",
         );
         if let Some(p) = &self.serial {
             s.push_str(&format!(
@@ -131,38 +138,46 @@ impl BenchReport {
         }
         if let Some(stats) = self.store {
             s.push_str(&format!(
-                "storage          puts={} fsync_file={} fsync_dir={}\n",
-                stats.puts, stats.fsync_file, stats.fsync_dir
+                "storage lifetime puts={} bytes=unavailable fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} lifetime_barrier_us={}\n",
+                stats.puts,
+                stats.fsync_file,
+                stats.fsync_file_us,
+                stats.fsync_dir,
+                stats.fsync_dir_us,
+                stats.barrier_us(),
             ));
         }
         if let Some(stats) = self.meta {
             s.push_str(&format!(
-                "sqlite           txn={:.3}ms busy={} updated={} forked={} denied={}\n",
-                stats.txn_us as f64 / 1000.0,
+                "sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} txn_us={} lifetime_accounted_us={} busy={} updated={} forked={} denied={}\n",
+                stats.lock_acquires,
+                stats.lock_wait_us,
+                stats.txn_count,
+                stats.txn_us,
+                stats.sqlite_accounted_us(),
                 stats.busy,
                 stats.cas_updated,
                 stats.cas_forked,
                 stats.cas_denied,
             ));
         }
-        if let Some(stats) = self.api {
-            let wall_s = self
-                .private
-                .as_ref()
-                .map(|(_, d, _)| d.as_secs_f64())
-                .unwrap_or(0.0)
-                + self
-                    .shared
-                    .as_ref()
-                    .map(|(_, d, _, _)| d.as_secs_f64())
-                    .unwrap_or(0.0);
-            let rate = |n: u64| if wall_s > 0.0 { n as f64 / wall_s } else { 0.0 };
+        if let (Some(store), Some(meta)) = (self.store, self.meta) {
+            let cumulative_phase_us = store
+                .barrier_us()
+                .saturating_add(meta.sqlite_accounted_us());
             s.push_str(&format!(
-                "api outcomes     stale={} ({:.2}/s) conflict={} ({:.2}/s)\n",
-                stats.stale_observation,
-                rate(stats.stale_observation),
-                stats.merge_conflict,
-                rate(stats.merge_conflict),
+                "lifetime phases  fsync_file_us={} + fsync_dir_us={} + sqlite_lock_wait_us={} + sqlite_txn_us={} = cumulative_phase_us={}\n",
+                store.fsync_file_us,
+                store.fsync_dir_us,
+                meta.lock_wait_us,
+                meta.txn_us,
+                cumulative_phase_us,
+            ));
+        }
+        if let Some(stats) = self.api {
+            s.push_str(&format!(
+                "api lifetime     stale={} conflict={}\n",
+                stats.stale_observation, stats.merge_conflict,
             ));
         }
         s
@@ -356,4 +371,68 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_labels_raw_counters_as_lifetime_totals() {
+        let report = BenchReport {
+            serial: None,
+            private: None,
+            shared: None,
+            merge_seal: None,
+            verify: None,
+            durability: None,
+            store: Some(BlobStoreStats {
+                puts: 2,
+                fsync_file: 3,
+                fsync_file_us: 11,
+                fsync_dir: 4,
+                fsync_dir_us: 13,
+            }),
+            meta: Some(MetaStats {
+                txn_us: 17,
+                txn_count: 5,
+                lock_wait_us: 19,
+                lock_acquires: 23,
+                busy: 0,
+                cas_updated: 7,
+                cas_forked: 1,
+                cas_denied: 0,
+            }),
+            api: Some(ApiStats {
+                stale_observation: 2,
+                merge_conflict: 3,
+            }),
+        };
+
+        let rendered = report.render();
+        assert!(rendered
+            .contains("counter scope = cumulative whole-run process lifetime, never per-checkin"));
+        assert!(rendered
+            .contains("counter start = storage at blob-store construction; sqlite/api post-open"));
+        assert!(rendered.contains(
+            "counter end   = after init + all workloads + merge/seal + verify (+ worker fsck)"
+        ));
+        assert!(rendered.contains(
+            "storage lifetime puts=2 bytes=unavailable fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 lifetime_barrier_us=24"
+        ));
+        assert!(rendered.contains(
+            "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=5 txn_us=17 lifetime_accounted_us=36 busy=0 updated=7 forked=1 denied=0"
+        ));
+        assert!(rendered.contains(
+            "fsync_file_us=11 + fsync_dir_us=13 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=60"
+        ));
+        assert!(rendered.contains(
+            "per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals"
+        ));
+        assert!(rendered.contains("api lifetime     stale=2 conflict=3"));
+        assert!(!rendered.contains("observed mix"));
+        assert!(!rendered.contains("observed_us"));
+        assert!(!rendered.contains("stale=2 ("));
+        assert!(!rendered.contains("conflict=3 ("));
+    }
 }

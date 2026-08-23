@@ -1,5 +1,8 @@
 name: workflow-security
 
+# Defense-in-depth candidate lint. This PR-controlled job is not the merge
+# trust root; issue #51 tracks binding policy from a protected ruleset/app.
+
 on:
   pull_request:
     paths:

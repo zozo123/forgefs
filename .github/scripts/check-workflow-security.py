@@ -9,17 +9,19 @@ closed instead of being partially interpreted by a line-oriented policy.
 from __future__ import annotations
 
 import re
+import stat
 import sys
 from pathlib import Path
 
 
 WORKFLOW_DIR = Path(".github/workflows")
+MAX_WORKFLOW_BYTES = 256 * 1024
+MAX_WORKFLOWS = 64
 REMOTE_ACTION = re.compile(
     r"^[^/@\s]+/[^/@\s]+(?:/[^@\s]+)*@([0-9a-fA-F]{40})$"
 )
-DOCKER_ACTION = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-fA-F]{64}$")
 MAPPING = re.compile(
-    r"^(?P<indent>\s*)(?:-\s*)?"
+    r"^(?P<indent>\s*)(?:(?P<dash>-)(?P<dash_space>\s+))?"
     r"(?P<key>\"[^\"]+\"|'[^']+'|[A-Za-z0-9_.-]+)\s*:\s*(?P<value>.*)$"
 )
 LIST_SCALAR = re.compile(r"^\s*-\s*(?P<value>[^:]+?)\s*$")
@@ -28,13 +30,32 @@ FLOW_NODE = re.compile(r"^\s*(?:-\s*)?(?:\[|\{(?!\{))")
 YAML_MERGE_KEY = re.compile(r"^\s*(?:-\s*)?<<\s*:")
 EXPLICIT_KEY = re.compile(r"^\s*(?:-\s*)?[?:](?:\s|$)")
 ESCAPED_KEY = re.compile(r'^\s*(?:-\s*)?"[^"\\]*(?:\\.[^"\\]*)+"\s*:')
-CARGO_INSTALL = re.compile(r"\bcargo\s+install\s+([A-Za-z0-9_-]+)\b")
 DOWNLOAD_COMMAND = re.compile(r"\b(?:curl|wget)\b", re.IGNORECASE)
 BLOCK_SCALAR = re.compile(r"^[|>](?:[-+]?[1-9]?|[1-9][-+]?)$")
-ALLOWED_CARGO_INSTALLS = frozenset(
+ALLOWED_REMOTE_ACTIONS = frozenset(
     {
+        "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+        "dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb",
+    }
+)
+ALLOWED_RUN_COMMANDS = frozenset(
+    {
+        "cargo +nightly fuzz run cap_token -- -max_total_time=60 -rss_limit_mb=2048",
+        "cargo +nightly fuzz run object_decode -- -max_total_time=60 -rss_limit_mb=2048",
+        "cargo +nightly fuzz run protocol_frame -- -max_total_time=60 -rss_limit_mb=2048",
+        "cargo audit --deny warnings",
+        "cargo check --manifest-path fuzz/Cargo.toml --bins",
+        "cargo check --workspace --all-targets --locked",
+        "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        "cargo fmt --all -- --check",
         "cargo install cargo-audit --version 0.22.2 --locked",
         "cargo install cargo-fuzz --version 0.13.2 --locked",
+        "cargo run --locked -p forge-cli -- bench --agents 32 --shared 16 --workers 16",
+        "cargo test --workspace --all-targets --locked",
+        "python3 .github/scripts/check-workflow-security.py",
+        "python3 .github/scripts/test-workflow-security.py",
     }
 )
 
@@ -180,53 +201,21 @@ def has_yaml_indirection(line: str) -> bool:
 
 
 def has_yaml_tag(line: str) -> bool:
-    """Detect YAML tags while ignoring quoted text and GitHub expressions."""
-    quote: str | None = None
-    escaped = False
-    index = 0
-    while index < len(line):
-        if quote is None and line.startswith("${{", index):
-            end = line.find("}}", index + 3)
-            if end == -1:
-                return False
-            index = end + 2
-            continue
-        char = line[index]
-        if quote == '"':
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-        elif quote == "'":
-            if char == quote:
-                if index + 1 < len(line) and line[index + 1] == quote:
-                    index += 1
-                else:
-                    quote = None
-        elif char in {'"', "'"}:
-            quote = char
-        elif char == "!":
-            previous = line[index - 1] if index else " "
-            if previous.isspace() or previous in "[{,:?-":
-                return True
-        index += 1
-    return False
+    """Detect a tag token at a YAML node boundary, not `!` inside a scalar."""
+    candidate = line.lstrip()
+    if candidate.startswith("-"):
+        candidate = candidate[1:].lstrip()
+    if candidate.startswith("!"):
+        return True
+    item = mapping(line)
+    return item is not None and item[2].lstrip().startswith("!")
 
 
 def check_run_command(
     command: str, errors: list[str], path: Path, line: int
 ) -> None:
-    """Enforce the deliberately small shell dependency-install surface."""
+    """Allow only whole, audited commands; do not approximate a shell parser."""
     command = scalar(command)
-    if "\\" in command:
-        error(
-            errors,
-            path,
-            line,
-            "backslash escapes and continuations are forbidden in workflow run steps",
-        )
     deescaped = re.sub(r"\\(.)", r"\1", command)
     if DOWNLOAD_COMMAND.search(deescaped):
         error(
@@ -235,16 +224,9 @@ def check_run_command(
             line,
             "direct curl/wget commands are forbidden in workflow run steps",
         )
-    install = CARGO_INSTALL.search(deescaped)
-    if install:
-        normalized = " ".join(deescaped.split())
-        if normalized not in ALLOWED_CARGO_INSTALLS:
-            error(
-                errors,
-                path,
-                line,
-                f"cargo install {install.group(1)} must match an audited exact command",
-            )
+    normalized = " ".join(command.split())
+    if normalized not in ALLOWED_RUN_COMMANDS:
+        error(errors, path, line, "workflow run command is not allowlisted")
 
 
 def yaml_bool(value: str) -> bool | None:
@@ -260,8 +242,11 @@ def mapping(line: str) -> tuple[int, str, str] | None:
     match = MAPPING.match(line)
     if not match:
         return None
+    key_indent = len(match.group("indent"))
+    if match.group("dash"):
+        key_indent += 1 + len(match.group("dash_space"))
     return (
-        len(match.group("indent")),
+        key_indent,
         scalar(match.group("key")).lower(),
         match.group("value").strip(),
     )
@@ -290,30 +275,51 @@ def checkout_step(lines: list[str], index: int, uses_indent: int) -> tuple[list[
 
 
 def checkout_disables_credentials(step: list[str], step_indent: int) -> bool:
-    with_indent: int | None = None
-    for line in step[1:]:
+    for position, line in enumerate(step[1:], 1):
         item = mapping(line)
         if item is None:
             continue
-        indent, key, value = item
-        if indent <= step_indent:
-            with_indent = None
-        if key == "with":
-            with_indent = indent
+        with_indent, key, _ = item
+        if key != "with" or with_indent <= step_indent:
             continue
-        if with_indent is not None and indent <= with_indent:
-            with_indent = None
-        if (
-            with_indent is not None
-            and key == "persist-credentials"
-            and indent == with_indent + 2
-        ):
-            return yaml_bool(value) is False
+        children: list[tuple[int, str, str]] = []
+        for child_line in step[position + 1 :]:
+            child = mapping(child_line)
+            if child is None:
+                continue
+            if child[0] <= with_indent:
+                break
+            children.append(child)
+        if not children:
+            return False
+        child_indent = min(child[0] for child in children)
+        return any(
+            key == "persist-credentials"
+            and indent == child_indent
+            and yaml_bool(value) is False
+            for indent, key, value in children
+        )
     return False
 
 
 def check_workflow(path: Path, errors: list[str]) -> None:
-    raw_lines = path.read_text(encoding="utf-8").splitlines()
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            error(errors, path, 1, "workflow must be a regular file, not a symlink")
+            return
+        if metadata.st_size > MAX_WORKFLOW_BYTES:
+            error(
+                errors,
+                path,
+                1,
+                f"workflow exceeds {MAX_WORKFLOW_BYTES}-byte policy limit",
+            )
+            return
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exception:
+        error(errors, path, 1, f"cannot read workflow safely: {exception}")
+        return
     lines = [strip_yaml_comment(line) for line in raw_lines]
     top_level_permissions = False
     block_scalar_indent: int | None = None
@@ -332,8 +338,6 @@ def check_workflow(path: Path, errors: list[str]) -> None:
             block_scalar_key = None
 
         if in_block_scalar:
-            if block_scalar_key == "run":
-                check_run_command(line.strip(), errors, path, index)
             continue
         if has_flow_yaml(line):
             error(
@@ -385,10 +389,15 @@ def check_workflow(path: Path, errors: list[str]) -> None:
                 "multiline or compound quoted YAML scalars are forbidden",
             )
         if BLOCK_SCALAR.fullmatch(value):
-            # In a compact sequence mapping (`- name: |`) sibling keys are two
-            # columns deeper than the dash.  They are not scalar content.
-            block_scalar_indent = item_indent + 2 if STEP.match(line) else item_indent
+            block_scalar_indent = item_indent
             block_scalar_key = key
+            if key == "run":
+                error(
+                    errors,
+                    path,
+                    index,
+                    "block-scalar run steps are forbidden; use an allowlisted inline command",
+                )
         elif key == "run":
             check_run_command(value, errors, path, index)
         if item_indent == 0 and key == "permissions":
@@ -421,11 +430,13 @@ def check_workflow(path: Path, errors: list[str]) -> None:
             )
             continue
         if target.startswith("docker://"):
-            if not DOCKER_ACTION.fullmatch(target):
-                error(errors, path, index, "pin Docker actions by sha256 digest")
+            error(errors, path, index, "Docker actions are not allowlisted")
             continue
         if not REMOTE_ACTION.fullmatch(target):
             error(errors, path, index, "pin remote actions to a full 40-hex commit SHA")
+            continue
+        if target not in ALLOWED_REMOTE_ACTIONS:
+            error(errors, path, index, "remote action is not allowlisted")
             continue
         if target.lower().startswith("actions/checkout@"):
             step, step_indent = checkout_step(lines, index - 1, item_indent)
@@ -436,11 +447,19 @@ def check_workflow(path: Path, errors: list[str]) -> None:
         error(errors, path, 1, "declare least-privilege top-level permissions")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) > 1:
+        print("usage: check-workflow-security.py [WORKFLOW_DIR]", file=sys.stderr)
+        return 2
+    workflow_dir = Path(arguments[0]) if arguments else WORKFLOW_DIR
     errors: list[str] = []
-    workflows = sorted((*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")))
+    workflows = sorted((*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")))
     if not workflows:
         print("no workflows found", file=sys.stderr)
+        return 1
+    if len(workflows) > MAX_WORKFLOWS:
+        print(f"too many workflows: {len(workflows)} > {MAX_WORKFLOWS}", file=sys.stderr)
         return 1
     for workflow in workflows:
         check_workflow(workflow, errors)
