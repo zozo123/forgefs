@@ -95,6 +95,10 @@ enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    Inbox {
+        #[command(subcommand)]
+        cmd: InboxCmd,
+    },
     Landmark {
         oid: String,
     },
@@ -147,6 +151,19 @@ enum SessionCmd {
         #[arg(long, default_value = "main")]
         from: String,
     },
+}
+
+#[derive(Subcommand)]
+enum InboxCmd {
+    /// Publish a sealed snapshot to a recipient-owned inbox ref.
+    Push {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// List inbox refs owned by the calling capability's agent.
+    List,
 }
 
 fn main() -> ExitCode {
@@ -320,6 +337,25 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             }
             let c = f.grant(cap, extra)?;
             println!("{}", c.to_token());
+        }
+        Cmd::Inbox {
+            cmd: InboxCmd::Push { to, snapshot },
+        } => match f.inbox_push(cap, &to, &snapshot)? {
+            CasResult::Updated { name, oid } => println!("pushed {name} {oid}"),
+            CasResult::Forked {
+                requested,
+                fork,
+                ours,
+                theirs,
+            } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
+            CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
+        },
+        Cmd::Inbox {
+            cmd: InboxCmd::List,
+        } => {
+            for row in f.inbox_list(cap)? {
+                println!("{} {}", row.name, row.oid);
+            }
         }
         Cmd::Landmark { oid } => {
             f.landmark(cap, ObjectId::from_hex(&oid)?)?;
