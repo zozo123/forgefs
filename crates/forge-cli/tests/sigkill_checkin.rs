@@ -109,9 +109,7 @@ fn cli_sigkill_during_checkin_preserves_ref_session_atomicity() {
     fsck_full(&cell, &root);
 
     let mut open = authenticated(&cell, &root);
-    open.arg("session")
-        .arg("open")
-        .arg("--from=heads/hot");
+    open.arg("session").arg("open").arg("--from=heads/hot");
     let ns = run(&mut open).trim().to_string();
 
     // Retarget the session root mount to the shared ref. checkin now performs a
