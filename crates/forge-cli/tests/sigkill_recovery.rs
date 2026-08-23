@@ -98,9 +98,9 @@ fn wait_for_active_publication(child: &mut Child, forge_root: &Path) -> bool {
 fn spawn_active_bench(cell: &Path) -> Child {
     let mut bench = forge();
     bench
-        .arg("--dir")
-        .arg(cell)
         .arg("bench")
+        .arg("--scratch")
+        .arg(cell)
         .arg("--agents")
         .arg("256")
         .arg("--shared")
