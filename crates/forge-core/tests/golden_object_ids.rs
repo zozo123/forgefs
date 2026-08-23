@@ -30,10 +30,9 @@ fn v1_object_ids_are_userspace_abi() {
         contrib: Some(ObjectId([0x55; 32])),
         ..commit.clone()
     };
-    let commit_with_contribution_bytes = hex_decode(
-        include_str!("../../../testdata/canonical/commit_with_contribution.hex").trim(),
-    )
-    .unwrap();
+    let commit_with_contribution_bytes =
+        hex_decode(include_str!("../../../testdata/canonical/commit_with_contribution.hex").trim())
+            .unwrap();
     assert_eq!(
         commit_with_contribution.encode(),
         commit_with_contribution_bytes
