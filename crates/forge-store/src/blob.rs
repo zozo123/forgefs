@@ -1,8 +1,11 @@
 use forge_core::hash_bytes;
 use forge_types::{Error, ObjectId, Result};
+use lru::LruCache;
+use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -11,6 +14,8 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
+const DURABLE_DIR_CACHE_CAPACITY: usize = 65_536;
+const DURABLE_OID_CACHE_CAPACITY: usize = 65_536;
 
 /// Monotonic process-local counters for physical durability work.
 /// `puts` counts newly published OIDs; dedup hits do not increment it.
@@ -32,6 +37,12 @@ struct BlobStoreCounters {
 pub struct LocalBlobStore {
     root: PathBuf,
     stats: Arc<BlobStoreCounters>,
+    // Positive durability proofs only. A directory is inserted after its
+    // parent barrier succeeds; an OID is inserted only after the batch's leaf
+    // barrier succeeds. Both caches are deliberately cold on every Store open
+    // so a new process re-proves state left visible by a crashed peer.
+    durable_dirs: Arc<Mutex<LruCache<PathBuf, ()>>>,
+    durable_oids: Arc<Mutex<LruCache<ObjectId, ()>>>,
 }
 
 /// Checkin-scoped durable publication. Every object is file-fsynced before its
@@ -41,18 +52,30 @@ pub struct LocalBlobStore {
 pub struct PublishBatch<'a> {
     store: &'a LocalBlobStore,
     dirs: BTreeSet<PathBuf>,
+    oids: BTreeSet<ObjectId>,
     new_puts: u64,
 }
 
 impl LocalBlobStore {
     pub fn new(root: PathBuf) -> Result<Self> {
         let stats = Arc::new(BlobStoreCounters::default());
+        let durable_dirs = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DURABLE_DIR_CACHE_CAPACITY).expect("non-zero directory cache"),
+        )));
+        let durable_oids = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DURABLE_OID_CACHE_CAPACITY).expect("non-zero OID cache"),
+        )));
         let objects = root.join("objects");
         let tmp = root.join("tmp");
-        ensure_dir_durable(&root, &objects, &stats)?;
-        ensure_dir_durable(&root, &tmp, &stats)?;
+        ensure_dir_durable(&root, &objects, &stats, &durable_dirs)?;
+        ensure_dir_durable(&root, &tmp, &stats, &durable_dirs)?;
         cleanup_stale_tmp(&tmp, &stats)?;
-        Ok(Self { root, stats })
+        Ok(Self {
+            root,
+            stats,
+            durable_dirs,
+            durable_oids,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -68,6 +91,7 @@ impl LocalBlobStore {
         PublishBatch {
             store: self,
             dirs: BTreeSet::new(),
+            oids: BTreeSet::new(),
             new_puts: 0,
         }
     }
@@ -87,6 +111,27 @@ impl LocalBlobStore {
             )));
         }
         Ok(())
+    }
+
+    fn verify_and_sync_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
+        // Operate on one descriptor so the bytes verified are the bytes forced.
+        // Opening writable is intentional: macOS F_FULLFSYNC is a fail-closed
+        // durability contract, not a best-effort read hint.
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if hash_bytes(&bytes) != id {
+            return Err(Error::Corrupt(format!(
+                "existing object does not match its id: {id}"
+            )));
+        }
+        crate::durable_sync_file(&file)?;
+        self.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn oid_is_durable(&self, id: ObjectId) -> bool {
+        self.durable_oids.lock().get(&id).is_some()
     }
 
     pub fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
@@ -115,38 +160,73 @@ impl PublishBatch<'_> {
     pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
         let id = hash_bytes(bytes);
         let dest = self.store.object_path(id);
-        if dest.exists() {
-            self.store.verify_existing(id, &dest)?;
-            return Ok(id);
-        }
-
         let (a, b) = id.shard_dirs();
         let objects = self.store.root.join("objects");
         let shard_a = objects.join(a);
         let shard_b = shard_a.join(b);
-        ensure_dir_durable(&objects, &shard_a, &self.store.stats)?;
-        ensure_dir_durable(&shard_a, &shard_b, &self.store.stats)?;
+
+        // Prove the complete pathname before trusting either an existing link
+        // or a link we are about to publish. A cold Store cannot inherit a
+        // crashed or older VERSION=1 process's unforced shard ancestors.
+        ensure_dir_durable(
+            &objects,
+            &shard_a,
+            &self.store.stats,
+            &self.store.durable_dirs,
+        )?;
+        ensure_dir_durable(
+            &shard_a,
+            &shard_b,
+            &self.store.stats,
+            &self.store.durable_dirs,
+        )?;
+
+        if dest.exists() {
+            if self.store.oid_is_durable(id) {
+                // Rehash at every trust boundary even when a process-local
+                // durability proof lets us avoid another physical barrier.
+                self.store.verify_existing(id, &dest)?;
+                return Ok(id);
+            }
+            self.store.verify_and_sync_existing(id, &dest)?;
+            // The visible link may have been published by another batch that
+            // has not yet synced this directory, or by a legacy process whose
+            // file/ancestor barriers were weaker. Reproduce the entire proof
+            // before allowing our caller to publish metadata that names it.
+            self.dirs.insert(shard_b);
+            self.oids.insert(id);
+            return Ok(id);
+        }
 
         let tmp_dir = self.store.root.join("tmp");
-        ensure_dir_durable(&self.store.root, &tmp_dir, &self.store.stats)?;
         let tmp = tmp_dir.join(ulid::Ulid::new().to_string());
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
-            f.sync_all()?;
+            crate::durable_sync_file(&f)?;
             self.store.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
         }
 
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
                 self.dirs.insert(shard_b);
+                self.oids.insert(id);
                 self.new_puts += 1;
                 let _ = fs::remove_file(&tmp);
                 Ok(id)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() => {
                 let _ = fs::remove_file(&tmp);
-                self.store.verify_existing(id, &dest)?;
+                if !self.store.oid_is_durable(id) {
+                    self.store.verify_and_sync_existing(id, &dest)?;
+                    self.dirs.insert(shard_b);
+                    self.oids.insert(id);
+                } else {
+                    self.store.verify_existing(id, &dest)?;
+                }
+                // Another publisher won after our existence check. Its file
+                // and directory barriers may still be pending, so this batch
+                // joins the proof unless another completed batch cached it.
                 Ok(id)
             }
             Err(e) => {
@@ -159,6 +239,14 @@ impl PublishBatch<'_> {
     pub fn finish(self) -> Result<()> {
         for dir in &self.dirs {
             sync_dir_counted(dir, &self.store.stats)?;
+        }
+        // This is the sole OID-proof publication point. A dropped or failed
+        // batch never teaches later callers that its visible links are durable.
+        {
+            let mut durable_oids = self.store.durable_oids.lock();
+            for id in self.oids {
+                durable_oids.put(id, ());
+            }
         }
         self.store
             .stats
@@ -174,12 +262,33 @@ impl crate::Store {
     }
 }
 
-fn ensure_dir_durable(parent: &Path, child: &Path, stats: &BlobStoreCounters) -> Result<()> {
-    match fs::create_dir(child) {
-        Ok(()) => sync_dir_counted(parent, stats),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(Error::Io(e.to_string())),
+fn ensure_dir_durable(
+    parent: &Path,
+    child: &Path,
+    stats: &BlobStoreCounters,
+    durable_dirs: &Mutex<LruCache<PathBuf, ()>>,
+) -> Result<()> {
+    if durable_dirs.lock().get(child).is_some() {
+        return Ok(());
     }
+    match fs::create_dir(child) {
+        Ok(()) => {}
+        // Existence is not proof that another process durably published the
+        // directory entry. Reproduce the parent barrier before depending on it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(child)?;
+            if !metadata.file_type().is_dir() {
+                return Err(Error::Invalid(format!(
+                    "object-store path is not a directory: {}",
+                    child.display()
+                )));
+            }
+        }
+        Err(e) => return Err(Error::Io(e.to_string())),
+    }
+    sync_dir_counted(parent, stats)?;
+    durable_dirs.lock().put(child.to_path_buf(), ());
+    Ok(())
 }
 
 /// Reclaim only crash debris old enough that it cannot plausibly be an active
@@ -219,7 +328,7 @@ fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {
 }
 
 fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {
-    fs::File::open(path)?.sync_all()?;
+    crate::durable_sync_dir(path)?;
     stats.fsync_dir.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -297,8 +406,80 @@ mod tests {
         assert_eq!(after.fsync_file, before.fsync_file + 1);
         assert!(after.fsync_dir > before.fsync_dir);
         s.put(b"measured").unwrap();
-        assert_eq!(s.stats(), after);
+        let after_dedup = s.stats();
+        assert_eq!(after_dedup, after);
         assert_eq!(s.get(id).unwrap(), b"measured");
+    }
+
+    #[test]
+    fn existing_directory_reproduces_a_possible_crashed_creators_parent_barrier() {
+        let d = tempdir().unwrap();
+        let parent = d.path().join("parent");
+        let child = parent.join("visible-but-not-proven-durable");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&child).unwrap();
+        let stats = BlobStoreCounters::default();
+        let durable_dirs = Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap()));
+
+        ensure_dir_durable(&parent, &child, &stats, &durable_dirs).unwrap();
+
+        assert_eq!(stats.fsync_dir.load(Ordering::Relaxed), 1);
+        ensure_dir_durable(&parent, &child, &stats, &durable_dirs).unwrap();
+        assert_eq!(
+            stats.fsync_dir.load(Ordering::Relaxed),
+            1,
+            "a successful positive proof is reusable within one Store"
+        );
+    }
+
+    #[test]
+    fn dedup_batch_reproduces_an_unfinished_publishers_directory_barrier() {
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let mut first = s.begin_batch();
+        let id = first.put(b"race-safe durable object").unwrap();
+        let before = s.stats();
+
+        let mut second = s.begin_batch();
+        assert_eq!(second.put(b"race-safe durable object").unwrap(), id);
+        assert_eq!(s.stats(), before, "barrier is deferred to batch finish");
+
+        // Model the winning publisher dying after link(2) but before finish.
+        // The deduplicating batch must still make the shared directory entry
+        // durable before its caller is allowed to publish a ref.
+        drop(first);
+        second.finish().unwrap();
+        let after = s.stats();
+        assert_eq!(after.puts, before.puts);
+        assert_eq!(after.fsync_file, before.fsync_file + 1);
+        assert_eq!(after.fsync_dir, before.fsync_dir + 1);
+        assert_eq!(s.get(id).unwrap(), b"race-safe durable object");
+    }
+
+    #[test]
+    fn cold_store_dedup_reproves_file_and_full_path() {
+        let d = tempdir().unwrap();
+        let first = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let mut unfinished = first.begin_batch();
+        let id = unfinished.put(b"cross-process durability join").unwrap();
+
+        // A newly opened Store has no inherited proof cache. Model a second
+        // process joining the visible link after the first dies before finish.
+        let second = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let before = second.stats();
+        let mut joining = second.begin_batch();
+        assert_eq!(joining.put(b"cross-process durability join").unwrap(), id);
+        drop(unfinished);
+        joining.finish().unwrap();
+        let after = second.stats();
+
+        assert_eq!(after.puts, before.puts);
+        assert_eq!(after.fsync_file, before.fsync_file + 1);
+        assert_eq!(
+            after.fsync_dir,
+            before.fsync_dir + 3,
+            "objects->aa, aa->bb, and bb->OID must all be re-proved"
+        );
     }
 
     fn same_shard_pair() -> (Vec<u8>, Vec<u8>) {
@@ -346,6 +527,41 @@ mod tests {
         assert_eq!(batch_after.puts - batch_before.puts, 2);
         assert_eq!(batch_after.fsync_file - batch_before.fsync_file, 2);
         assert_eq!(serial_dirs, batch_dirs + 1);
+    }
+
+    #[test]
+    fn warm_same_shard_put_pays_only_the_new_leaf_barrier() {
+        let d = tempdir().unwrap();
+        let (a, b) = same_shard_pair();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        s.put(&a).unwrap();
+        let before = s.stats();
+
+        s.put(&b).unwrap();
+        let after = s.stats();
+
+        assert_eq!(after.puts, before.puts + 1);
+        assert_eq!(after.fsync_file, before.fsync_file + 1);
+        assert_eq!(after.fsync_dir, before.fsync_dir + 1);
+    }
+
+    #[test]
+    fn legacy_visible_object_reproves_uncached_ancestors() {
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let bytes = b"legacy visible object";
+        let id = hash_bytes(bytes);
+        let dest = s.object_path(id);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, bytes).unwrap();
+        let before = s.stats();
+
+        assert_eq!(s.put(bytes).unwrap(), id);
+        let after = s.stats();
+
+        assert_eq!(after.puts, before.puts);
+        assert_eq!(after.fsync_file, before.fsync_file + 1);
+        assert_eq!(after.fsync_dir, before.fsync_dir + 3);
     }
 
     #[test]

@@ -45,6 +45,21 @@ jobs:
       - name: Test MSRV
         run: cargo test --workspace --all-targets --locked
 
+  macos-durability:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-durability
+      - name: Test macOS full-durability path
+        run: cargo test --workspace --all-targets --locked
+
   e2e-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 20

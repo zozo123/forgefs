@@ -134,6 +134,24 @@ pub struct MetaStats {
     pub cas_denied: u64,
 }
 
+/// Effective SQLite settings that define the mutable catalog's durability
+/// contract. These are verified during open and retained for diagnostics so a
+/// benchmark can never compare runs with an implicit or weaker policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurabilityPolicy {
+    pub journal_mode: String,
+    pub synchronous: i64,
+    /// `None` means the platform does not support SQLite's macOS-only
+    /// `F_FULLFSYNC` path.
+    pub fullfsync: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointResult {
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+}
+
 #[derive(Debug, Default)]
 struct MetaCounters {
     txn_us: AtomicU64,
@@ -161,6 +179,7 @@ impl Drop for TxnTimer<'_> {
 pub struct Meta {
     write: Mutex<Connection>,
     stats: MetaCounters,
+    durability: DurabilityPolicy,
 }
 
 fn oid_from_blob(v: Vec<u8>) -> Result<ObjectId> {
@@ -294,6 +313,32 @@ impl Meta {
         }
     }
 
+    pub fn durability_policy(&self) -> &DurabilityPolicy {
+        &self.durability
+    }
+
+    /// Complete a truncating WAL checkpoint through the same connection whose
+    /// FULL durability policy was verified during `open`. SQLite reports a
+    /// busy checkpoint in the result row rather than as an execution error, so
+    /// treat partial completion as an explicit failure.
+    pub fn checkpoint_truncate(&self) -> Result<CheckpointResult> {
+        let conn = self.write.lock();
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| self.map_sql_counted(error))?;
+        if busy != 0 || checkpointed_frames < log_frames {
+            return Err(Error::Busy(format!(
+                "WAL checkpoint incomplete: busy={busy} log={log_frames} checkpointed={checkpointed_frames}"
+            )));
+        }
+        Ok(CheckpointResult {
+            log_frames,
+            checkpointed_frames,
+        })
+    }
+
     fn map_sql_counted(&self, error: rusqlite::Error) -> Error {
         let error = map_sql(error);
         if matches!(error, Error::Busy(_)) {
@@ -359,17 +404,24 @@ impl Meta {
                 "metadata durability requires synchronous=FULL(2), got {synchronous}"
             )));
         }
-        #[cfg(target_os = "macos")]
-        {
-            let fullfsync: i64 = conn
-                .pragma_query_value(None, "fullfsync", |row| row.get(0))
-                .map_err(map_sql)?;
-            if fullfsync != 1 {
-                return Err(Error::Corrupt(format!(
-                    "metadata durability requires fullfsync=ON on macOS, got {fullfsync}"
-                )));
+        let fullfsync = {
+            #[cfg(target_os = "macos")]
+            {
+                let fullfsync: i64 = conn
+                    .pragma_query_value(None, "fullfsync", |row| row.get(0))
+                    .map_err(map_sql)?;
+                if fullfsync != 1 {
+                    return Err(Error::Corrupt(format!(
+                        "metadata durability requires fullfsync=ON on macOS, got {fullfsync}"
+                    )));
+                }
+                Some(true)
             }
-        }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        };
 
         migrate(&mut conn, version)?;
         conn.execute(
@@ -380,6 +432,11 @@ impl Meta {
         Ok(Self {
             write: Mutex::new(conn),
             stats: MetaCounters::default(),
+            durability: DurabilityPolicy {
+                journal_mode: journal_mode.to_ascii_lowercase(),
+                synchronous,
+                fullfsync,
+            },
         })
     }
 
@@ -1536,12 +1593,17 @@ mod durability_policy_tests {
             .unwrap();
         assert_eq!(mode.to_ascii_lowercase(), "wal");
         assert_eq!(synchronous, 2, "FULL is SQLite value 2");
+        assert_eq!(meta.durability_policy().journal_mode, "wal");
+        assert_eq!(meta.durability_policy().synchronous, 2);
         #[cfg(target_os = "macos")]
         {
             let fullfsync: i64 = conn
                 .pragma_query_value(None, "fullfsync", |row| row.get(0))
                 .unwrap();
             assert_eq!(fullfsync, 1);
+            assert_eq!(meta.durability_policy().fullfsync, Some(true));
         }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(meta.durability_policy().fullfsync, None);
     }
 }

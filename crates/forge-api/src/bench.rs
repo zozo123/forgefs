@@ -11,7 +11,7 @@
 
 use crate::{ApiStats, Forge};
 use forge_cap::Cap;
-use forge_store::{blob::BlobStoreStats, MetaStats};
+use forge_store::{blob::BlobStoreStats, DurabilityPolicy, MetaStats};
 use forge_types::{CasResult, Error, Result};
 use std::sync::Arc;
 use std::thread;
@@ -67,6 +67,7 @@ pub struct BenchReport {
     pub shared: Option<(Percentiles, Duration, usize, usize)>,
     pub merge_seal: Option<Duration>,
     pub verify: Option<Duration>,
+    pub durability: Option<DurabilityPolicy>,
     pub store: Option<BlobStoreStats>,
     pub meta: Option<MetaStats>,
     pub api: Option<ApiStats>,
@@ -116,6 +117,17 @@ impl BenchReport {
         }
         if let Some(d) = self.verify {
             s.push_str(&format!("verify           wall={:.3}s\n", d.as_secs_f64()));
+        }
+        if let Some(policy) = &self.durability {
+            let fullfsync = match policy.fullfsync {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "n/a",
+            };
+            s.push_str(&format!(
+                "durability       journal_mode={} synchronous=FULL({}) fullfsync={}\n",
+                policy.journal_mode, policy.synchronous, fullfsync
+            ));
         }
         if let Some(stats) = self.store {
             s.push_str(&format!(
@@ -339,6 +351,7 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         shared: Some(shared_r),
         merge_seal: Some(merge_seal),
         verify: Some(verify),
+        durability: Some(forge.store.meta.durability_policy().clone()),
         store: Some(store),
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),

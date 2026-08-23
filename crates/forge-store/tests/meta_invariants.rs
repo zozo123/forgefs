@@ -1,6 +1,5 @@
 use forge_store::Meta;
 use forge_types::{Error, ObjectId};
-use rusqlite::Connection;
 use tempfile::tempdir;
 
 fn oid(n: u8) -> ObjectId {
@@ -39,12 +38,11 @@ fn committed_ref_survives_wal_checkpoint_and_reopen() {
     )
     .unwrap();
 
-    // Checkpoint through a separate connection while the ForgeFS metadata
-    // connection still exists. The committed ref must not depend on WAL shape.
-    Connection::open(&db)
-        .unwrap()
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .unwrap();
+    // Checkpoint through the connection whose durability policy ForgeFS
+    // verified. The method inspects SQLite's result row, where a busy/partial
+    // checkpoint is reported without necessarily raising an execution error.
+    let checkpoint = meta.checkpoint_truncate().unwrap();
+    assert_eq!(checkpoint.log_frames, checkpoint.checkpointed_frames);
     drop(meta);
 
     let reopened = Meta::open(&db).unwrap();
