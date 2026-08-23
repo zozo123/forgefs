@@ -469,6 +469,33 @@ impl Forge {
             .collect())
     }
 
+    /// The tree a session actually sees through one of its mounts.
+    ///
+    /// I8 pins a session to one base OID, so a read through a read-write
+    /// `ref:` mount must come from that base and never from the live ref,
+    /// which other agents can move. Reading the live ref recorded an
+    /// observation that `check_observations` then compared against the pinned
+    /// tree, so the two could never agree: the session failed checkin with
+    /// StaleObservation forever, no re-read or re-mount could clear it, and its
+    /// staged work was published to no ref at all -- unlike the pure-writer
+    /// path, which forks and preserves it.
+    ///
+    /// Foreign read-only mounts deliberately stay live. That is what makes
+    /// cross-mount stale detection work, and `check_observations` validates
+    /// those against the live tree to match.
+    ///
+    /// The default `/` mount is `ref:<live_ref>` on the session's own private
+    /// ref, and `checkin` re-pins the session as it advances, so serving reads
+    /// from the pin is also correct for the ordinary private-workspace case.
+    fn session_mount_tree(&self, nsrow: &forge_store::NsRow, m: &Mount) -> Result<ObjectId> {
+        if m.mode == Mode::Rw && matches!(parse_spec(&m.spec)?, Spec::Ref(_)) {
+            if let Some(pin) = nsrow.pinned_oid {
+                return Ok(self.store.get_commit(pin)?.tree);
+            }
+        }
+        self.mount_tree(&m.spec)
+    }
+
     fn mount_tree(&self, spec: &str) -> Result<ObjectId> {
         let oid = self.resolve_spec_oid(spec)?;
         match self.store.object_type(oid)? {
@@ -485,12 +512,12 @@ impl Forge {
         ns: &str,
         path: &str,
     ) -> Result<Vec<(String, String, String, bool)>> {
-        self.require_ns(cap, ns)?;
+        let nsrow = self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         self.check_spec_read(cap, &m.spec)?;
         let rel = rel_of(&m.path, path)?;
-        let tree = self.mount_tree(&m.spec)?;
+        let tree = self.session_mount_tree(&nsrow, m)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
         let ents = ns_ls(&self.store, &ov, tree, &rel)?;
         Ok(ents
@@ -510,12 +537,12 @@ impl Forge {
     }
 
     pub fn read(&self, cap: &Cap, ns: &str, path: &str) -> Result<Vec<u8>> {
-        self.require_ns(cap, ns)?;
+        let nsrow = self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         self.check_spec_read(cap, &m.spec)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
-        let tree = self.mount_tree(&m.spec)?;
+        let tree = self.session_mount_tree(&nsrow, m)?;
         match resolve(&self.store, &mounts, &ov, tree, path)? {
             Resolved::Blob { id, .. } => {
                 let rel = rel_of(&m.path, path)?;
