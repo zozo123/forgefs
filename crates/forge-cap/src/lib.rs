@@ -127,6 +127,13 @@ impl Cap {
     pub fn agent_id(&self) -> &str {
         self.agent.as_deref().unwrap_or("anon")
     }
+
+    /// Whether a raw object ID can be authorized without a reference name.
+    /// Any positive, operation-specific, or negative ref caveat makes the
+    /// scope name-dependent, so an OID cannot safely be checked against it.
+    pub fn has_unrestricted_ref_scope(&self) -> bool {
+        self.ref_sets.is_empty() && self.op_ref_sets.is_empty() && self.ref_not.is_empty()
+    }
 }
 
 fn matches_any(globs: &[String], name: &str) -> bool {
@@ -500,6 +507,37 @@ mod tests {
         narrow.allows(Op::Read, Some("heads/alice/1"), 0).unwrap();
         assert!(narrow.allows(Op::Read, Some("heads/bob/1"), 0).is_err());
         assert!(narrow.allows(Op::Read, Some("main"), 0).is_err());
+    }
+
+    #[test]
+    fn raw_oid_scope_requires_no_ref_caveat_of_any_kind() {
+        let key = [10u8; 32];
+        let cases = [
+            (vec!["ops=read", "time<=100"], true),
+            (vec!["ops=read", "agent=reader"], true),
+            (vec!["ops=read", "ref=main"], false),
+            (vec!["ops=read", "allow=read:main"], false),
+            (vec!["ops=read", "ref!=main"], false),
+        ];
+
+        let unscoped = mint(&key, "forge", "unscoped", vec!["ops=read".into()]).unwrap();
+        assert!(unscoped.has_unrestricted_ref_scope());
+
+        for (caveats, expected) in cases {
+            let cap = mint(
+                &key,
+                "forge",
+                "scope-test",
+                caveats.into_iter().map(str::to_owned).collect(),
+            )
+            .unwrap();
+            assert_eq!(
+                cap.has_unrestricted_ref_scope(),
+                expected,
+                "caveats={:?}",
+                cap.caveats
+            );
+        }
     }
 
     #[test]
