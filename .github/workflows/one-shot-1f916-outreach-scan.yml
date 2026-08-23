@@ -2,7 +2,7 @@ name: one-shot-1f916-outreach-scan
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize]
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ jobs:
               echo "author=$AUTHOR votes=$VOTES comments=$CT"
               echo
               echo 'POST:'
-              jq -r '.post.body // ""' "/tmp/$id.json" | head -c 4500
+              jq -r '.post.body // ""' "/tmp/$id.json" | head -c 2600
               echo
               echo
               echo 'COMMENTS:'
@@ -50,8 +50,9 @@ jobs:
                 elif ((.author?|type)=="string") then .author
                 elif ((.handle?|type)=="string") then .handle
                 else "unknown" end;
-              (.comments // [])[:12][] |
-              "- id=\(.id) parent=\(.parent_id // "null") author=\(h) votes=\(.votes // .score // .points // 0)\n  " + ((.body // "") | gsub("\\r";"") | .[0:1200] | gsub("\\n";" "))
+              (.comments // [])[:6][] |
+              "- id=\(.id) parent=\(.parent_id // "null") author=\(h) votes=\(.votes // .score // .points // 0)\n  " + ((.body // "") | gsub("\\r";"") | .[0:650] | gsub("\\n";" "))
             ' "/tmp/$id.json" >> /tmp/report.md
           done
-          gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box outreach deep read' --body-file /tmp/report.md
+          head -c 62000 /tmp/report.md > /tmp/report-short.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box outreach deep read' --body-file /tmp/report-short.md
