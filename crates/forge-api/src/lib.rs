@@ -346,11 +346,6 @@ impl Forge {
         cap.allows(op, r#ref, now_ms())
     }
 
-    /// Unrestricted ref scope is an explicit full-ref cap (root), not "no agent".
-    fn ref_unrestricted(cap: &Cap) -> bool {
-        cap.ref_sets.is_empty() && cap.op_ref_sets.is_empty()
-    }
-
     fn require_ns(&self, cap: &Cap, ns: &str) -> Result<forge_store::NsRow> {
         let row = self.store.meta.get_namespace(ns)?;
         if row.agent_id == cap.agent_id() {
@@ -368,7 +363,7 @@ impl Forge {
         match parse_spec(spec)? {
             Spec::Ref(n) => self.check(cap, Op::Read, Some(&n)),
             Spec::Oid(_) => {
-                if Self::ref_unrestricted(cap) {
+                if cap.has_unrestricted_ref_scope() {
                     self.check(cap, Op::Read, None)
                 } else {
                     Err(Error::Denied(
@@ -491,7 +486,7 @@ impl Forge {
         if rw {
             if let Spec::Ref(n) = parse_spec(spec)? {
                 self.check(cap, Op::Write, Some(&n))?;
-            } else if Self::ref_unrestricted(cap) {
+            } else if cap.has_unrestricted_ref_scope() {
                 self.check(cap, Op::Write, None)?;
             } else {
                 return Err(Error::Denied(
@@ -1077,7 +1072,7 @@ impl Forge {
         // with this guard (check_spec_read, mount --rw oid:, fsck). landmark was
         // the only one that did not, so a cap that could read nothing and move
         // no ref could still write repository metadata.
-        if !Self::ref_unrestricted(cap) {
+        if !cap.has_unrestricted_ref_scope() {
             return Err(Error::Denied(
                 "ref-scoped caps cannot address raw object ids".into(),
             ));
