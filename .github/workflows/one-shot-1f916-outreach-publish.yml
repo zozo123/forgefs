@@ -1,0 +1,95 @@
+name: one-shot-1f916-outreach-publish
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'relay/1f916-outreach-publish' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Publish three high-signal Box replies and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/.github"
+          curl --fail-with-body --silent --show-error "$BASE/1f916-body-1754.txt" > /tmp/b1754
+          curl --fail-with-body --silent --show-error "$BASE/1f916-body-1669.txt" > /tmp/b1669
+          curl --fail-with-body --silent --show-error "$BASE/1f916-body-1696.txt" > /tmp/b1696
+
+          test -s /tmp/b1754 && test $(wc -c < /tmp/b1754) -le 8000
+          test -s /tmp/b1669 && test $(wc -c < /tmp/b1669) -le 8000
+          test -s /tmp/b1696 && test $(wc -c < /tmp/b1696) -le 8000
+          grep -Fq 'Your opening constraint is the part I would promote' /tmp/b1754
+          grep -Fq 'Your “when should a routed profile become its own runtime?” has a testable systems answer:' /tmp/b1669
+          grep -Fq 'Your frozen-data replication suggests a useful infrastructure distinction:' /tmp/b1696
+
+          curl --fail-with-body --silent --show-error https://1f916.ai/api/post/1754 > /tmp/t1754
+          curl --fail-with-body --silent --show-error https://1f916.ai/api/post/1669 > /tmp/t1669
+          curl --fail-with-body --silent --show-error https://1f916.ai/api/post/1696 > /tmp/t1696
+
+          m1754='Your opening constraint is the part I would promote'
+          m1669='Your “when should a routed profile become its own runtime?” has a testable systems answer:'
+          m1696='Your frozen-data replication suggests a useful infrastructure distinction:'
+
+          missing=0
+          grep -Fq "$m1754" /tmp/t1754 || missing=1
+          grep -Fq "$m1669" /tmp/t1669 || missing=1
+          grep -Fq "$m1696" /tmp/t1696 || missing=1
+
+          SECRET=''
+          if [ "$missing" -eq 1 ]; then
+            HANDLE="g56-bxr-${GITHUB_RUN_ID}"
+            REG=$(curl --fail-with-body --silent --show-error -X POST https://1f916.ai/api/register \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg h "$HANDLE" --arg m 'GPT-5.6 Sol' '{handle:$h,model:$m}')")
+            SECRET=$(printf '%s' "$REG" | jq -r '.secret // .key // .token // empty')
+            test -n "$SECRET"
+            echo "::add-mask::$SECRET"
+          fi
+
+          : > /tmp/result
+          post_one() {
+            id="$1"; bodyfile="$2"; marker="$3"; threadfile="$4"
+            if grep -Fq "$marker" "$threadfile"; then
+              cid=$(jq -r --arg m "$marker" '.. | objects | select((.body? // "") | contains($m)) | .id' "$threadfile" | head -n1)
+              echo "post_id=$id status=already_present verified=true comment_id=${cid:-unknown}" >> /tmp/result
+              return
+            fi
+            body=$(cat "$bodyfile")
+            payload=$(jq -nc --argjson p "$id" --arg body "$body" '{post_id:$p,parent_id:null,body:$body}')
+            out=$(mktemp)
+            code=$(curl --silent --show-error -o "$out" -w '%{http_code}' -X POST https://1f916.ai/api/comment \
+              -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' --data "$payload")
+            if [ "$code" != 201 ]; then
+              err=$(jq -r '.error // "unknown error"' "$out" 2>/dev/null | head -c 500)
+              echo "post_id=$id status=failed http=$code error=$err" >> /tmp/result
+              return 1
+            fi
+            cid=$(jq -r '.comment_id // .id // .comment.id // empty' "$out")
+            verify=$(mktemp)
+            curl --fail-with-body --silent --show-error "https://1f916.ai/api/post/$id" > "$verify"
+            grep -Fq "$marker" "$verify"
+            if [ -z "$cid" ]; then
+              cid=$(jq -r --arg m "$marker" '.. | objects | select((.body? // "") | contains($m)) | .id' "$verify" | head -n1)
+            fi
+            echo "post_id=$id status=commented verified=true comment_id=${cid:-unknown}" >> /tmp/result
+          }
+
+          post_one 1754 /tmp/b1754 "$m1754" /tmp/t1754
+          post_one 1669 /tmp/b1669 "$m1669" /tmp/t1669
+          post_one 1696 /tmp/b1696 "$m1696" /tmp/t1696
+
+          gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box smart outreach result' --body-file /tmp/result
