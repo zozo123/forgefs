@@ -2,7 +2,7 @@ use crate::metrics::TimingCounter;
 use forge_core::now_ms;
 use forge_types::{CasResult, Error, ObjectId, RefRow, Result};
 use parking_lot::{Mutex, MutexGuard};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -165,6 +165,12 @@ pub struct DurabilityPolicy {
     /// `None` means the platform does not support SQLite's macOS-only
     /// `F_FULLFSYNC` path.
     pub fullfsync: Option<bool>,
+    /// True when this policy was only *observed* on a read-only open. Nothing
+    /// was established or enforced: `journal_mode` is the on-disk mode, while
+    /// `synchronous` has no on-disk representation at all and is this
+    /// connection's effective value. A read-only catalog acknowledges no
+    /// write, so it carries no durability contract to report.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +239,7 @@ pub struct Meta {
     write: TimedMutex<Connection>,
     stats: MetaCounters,
     durability: DurabilityPolicy,
+    read_only: bool,
 }
 
 fn oid_from_blob(v: Vec<u8>) -> Result<ObjectId> {
@@ -256,10 +263,130 @@ fn map_sql(e: rusqlite::Error) -> Error {
         return match inner.code {
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Error::Busy(text),
             ErrorCode::ConstraintViolation => Error::Invalid(text),
+            // A read-only open sets `query_only`, so SQLite itself refuses every
+            // write on that connection. Report the refusal as denied authority
+            // (exit 1) rather than as an internal SQLite fault (exit 5): the
+            // caller asked a read-only handle to mutate the repository.
+            ErrorCode::ReadOnly => Error::Denied(format!(
+                "repository is open read-only; this operation writes metadata: {text}"
+            )),
             _ => Error::Sqlite(text),
         };
     }
     Error::Sqlite(e.to_string())
+}
+
+/// Open a connection that cannot write, and prove it works before returning.
+///
+/// `SQLITE_OPEN_READONLY` never creates the file; `query_only` additionally
+/// refuses writes to temp and attached databases, so every stray write path
+/// fails as SQLITE_READONLY (`Error::Denied`) instead of reaching the media.
+/// The probe query forces SQLite to open the database -- and in WAL mode its
+/// shared-memory index -- now, while the failure can still be classified,
+/// rather than inside some later unrelated query.
+fn connect_read_only(path: &Path) -> std::result::Result<Connection, rusqlite::Error> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.pragma_update(None, "busy_timeout", 5000i64)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(conn)
+}
+
+fn cannot_open(error: &rusqlite::Error) -> bool {
+    use rusqlite::ffi::ErrorCode;
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::CannotOpen | ErrorCode::ReadOnly)
+    )
+}
+
+/// True when the filesystem holding `path` is mounted read-only. `statvfs`
+/// answers this without writing, which a probe file could not.
+#[cfg(unix)]
+fn media_is_read_only(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a NUL-terminated C string and `buf` is a valid,
+    // properly aligned allocation that `statvfs` fills in on success. Nothing
+    // borrowed here escapes the call.
+    unsafe {
+        if libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return false;
+        }
+        buf.assume_init().f_flag & libc::ST_RDONLY != 0
+    }
+}
+
+#[cfg(not(unix))]
+fn media_is_read_only(_path: &Path) -> bool {
+    false
+}
+
+/// SQLite URI filenames are percent-decoded and `?`/`#` delimit the query, so
+/// every byte outside the unreserved set must be escaped.
+fn sqlite_uri(path: &Path, query: &str) -> Result<String> {
+    let text = path.to_str().ok_or_else(|| {
+        Error::Invalid(format!(
+            "metadata path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    let mut uri = String::from("file:");
+    for byte in text.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(char::from(*byte));
+            }
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    uri.push('?');
+    uri.push_str(query);
+    Ok(uri)
+}
+
+/// A writable open on read-only media fails deep inside SQLite as
+/// "unable to open database file", which is neither actionable nor an internal
+/// fault. Name the actual cause, and classify it as denied authority (exit 1)
+/// rather than as an internal SQLite failure (exit 5).
+fn explain_read_only_media(path: &Path, error: Error) -> Error {
+    if matches!(error, Error::Sqlite(_) | Error::Io(_) | Error::Denied(_))
+        && media_is_read_only(path)
+    {
+        return Error::Denied(format!(
+            "{} is on read-only media; opening a ForgeFS repository for writing needs writable media (`forge fsck` and `forge verify` run read-only)",
+            path.display()
+        ));
+    }
+    error
+}
+
+/// A read-only SQLite open fails with SQLITE_CANTOPEN when the catalog is
+/// missing, and with SQLITE_CANTOPEN/SQLITE_READONLY_CANTINIT when a WAL
+/// database still holds unrecovered frames and no shared-memory index can be
+/// created on read-only media. Neither is an internal fault, so neither may
+/// surface as the exit-5 `Sqlite` class.
+fn map_read_only_open(path: &Path, e: rusqlite::Error) -> Error {
+    use rusqlite::ffi::ErrorCode;
+    if let rusqlite::Error::SqliteFailure(inner, _) = &e {
+        if matches!(inner.code, ErrorCode::CannotOpen | ErrorCode::ReadOnly) {
+            return Error::Invalid(format!(
+                "cannot open {} read-only; either it is missing or a pending write-ahead log needs recovery on writable media first",
+                path.display()
+            ));
+        }
+    }
+    map_sql(e)
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
@@ -393,6 +520,13 @@ impl Meta {
         &self.durability
     }
 
+    /// True when this catalog was opened read-only. Every write path is
+    /// refused by SQLite itself (`query_only`), so this is a diagnostic, not
+    /// the enforcement point.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Complete a truncating WAL checkpoint through the same connection whose
     /// FULL durability policy was verified during `open`. SQLite reports a
     /// busy checkpoint in the result row rather than as an execution error, so
@@ -436,24 +570,69 @@ impl Meta {
         }
     }
 
-    pub fn open(path: &Path) -> Result<Self> {
-        let mut conn = Connection::open(path).map_err(map_sql)?;
-
-        // Connection-scoped only: preserve the normal five-second contention
-        // policy without changing an incompatible database on disk.
+    /// Connection-scoped settings that no read-only open needs to avoid: none
+    /// of them writes to the database file or its directory.
+    fn configure_connection(conn: &Connection) -> Result<()> {
+        // Preserve the normal five-second contention policy without changing
+        // an incompatible database on disk.
         conn.pragma_update(None, "busy_timeout", 5000i64)
             .map_err(map_sql)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(map_sql)?;
+        Ok(())
+    }
 
-        // Compatibility checks are read-only. Do not mutate a repository that
-        // this binary has already determined it cannot understand.
-        let version = schema_version(&conn)?;
+    /// Compatibility checks are read-only. Do not mutate a repository that
+    /// this binary has already determined it cannot understand.
+    fn compatible_schema_version(conn: &Connection) -> Result<i64> {
+        let version = schema_version(conn)?;
         if version > CURRENT_SCHEMA_VERSION {
             return Err(Error::Invalid(format!(
                 "metadata schema version {version} is newer than supported {CURRENT_SCHEMA_VERSION}"
             )));
         }
+        Ok(version)
+    }
+
+    /// Report the settings actually in force. `read_only` marks the policy as
+    /// observed rather than established, so a read-only open can never claim
+    /// a WAL/FULL contract it did not set.
+    fn observe_durability(conn: &Connection, read_only: bool) -> Result<DurabilityPolicy> {
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(map_sql)?;
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .map_err(map_sql)?;
+        let fullfsync = {
+            #[cfg(target_os = "macos")]
+            {
+                let fullfsync: i64 = conn
+                    .pragma_query_value(None, "fullfsync", |row| row.get(0))
+                    .map_err(map_sql)?;
+                Some(fullfsync == 1)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        };
+        Ok(DurabilityPolicy {
+            journal_mode: journal_mode.to_ascii_lowercase(),
+            synchronous,
+            fullfsync,
+            read_only,
+        })
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::open_writable(path).map_err(|error| explain_read_only_media(path, error))
+    }
+
+    fn open_writable(path: &Path) -> Result<Self> {
+        let mut conn = Connection::open(path).map_err(map_sql)?;
+        Self::configure_connection(&conn)?;
+        let version = Self::compatible_schema_version(&conn)?;
 
         // Once compatible, establish the persistent durability contract before
         // any schema migration or metadata write.
@@ -465,40 +644,25 @@ impl Meta {
         conn.pragma_update(None, "fullfsync", "ON")
             .map_err(map_sql)?;
 
-        let journal_mode: String = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .map_err(map_sql)?;
-        if !journal_mode.eq_ignore_ascii_case("wal") {
+        let durability = Self::observe_durability(&conn, false)?;
+        if !durability.journal_mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Corrupt(format!(
-                "metadata durability requires journal_mode=WAL, got {journal_mode}"
+                "metadata durability requires journal_mode=WAL, got {}",
+                durability.journal_mode
             )));
         }
-        let synchronous: i64 = conn
-            .pragma_query_value(None, "synchronous", |row| row.get(0))
-            .map_err(map_sql)?;
-        if synchronous != 2 {
+        if durability.synchronous != 2 {
             return Err(Error::Corrupt(format!(
-                "metadata durability requires synchronous=FULL(2), got {synchronous}"
+                "metadata durability requires synchronous=FULL(2), got {}",
+                durability.synchronous
             )));
         }
-        let fullfsync = {
-            #[cfg(target_os = "macos")]
-            {
-                let fullfsync: i64 = conn
-                    .pragma_query_value(None, "fullfsync", |row| row.get(0))
-                    .map_err(map_sql)?;
-                if fullfsync != 1 {
-                    return Err(Error::Corrupt(format!(
-                        "metadata durability requires fullfsync=ON on macOS, got {fullfsync}"
-                    )));
-                }
-                Some(true)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                None
-            }
-        };
+        #[cfg(target_os = "macos")]
+        if durability.fullfsync != Some(true) {
+            return Err(Error::Corrupt(
+                "metadata durability requires fullfsync=ON on macOS".into(),
+            ));
+        }
 
         migrate(&mut conn, version)?;
         conn.execute(
@@ -509,11 +673,50 @@ impl Meta {
         Ok(Self {
             write: TimedMutex::new(conn),
             stats: MetaCounters::default(),
-            durability: DurabilityPolicy {
-                journal_mode: journal_mode.to_ascii_lowercase(),
-                synchronous,
-                fullfsync,
-            },
+            durability,
+            read_only: false,
+        })
+    }
+
+    /// Open the catalog without writing to it, to its journal, or to its
+    /// directory: `SQLITE_OPEN_READONLY` (never `CREATE`), `query_only=1`, no
+    /// durability pragma writes, no migration, and no `cap_root` scrub. This
+    /// is the only open that works when the media itself is read-only.
+    ///
+    /// The durability pragmas are read and reported exactly as found. A
+    /// read-only handle establishes no contract, so it must not fake one.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = match connect_read_only(path) {
+            Ok(conn) => conn,
+            // A WAL database is unreadable without its shared-memory index, and
+            // read-only media cannot host one, so an ordinary read-only open of
+            // a WAL catalog on such media fails with SQLITE_CANTOPEN.
+            // `immutable=1` makes SQLite skip locking and the -shm entirely. It
+            // asserts the file cannot change underneath this connection, which
+            // is exactly what a read-only mount guarantees -- so it is used
+            // only after confirming that mount, never as a blanket assumption.
+            Err(error) if cannot_open(&error) && media_is_read_only(path) => {
+                let uri = sqlite_uri(path, "immutable=1")?;
+                connect_read_only(Path::new(&uri))
+                    .map_err(|error| map_read_only_open(path, error))?
+            }
+            Err(error) => return Err(map_read_only_open(path, error)),
+        };
+
+        let version = Self::compatible_schema_version(&conn)?;
+        if version < CURRENT_SCHEMA_VERSION {
+            // Migration is a write. Say so, instead of failing later inside an
+            // arbitrary query against a column this schema does not have.
+            return Err(Error::Invalid(format!(
+                "metadata schema version {version} needs migration to {CURRENT_SCHEMA_VERSION}, which a read-only open cannot perform"
+            )));
+        }
+        let durability = Self::observe_durability(&conn, true)?;
+        Ok(Self {
+            write: TimedMutex::new(conn),
+            stats: MetaCounters::default(),
+            durability,
+            read_only: true,
         })
     }
 
@@ -1673,6 +1876,50 @@ mod tests {
 mod durability_policy_tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A read-only open must read the catalog, refuse every write with a clear
+    /// denial, and report the durability policy it *found* rather than the
+    /// WAL/FULL contract it never established.
+    #[test]
+    fn read_only_open_reads_refuses_writes_and_reports_observed_policy() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("meta.sqlite");
+        {
+            let writable = Meta::open(&path).unwrap();
+            writable.set_cap_root(b"0123456789abcdef").unwrap();
+            assert!(!writable.read_only());
+            assert!(!writable.durability_policy().read_only);
+        }
+
+        let ro = Meta::open_read_only(&path).unwrap();
+        assert!(ro.read_only());
+        assert_eq!(ro.get_seal_pub().unwrap(), b"0123456789abcdef".to_vec());
+        // journal_mode is persisted in the database header, so it is honest to
+        // report it; the policy is flagged as observed, not established.
+        assert_eq!(ro.durability_policy().journal_mode, "wal");
+        assert!(ro.durability_policy().read_only);
+
+        let denied = ro
+            .set_cap_root(b"fedcba9876543210")
+            .expect_err("query_only must refuse a metadata write");
+        assert!(matches!(denied, Error::Denied(_)), "{denied}");
+    }
+
+    /// `SQLITE_OPEN_READONLY` never creates the catalog, and the failure is
+    /// classified as input (exit 1), never as an internal SQLite fault.
+    #[test]
+    fn read_only_open_never_creates_the_catalog() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("absent.sqlite");
+        let Err(error) = Meta::open_read_only(&path) else {
+            panic!("a read-only open must not create the database");
+        };
+        assert!(matches!(error, Error::Invalid(_)), "{error}");
+        assert!(
+            !path.exists(),
+            "a read-only open must not create meta.sqlite"
+        );
+    }
 
     #[test]
     fn open_enforces_catalog_durability_pragmas() {

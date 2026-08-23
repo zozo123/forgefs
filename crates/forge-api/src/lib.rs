@@ -66,8 +66,10 @@ pub struct Forge {
     root: PathBuf,
     stats: ApiCounters,
     // Shared for direct clients, exclusive for the daemon. The descriptor lifetime is the lock.
-    _cell_lock: File,
+    // `None` only for a read-only open whose media refused to hand out a LOCK descriptor.
+    _cell_lock: Option<File>,
     exclusive_cell_lock: bool,
+    read_only: bool,
 }
 
 impl Forge {
@@ -106,7 +108,7 @@ impl Forge {
         fs::create_dir(&staging)?;
         init_crash_point("staging-created");
 
-        let prepared = (|| -> Result<File> {
+        let prepared = (|| -> Result<Option<File>> {
             secure_key_dir(&staging.join("keys"))?;
             fs::create_dir_all(staging.join("objects"))?;
             fs::create_dir_all(staging.join("tmp"))?;
@@ -172,7 +174,7 @@ impl Forge {
             // Acquire the direct-client shared ownership while LOCK is still in
             // staging. The descriptor keeps the same inode locked across rename,
             // eliminating the post-publication daemon race.
-            let cell_lock = acquire_cell_lock(&staging, false)?;
+            let cell_lock = acquire_cell_lock(&staging, LockIntent::Create)?;
             sync_dir(&staging)?;
             init_crash_point("staging-durable");
             Ok(cell_lock)
@@ -213,6 +215,25 @@ impl Forge {
         Self::open_with_lock(dir, false)
     }
 
+    /// Open a cell for the documented read-only commands (`fsck`, `verify`)
+    /// without writing a single byte: LOCK is opened `O_RDONLY` and never
+    /// created, SQLite is opened `SQLITE_OPEN_READONLY` with `query_only=1`,
+    /// no durability pragma is set, no migration runs, no `cap_root` scrub
+    /// runs, and no object/tmp directory is created or reclaimed. It is the
+    /// only open that works when the media itself is mounted read-only.
+    ///
+    /// The mode is selected explicitly by the caller rather than by sniffing
+    /// `EROFS`: auto-degrading would turn a writable-intent open on
+    /// accidentally read-only media into a handle that silently cannot commit,
+    /// and would make the guarantee depend on the medium instead of on the
+    /// command. Every write through this handle is refused with
+    /// `Error::Denied` at the store boundary.
+    pub fn open_read_only(dir: &Path) -> Result<Self> {
+        let root = find_forge(dir)?;
+        let cell_lock = acquire_cell_lock(&root, LockIntent::ReadOnly)?;
+        Self::open_locked_mode(root, cell_lock, false, true)
+    }
+
     /// Open a cell for `forge serve`. The exclusive lock is acquired before
     /// SQLite or object state is opened, so a daemon can never coexist with a
     /// direct client that holds the shared cell lock.
@@ -222,11 +243,25 @@ impl Forge {
 
     fn open_with_lock(dir: &Path, exclusive: bool) -> Result<Self> {
         let root = find_forge(dir)?;
-        let cell_lock = acquire_cell_lock(&root, exclusive)?;
+        let intent = if exclusive {
+            LockIntent::Exclusive
+        } else {
+            LockIntent::Shared
+        };
+        let cell_lock = acquire_cell_lock(&root, intent)?;
         Self::open_locked(root, cell_lock, exclusive)
     }
 
-    fn open_locked(root: PathBuf, cell_lock: File, exclusive: bool) -> Result<Self> {
+    fn open_locked(root: PathBuf, cell_lock: Option<File>, exclusive: bool) -> Result<Self> {
+        Self::open_locked_mode(root, cell_lock, exclusive, false)
+    }
+
+    fn open_locked_mode(
+        root: PathBuf,
+        cell_lock: Option<File>,
+        exclusive: bool,
+        read_only: bool,
+    ) -> Result<Self> {
         // Revalidate after acquiring ownership. An updater may replace the
         // repository between discovery's read-only check and this lock grant.
         // No key, object, or SQLite state may be read or mutated first.
@@ -234,13 +269,21 @@ impl Forge {
         // A previous initializer may have died after the no-replace rename but
         // before forcing this directory entry. Every cold open joins that
         // publication before exposing a handle that can acknowledge writes.
-        sync_repo_parent(&root)?;
+        // A read-only handle acknowledges no write and cannot take a durability
+        // barrier on read-only media, so it has nothing to join.
+        if !read_only {
+            sync_repo_parent(&root)?;
+        }
         validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
         let sk = SigningKey::from_bytes(&seal_seed);
         let seal_pk = sk.verifying_key().to_bytes();
-        let store = Store::open(&root)?;
+        let store = if read_only {
+            Store::open_read_only(&root)?
+        } else {
+            Store::open(&root)?
+        };
         let configured_pk = store.meta.get_seal_pub()?;
         if configured_pk != seal_pk.to_vec() {
             return Err(Error::Corrupt(
@@ -256,11 +299,19 @@ impl Forge {
             stats: ApiCounters::default(),
             _cell_lock: cell_lock,
             exclusive_cell_lock: exclusive,
+            read_only,
         })
     }
 
     pub(crate) fn has_exclusive_cell_lock(&self) -> bool {
         self.exclusive_cell_lock
+    }
+
+    /// True when this handle was opened read-only. Writes through it are
+    /// refused with `Error::Denied` by the object store and by SQLite's
+    /// `query_only`; this is a diagnostic, not the enforcement point.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn root(&self) -> &Path {
@@ -1424,15 +1475,75 @@ fn publish_noreplace(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
-fn acquire_cell_lock(root: &Path, exclusive: bool) -> Result<File> {
+/// Why a cell lock is being taken. The open mode of `.forge/LOCK` is part of
+/// the contract, not an incidental detail: `flock` needs neither write access
+/// nor an `O_CREAT`, so only an intent that may itself write the repository
+/// opens LOCK for writing or creates it. Anything stricter makes a repository
+/// on read-only media impossible to open at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LockIntent {
+    /// `Forge::init`: LOCK does not exist yet, so it must be created, then held
+    /// shared across publication.
+    Create,
+    /// A direct client that may write. Shared ownership of an existing LOCK.
+    Shared,
+    /// `forge serve`: exclusive ownership, excluding direct clients.
+    Exclusive,
+    /// `fsck`/`verify`: shared ownership, opened read-only, and tolerated when
+    /// the media refuses the open outright.
+    ReadOnly,
+}
+
+impl LockIntent {
+    fn exclusive(self) -> bool {
+        matches!(self, Self::Exclusive)
+    }
+
+    /// Only these may write to or create the LOCK file itself.
+    fn may_write_lock_file(self) -> bool {
+        matches!(self, Self::Create | Self::Exclusive)
+    }
+}
+
+/// Read-only media can refuse to hand out a descriptor for LOCK at all. `flock`
+/// is advisory and a read-only handle mutates nothing, so a reader continues
+/// unlocked rather than failing: refusing here is what made the documented
+/// read-only `fsck` and `verify` impossible on read-only media.
+fn lock_open_tolerable(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EROFS)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn acquire_cell_lock(root: &Path, intent: LockIntent) -> Result<Option<File>> {
     let path = root.join("LOCK");
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options.read(true);
+    if intent.may_write_lock_file() {
+        options.write(true).create(true).truncate(false);
+    }
     #[cfg(unix)]
     {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(&path)?;
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if intent == LockIntent::ReadOnly && lock_open_tolerable(&error) => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     #[cfg(unix)]
     {
@@ -1445,13 +1556,14 @@ fn acquire_cell_lock(root: &Path, exclusive: bool) -> Result<File> {
         }
     }
 
+    let exclusive = intent.exclusive();
     let result = if exclusive {
         file.try_lock()
     } else {
         file.try_lock_shared()
     };
     match result {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy(if exclusive {
             "forge cell is in use by a direct client or daemon".into()
         } else {
@@ -1731,15 +1843,15 @@ mod tests {
         let staging = d.path().join("staging");
         let root = d.path().join(".forge");
         fs::create_dir(&staging).unwrap();
-        let shared = acquire_cell_lock(&staging, false).unwrap();
+        let shared = acquire_cell_lock(&staging, LockIntent::Create).unwrap();
         publish_noreplace(&staging, &root).unwrap();
 
         assert!(matches!(
-            acquire_cell_lock(&root, true),
+            acquire_cell_lock(&root, LockIntent::Exclusive),
             Err(Error::Busy(_))
         ));
         drop(shared);
-        drop(acquire_cell_lock(&root, true).unwrap());
+        drop(acquire_cell_lock(&root, LockIntent::Exclusive).unwrap());
     }
 
     #[test]
@@ -1752,7 +1864,7 @@ mod tests {
         // Model discovery by an old binary, followed by an exclusive updater
         // publishing a newer format before the old binary acquires its lock.
         validate_repo_version(&root).unwrap();
-        let lock = acquire_cell_lock(&root, false).unwrap();
+        let lock = acquire_cell_lock(&root, LockIntent::Shared).unwrap();
         fs::write(root.join("VERSION"), b"2\n").unwrap();
 
         let error = Forge::open_locked(root, lock, false)
@@ -1773,8 +1885,89 @@ mod tests {
         fs::write(&victim, b"keep").unwrap();
         symlink(&victim, root.join("LOCK")).unwrap();
 
-        assert!(acquire_cell_lock(&root, true).is_err());
+        assert!(acquire_cell_lock(&root, LockIntent::Exclusive).is_err());
         assert_eq!(fs::read(victim).unwrap(), b"keep");
+    }
+
+    /// Read-only media rejects `O_RDWR` and `O_CREAT` outright, so opening
+    /// `.forge/LOCK` that way made the documented read-only `fsck`/`verify`
+    /// impossible before SQLite was ever reached. `flock` needs neither, so the
+    /// access mode of the descriptor is the property to assert. Checking
+    /// `F_GETFL` rather than filesystem permissions keeps the test meaningful
+    /// when it runs as root, which bypasses permission bits.
+    ///
+    /// Only the loop-mount check in `readonly-verify` covers an actually
+    /// read-only mount; this covers the open mode that made it impossible.
+    #[cfg(unix)]
+    #[test]
+    fn shared_cell_locks_open_lock_read_only_and_never_create_it() {
+        use std::os::fd::AsRawFd;
+
+        let d = tempdir().unwrap();
+        let initialized = Forge::init(d.path()).unwrap();
+        let root = initialized.root().to_path_buf();
+        drop(initialized);
+
+        for intent in [LockIntent::Shared, LockIntent::ReadOnly] {
+            let lock = acquire_cell_lock(&root, intent)
+                .unwrap()
+                .expect("an initialized repository has a LOCK to share");
+            let flags = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL failed for {intent:?}");
+            assert_eq!(
+                flags & libc::O_ACCMODE,
+                libc::O_RDONLY,
+                "{intent:?} must open .forge/LOCK read-only: read-only media \
+                 refuses O_RDWR, which makes the repository unopenable"
+            );
+        }
+
+        fs::remove_file(root.join("LOCK")).unwrap();
+        assert!(
+            acquire_cell_lock(&root, LockIntent::ReadOnly)
+                .unwrap()
+                .is_none(),
+            "a read-only open tolerates media that cannot hand out a LOCK"
+        );
+        assert!(
+            !root.join("LOCK").exists(),
+            "no shared cell lock may create .forge/LOCK"
+        );
+    }
+
+    /// End-to-end shape of the read-only path: the documented read-only
+    /// commands work through `open_read_only`, and every write through that
+    /// handle is denied (exit 1) instead of failing somewhere inside SQLite or
+    /// the object store. The read-only *media* half is covered only by the
+    /// loop-mount check, which no unprivileged test can perform.
+    #[test]
+    fn read_only_open_serves_fsck_and_verify_and_denies_writes() {
+        let d = tempdir().unwrap();
+        let f = Forge::init(d.path()).unwrap();
+        let cap = f.root_cap().unwrap();
+        let integ = f.integrator_cap().unwrap();
+        let ns = f.session_open(&cap, "main").unwrap();
+        f.write(&cap, &ns, "/paper.txt", b"final", false).unwrap();
+        let CasResult::Updated { name, .. } = f.checkin(&cap, &ns, "/", "paper").unwrap() else {
+            panic!("expected update");
+        };
+        f.merge(&integ, "main", &name, None).unwrap();
+        f.seal(&integ, "main", "v1.0").unwrap();
+        drop(f);
+
+        let ro = Forge::open_read_only(d.path()).unwrap();
+        assert!(ro.is_read_only());
+        assert!(ro.store.meta.read_only());
+        assert!(ro.store.blobs.read_only());
+
+        let report = ro.fsck(&cap, true).unwrap();
+        assert!(report.ok, "{:?}", report.findings);
+        ro.verify_tag(&cap, "v1.0").unwrap();
+
+        let denied = ro
+            .session_open(&cap, "main")
+            .expect_err("a read-only handle must refuse to write metadata");
+        assert!(matches!(denied, Error::Denied(_)), "{denied}");
     }
 
     #[test]
