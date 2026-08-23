@@ -339,7 +339,7 @@ fn verify_graph(
                 for read in contribution.reads {
                     queue.push_back((
                         read.id,
-                        None,
+                        Some(ObjectType::Blob),
                         format!("contribution:{id}:read:{}", read.path),
                     ));
                 }

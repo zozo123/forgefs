@@ -14,7 +14,7 @@ cap         (operation, resource); attenuation ⊆ parent
 
 | ID | Rule |
 |---|---|
-| I1 | Decode(encode(x)) is encode(x). Non-canonical bytes are Corrupt. |
+| I1 | Decode(encode(x)) is encode(x). Non-canonical bytes, unknown fields, and unknown VERSION 1 type bytes are Corrupt. |
 | I2 | One logical object ⇒ one byte string ⇒ one ObjectId. |
 | I3 | Put is idempotent iff bytes match; never overwrite. |
 | I4 | A committed ref implies fsynced object bytes and every directory edge needed to reach them; visibility alone is never a durability proof. |
@@ -23,13 +23,14 @@ cap         (operation, resource); attenuation ⊆ parent
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Checkin CASes that oid, never a moving head. |
 | I9 | Reads record path→oid. Stale observations fail checkin even on disjoint writes. |
-| I10 | Checkin is a contribution (base, tree, agent), not a loose message. |
+| I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. |
 | I11 | Overlap is a Conflict object. |
 | I12 | Merge uses real DAG merge-bases. |
 | I13 | Authority(c+d) ⊆ Authority(c). Holder attenuates without the root secret. |
 | I14 | No ambient root. Namespace ID is not a capability. |
 | I15 | verify/fsck reread durable bytes and this forge's seal key. |
 | I16 | Tree names are exact UTF-8 bytes: no Unicode normalization or case folding occurs in core identity. |
+| I17 | Repository VERSION gates immutable decoding and is independent of SQLite schema version. Unknown future values fail closed; metadata migrations never rewrite objects or ObjectIds. |
 
 A composed Unicode name and its canonically equivalent decomposed spelling are distinct ForgeFS entries if their UTF-8 byte strings differ. Likewise `Foo` and `foo` are distinct. Export adapters must detect target-filesystem collisions and fail rather than silently normalize, fold, or overwrite names.
 
