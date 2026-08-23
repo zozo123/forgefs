@@ -25,7 +25,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I9 | Reads record path→oid. Stale observations fail checkin even on disjoint writes. |
 | I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. |
 | I11 | Overlap is a Conflict object. |
-| I12 | Merge uses real DAG merge-bases. |
+| I12 | Merge order comes only from the commit parent DAG and real merge-bases. `Commit.ts` and `Contribution.ts` are advisory metadata, never causal order. |
 | I13 | Authority(c+d) ⊆ Authority(c). Holder attenuates without the root secret. |
 | I14 | No ambient root. Namespace ID is not a capability. |
 | I15 | verify/fsck reread durable bytes and this forge's seal key. |
