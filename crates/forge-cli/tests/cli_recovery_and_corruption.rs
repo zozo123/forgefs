@@ -114,9 +114,7 @@ fn cli_process_dead_overlay_survives_shared_ref_advance_then_forks() {
 
     let open_shared = |dir: &Path, cap: &str| {
         let mut open = authenticated(dir, cap);
-        open.arg("session")
-            .arg("open")
-            .arg("--from=heads/hot");
+        open.arg("session").arg("open").arg("--from=heads/hot");
         let ns = run_text(&mut open).trim().to_string();
         let mut mount = authenticated(dir, cap);
         mount
@@ -247,7 +245,11 @@ fn cli_full_fsck_fails_closed_after_durable_blob_bitrot() {
         .join(&blob_oid[0..2])
         .join(&blob_oid[2..4])
         .join(&blob_oid);
-    assert!(object.is_file(), "blob object missing at {}", object.display());
+    assert!(
+        object.is_file(),
+        "blob object missing at {}",
+        object.display()
+    );
     let len = fs::metadata(&object).unwrap().len() as usize;
     fs::write(&object, vec![0u8; len.max(1)]).unwrap();
 
