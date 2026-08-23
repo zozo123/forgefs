@@ -148,8 +148,8 @@ pub struct MetaStats {
 }
 
 impl MetaStats {
-    /// Observed SQLite-path time whose phases do not overlap: local mutex wait
-    /// plus explicit transaction time while holding that mutex.
+    /// Saturating sum over this process-lifetime snapshot: local mutex wait
+    /// plus explicit transaction time. It is not a per-checkin measurement.
     pub fn sqlite_accounted_us(&self) -> u64 {
         self.lock_wait_us.saturating_add(self.txn_us)
     }

@@ -81,9 +81,9 @@ For each concurrency point report at minimum:
 - throughput (ops/s);
 - latency p50, p95, p99, and max;
 - successful `Updated`, `Forked`, `Noop`, stale, and conflict counts as applicable;
-- process-local SQLite mutex acquisitions/wait, explicit transaction attempts/time, and busy outcomes;
+- whole-run process-lifetime SQLite mutex acquisitions/wait, explicit transaction attempts/time, and busy outcomes;
 - object puts and bytes;
-- file-fsync and directory-fsync counts/time;
+- whole-run process-lifetime file-fsync and directory-fsync counts/time;
 - CPU and peak RSS for long/large runs;
 - final `fsck --full` result.
 
@@ -91,12 +91,25 @@ Correctness counters are gates. Absolute latency and throughput are measurements
 
 If the checked-in build cannot expose one of the required SQLite/fsync measurements, mark that field **`unavailable`** in the raw result. Such a run may support user-visible latency/throughput claims, but it is **not eligible for cross-version architectural attribution** (for example, “SQLite was the bottleneck” or “directory barriers caused the speedup”) until the missing instrumentation is available.
 
-## Checkin cost mix
+## Whole-run process-lifetime counters
 
-For architectural performance claims, publish the available decomposition of
-one checkin. `forge bench` emits monotonic process-local totals from the Store
-and Meta instances used by the run. Their semantics are deliberately
-mechanical:
+The raw counter block emitted by `forge bench` is one cumulative lifetime
+snapshot, not a workload delta and not a checkin profile. Its boundaries are:
+
+1. Storage counting starts inside `LocalBlobStore::new` for the `Store` retained
+   by the returned `Forge`, before that open's counted object/tmp directory
+   durability setup and stale-temp cleanup. During `Forge::init`, this is the
+   post-publication reopen; counters owned by the discarded staging `Store` are
+   not part of the report.
+2. SQLite counting starts after `Meta::open` finishes for that retained Store;
+   schema/open work is excluded, while the following seal-key validation read
+   is included. API outcome counting starts when the final `Forge` is built.
+3. Counting continues across the serial baseline, private workload, shared
+   workload, merge/seal, and tag verification.
+4. The snapshot is taken after verification. The bounded-worker runner also
+   performs and includes full `fsck` before taking the snapshot.
+
+The individual counter semantics are deliberately mechanical:
 
 - `fsync_file` / `fsync_file_us` count and time successful file durability
   barriers; `fsync_dir` / `fsync_dir_us` do the same for directories. Failed
@@ -108,26 +121,46 @@ mechanical:
   cross-process `busy_timeout` wait is therefore inside `txn_us`; `busy` is an
   outcome count, not a duration. Schema setup during `Meta::open` and implicit
   autocommit statements are not included in `txn_us`.
-- `accounted_us = lock_wait_us + txn_us`; those two phases do not overlap for
-  one operation. `barrier_us = fsync_file_us + fsync_dir_us`.
+- Rendered `lifetime_accounted_us = lock_wait_us + txn_us` and
+  `lifetime_barrier_us = fsync_file_us + fsync_dir_us` are saturating
+  arithmetic sums over the lifetime snapshot, not per-operation measurements.
 
 Durations are accumulated internally in nanoseconds and converted to whole
 microseconds only when read, so a sequence of sub-microsecond lock waits is not
-silently rounded to zero. Totals from concurrently executing operations can
-overlap in wall-clock time; compare the sum to wall time only for a serial or
-per-operation sample.
+silently rounded to zero. Cumulative phase durations from concurrently
+executing operations can overlap in wall-clock time.
 
-The currently observed subset of the checkin mix is printed on every run:
+The renderer prints their arithmetic aggregation only as a lifetime phase
+total:
 
 ```text
-fsync_file_us + fsync_dir_us + sqlite_lock_wait_us + sqlite_txn_us = observed_us
+fsync_file_us + fsync_dir_us + sqlite_lock_wait_us + sqlite_txn_us = cumulative_phase_us
 ```
 
-Hashing, canonical encoding, and uninstrumented SQLite autocommit work remain
-outside `observed_us`. Any unavailable component must be named. If the
-observed subset does not approximately explain a serial operation's wall time,
-treat the profile as incomplete before redesigning the storage or concurrency
-architecture.
+These totals may support whole-run regression diagnosis when command shape and
+boundaries are identical. They **must not** be divided by a checkin count,
+compared with one checkin's latency, or described as an average/p50/p99
+checkin cost. They include different phase populations, and concurrent phase
+durations can overlap.
+
+## Per-checkin cost mix: unavailable
+
+A true checkin mix remains follow-up instrumentation. It requires
+operation-scoped counter snapshots or tracing that begins and ends with the
+same checkin and excludes initialization, other workloads, merge/seal,
+verification, and `fsck`. Hashing, canonical encoding, and SQLite autocommit
+work also remain uninstrumented.
+
+Until that attribution exists, every run reports the per-checkin mix as
+`unavailable`. Do not estimate it by dividing the process-lifetime totals. The
+target future decomposition remains:
+
+```text
+hash_us + encode_us + fsync_file_us + fsync_dir_us + sqlite_wait_us + sqlite_txn_us ~= checkin_wall_us
+```
+
+Any unavailable component must be named. Do not redesign the storage or
+concurrency architecture based on an incomplete attribution.
 
 ## Raw results
 
@@ -140,7 +173,8 @@ A performance PR attaches or links the exact command and unedited machine-readab
 5. correctness result;
 6. all repetition outputs plus the median aggregation rule above;
 7. p50/p95/p99/max plus throughput;
-8. storage/SQLite instrumentation, or explicit `unavailable` markers;
+8. whole-run storage/SQLite lifetime totals, plus explicit `unavailable`
+   markers for per-checkin attribution;
 9. the mechanism believed to explain the change;
 10. for W7, the comparator metadata and durability-equivalence verdict.
 

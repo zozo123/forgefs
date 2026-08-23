@@ -34,6 +34,8 @@ pub struct BlobStoreStats {
 }
 
 impl BlobStoreStats {
+    /// Saturating sum over this process-lifetime snapshot. It is not a
+    /// per-publication or per-checkin measurement.
     pub fn barrier_us(&self) -> u64 {
         self.fsync_file_us.saturating_add(self.fsync_dir_us)
     }
