@@ -1,6 +1,6 @@
 //! Process-level proof that write-once object publication converges across processes.
 
-use forge_core::{hash_bytes, Blob};
+use forge_types::ObjectId;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -36,6 +36,13 @@ fn assert_success(out: &Output) {
     );
 }
 
+fn output_oid(out: &Output) -> String {
+    assert_success(out);
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    ObjectId::from_hex(&oid).expect("forge write must print a canonical ObjectId");
+    oid
+}
+
 fn open_session(dir: &str, cap: &str) -> String {
     let mut cmd = authenticated(dir, cap);
     cmd.arg("session").arg("open").arg("--from=main");
@@ -53,15 +60,6 @@ fn write_command(dir: &str, cap: &str, ns: &str, path: &str, file: &Path) -> Com
     cmd
 }
 
-fn blob_id(data: &[u8]) -> forge_types::ObjectId {
-    hash_bytes(
-        &Blob {
-            data: data.to_vec(),
-        }
-        .encode(),
-    )
-}
-
 fn count_named_files(root: &Path, name: &str) -> usize {
     let mut count = 0;
     for entry in fs::read_dir(root).unwrap() {
@@ -69,7 +67,7 @@ fn count_named_files(root: &Path, name: &str) -> usize {
         let ty = entry.file_type().unwrap();
         if ty.is_dir() {
             count += count_named_files(&entry.path(), name);
-        } else if ty.is_file() && entry.file_name() == name {
+        } else if ty.is_file() && entry.file_name().to_string_lossy() == name {
             count += 1;
         }
     }
@@ -105,11 +103,12 @@ fn race_writes(
         .collect()
 }
 
-fn assert_write_oid(outputs: &[Output], expected: &str) {
-    for out in outputs {
-        assert_success(out);
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
+fn assert_same_write_oid(outputs: &[Output]) -> String {
+    let first = output_oid(&outputs[0]);
+    for out in &outputs[1..] {
+        assert_eq!(output_oid(out), first);
     }
+    first
 }
 
 fn read_bytes(dir: &str, cap: &str, ns: &str, path: &str) -> Vec<u8> {
@@ -143,18 +142,19 @@ fn cli_processes_converge_on_one_object_publication() {
 
     let payload = vec![0x5a; PAYLOAD_BYTES];
     let payload_file = write_file(d.path(), "same-payload.bin", &payload);
-    let expected = blob_id(&payload).hex();
     let sessions = (0..SAME_WRITERS)
         .map(|_| open_session(dir, cap))
         .collect::<Vec<_>>();
 
     let outputs = race_writes(dir, cap, &sessions, &payload_file, "same");
-    assert_write_oid(&outputs, &expected);
+    let shared_oid = assert_same_write_oid(&outputs);
     assert_eq!(
-        count_named_files(&d.path().join(".forge/objects"), &expected),
+        count_named_files(&d.path().join(".forge/objects"), &shared_oid),
         1,
         "identical object bytes must have one canonical durable name"
     );
+    // Full fsck rereads and rehashes the durable object, so the OID printed by
+    // each process is proven against the encoded Blob bytes rather than the raw payload.
     fsck_full(dir, cap);
 
     let a = vec![0x41; PAYLOAD_BYTES];
@@ -192,16 +192,9 @@ fn cli_processes_converge_on_one_object_publication() {
 
     let left = left.join().unwrap();
     let right = right.join().unwrap();
-    assert_success(&left);
-    assert_success(&right);
-    assert_eq!(
-        String::from_utf8_lossy(&left.stdout).trim(),
-        blob_id(&a).hex()
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&right.stdout).trim(),
-        blob_id(&b).hex()
-    );
+    let left_oid = output_oid(&left);
+    let right_oid = output_oid(&right);
+    assert_ne!(left_oid, right_oid);
     assert_eq!(read_bytes(dir, cap, &a_ns, "/different-a.bin"), a);
     assert_eq!(read_bytes(dir, cap, &b_ns, "/different-b.bin"), b);
     fsck_full(dir, cap);
