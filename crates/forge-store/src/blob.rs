@@ -442,7 +442,13 @@ mod tests {
 
         let mut second = s.begin_batch();
         assert_eq!(second.put(b"race-safe durable object").unwrap(), id);
-        assert_eq!(s.stats(), before, "barrier is deferred to batch finish");
+        let joined = s.stats();
+        assert_eq!(joined.puts, before.puts);
+        assert_eq!(joined.fsync_file, before.fsync_file + 1);
+        assert_eq!(
+            joined.fsync_dir, before.fsync_dir,
+            "the pathname barrier is deferred to batch finish"
+        );
 
         // Model the winning publisher dying after link(2) but before finish.
         // The deduplicating batch must still make the shared directory entry
