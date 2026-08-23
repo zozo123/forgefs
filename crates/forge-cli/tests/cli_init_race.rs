@@ -73,7 +73,8 @@ fn cli_concurrent_init_has_exactly_one_publisher_and_no_staging_leaks() {
 
     let winners = results.iter().filter(|out| out.status.success()).count();
     assert_eq!(
-        winners, 1,
+        winners,
+        1,
         "atomic no-replace publication must have one winner; results={:?}",
         results
             .iter()
@@ -108,7 +109,10 @@ fn cli_concurrent_init_has_exactly_one_publisher_and_no_staging_leaks() {
     let mut refs = authenticated(d.path(), &root_cap);
     refs.arg("refs");
     let refs = run(&mut refs);
-    assert!(refs.contains("main"), "missing main after init race: {refs}");
+    assert!(
+        refs.contains("main"),
+        "missing main after init race: {refs}"
+    );
 
     let mut fsck = authenticated(d.path(), &root_cap);
     fsck.arg("fsck").arg("--full");
