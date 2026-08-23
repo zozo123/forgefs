@@ -12,7 +12,7 @@ jobs:
   scan:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'relay/1f916-relevant-scan' &&
+      startsWith(github.event.pull_request.head.ref, 'relay/1f916-relevant-scan') &&
       github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     timeout-minutes: 3
