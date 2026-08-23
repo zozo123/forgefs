@@ -81,7 +81,7 @@ For each concurrency point report at minimum:
 - throughput (ops/s);
 - latency p50, p95, p99, and max;
 - successful `Updated`, `Forked`, `Noop`, stale, and conflict counts as applicable;
-- SQLite busy/wait and transaction time;
+- process-local SQLite mutex acquisitions/wait, explicit transaction attempts/time, and busy outcomes;
 - object puts and bytes;
 - file-fsync and directory-fsync counts/time;
 - CPU and peak RSS for long/large runs;
@@ -93,13 +93,41 @@ If the checked-in build cannot expose one of the required SQLite/fsync measureme
 
 ## Checkin cost mix
 
-For architectural performance claims, publish the available decomposition of one checkin:
+For architectural performance claims, publish the available decomposition of
+one checkin. `forge bench` emits monotonic process-local totals from the Store
+and Meta instances used by the run. Their semantics are deliberately
+mechanical:
+
+- `fsync_file` / `fsync_file_us` count and time successful file durability
+  barriers; `fsync_dir` / `fsync_dir_us` do the same for directories. Failed
+  barriers fail the operation and are not reported as successful work.
+- `lock_acquires` / `lock_wait_us` cover every acquisition of ForgeFS's one
+  process-local SQLite connection mutex, including reads and autocommit writes.
+- `txn_count` / `txn_us` cover every instrumented explicit `BEGIN IMMEDIATE`
+  attempt from before BEGIN through COMMIT or rollback. SQLite's
+  cross-process `busy_timeout` wait is therefore inside `txn_us`; `busy` is an
+  outcome count, not a duration. Schema setup during `Meta::open` and implicit
+  autocommit statements are not included in `txn_us`.
+- `accounted_us = lock_wait_us + txn_us`; those two phases do not overlap for
+  one operation. `barrier_us = fsync_file_us + fsync_dir_us`.
+
+Durations are accumulated internally in nanoseconds and converted to whole
+microseconds only when read, so a sequence of sub-microsecond lock waits is not
+silently rounded to zero. Totals from concurrently executing operations can
+overlap in wall-clock time; compare the sum to wall time only for a serial or
+per-operation sample.
+
+The currently observed subset of the checkin mix is printed on every run:
 
 ```text
-hash_us + encode_us + fsync_file_us + fsync_dir_us + sqlite_busy_us + sqlite_txn_us ~= wall_us
+fsync_file_us + fsync_dir_us + sqlite_lock_wait_us + sqlite_txn_us = observed_us
 ```
 
-Any unavailable component must be named. If the accounted components do not approximately explain wall time, treat the profile as incomplete before redesigning the storage or concurrency architecture.
+Hashing, canonical encoding, and uninstrumented SQLite autocommit work remain
+outside `observed_us`. Any unavailable component must be named. If the
+observed subset does not approximately explain a serial operation's wall time,
+treat the profile as incomplete before redesigning the storage or concurrency
+architecture.
 
 ## Raw results
 

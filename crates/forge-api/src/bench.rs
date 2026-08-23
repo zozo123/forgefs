@@ -131,18 +131,40 @@ impl BenchReport {
         }
         if let Some(stats) = self.store {
             s.push_str(&format!(
-                "storage          puts={} fsync_file={} fsync_dir={}\n",
-                stats.puts, stats.fsync_file, stats.fsync_dir
+                "storage          puts={} fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_us={}\n",
+                stats.puts,
+                stats.fsync_file,
+                stats.fsync_file_us,
+                stats.fsync_dir,
+                stats.fsync_dir_us,
+                stats.barrier_us(),
             ));
         }
         if let Some(stats) = self.meta {
             s.push_str(&format!(
-                "sqlite           txn={:.3}ms busy={} updated={} forked={} denied={}\n",
-                stats.txn_us as f64 / 1000.0,
+                "sqlite           lock_acquires={} lock_wait_us={} txn_count={} txn_us={} accounted_us={} busy={} updated={} forked={} denied={}\n",
+                stats.lock_acquires,
+                stats.lock_wait_us,
+                stats.txn_count,
+                stats.txn_us,
+                stats.sqlite_accounted_us(),
                 stats.busy,
                 stats.cas_updated,
                 stats.cas_forked,
                 stats.cas_denied,
+            ));
+        }
+        if let (Some(store), Some(meta)) = (self.store, self.meta) {
+            let observed_us = store
+                .barrier_us()
+                .saturating_add(meta.sqlite_accounted_us());
+            s.push_str(&format!(
+                "observed mix     fsync_file_us={} + fsync_dir_us={} + sqlite_lock_wait_us={} + sqlite_txn_us={} = observed_us={}\n",
+                store.fsync_file_us,
+                store.fsync_dir_us,
+                meta.lock_wait_us,
+                meta.txn_us,
+                observed_us,
             ));
         }
         if let Some(stats) = self.api {
@@ -356,4 +378,50 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_exposes_raw_phase_counters_and_saturating_mix() {
+        let report = BenchReport {
+            serial: None,
+            private: None,
+            shared: None,
+            merge_seal: None,
+            verify: None,
+            durability: None,
+            store: Some(BlobStoreStats {
+                puts: 2,
+                fsync_file: 3,
+                fsync_file_us: 11,
+                fsync_dir: 4,
+                fsync_dir_us: 13,
+            }),
+            meta: Some(MetaStats {
+                txn_us: 17,
+                txn_count: 5,
+                lock_wait_us: 19,
+                lock_acquires: 23,
+                busy: 0,
+                cas_updated: 7,
+                cas_forked: 1,
+                cas_denied: 0,
+            }),
+            api: None,
+        };
+
+        let rendered = report.render();
+        assert!(rendered.contains(
+            "storage          puts=2 fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 barrier_us=24"
+        ));
+        assert!(rendered.contains(
+            "sqlite           lock_acquires=23 lock_wait_us=19 txn_count=5 txn_us=17 accounted_us=36"
+        ));
+        assert!(rendered.contains(
+            "fsync_file_us=11 + fsync_dir_us=13 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = observed_us=60"
+        ));
+    }
 }
