@@ -450,6 +450,11 @@ impl Forge {
         } else {
             self.check_spec_read(cap, spec)?;
         }
+        // A mount naming something that does not resolve is bad input, not
+        // durable state. Persisting one made `fsck --full` report MOUNT_REF
+        // corruption (exit 2) on a repository whose bytes were entirely intact,
+        // which any holder of read authority could trigger at will.
+        self.resolve_spec_oid(spec)?;
         self.store.meta.insert_mount(ns, &path, spec, mode)?;
         Ok(())
     }
@@ -990,13 +995,38 @@ impl Forge {
     }
 
     pub fn landmark(&self, cap: &Cap, oid: ObjectId) -> Result<()> {
+        // Every other raw-OID entry point in this crate pairs check(.., None)
+        // with this guard (check_spec_read, mount --rw oid:, fsck). landmark was
+        // the only one that did not, so a cap that could read nothing and move
+        // no ref could still write repository metadata.
+        if !Self::ref_unrestricted(cap) {
+            return Err(Error::Denied(
+                "ref-scoped caps cannot address raw object ids".into(),
+            ));
+        }
         self.check(cap, Op::Write, None)?;
-        self.store.meta.landmark(oid, "commit", "explicit")?;
+        // Record what the object actually is, and refuse one that is not there.
+        // A landmark is a GC root, so a dangling or mistyped row is a latent
+        // collection hazard that fsck does not currently surface.
+        let kind = match self.store.object_type(oid)? {
+            ObjectType::Blob => "blob",
+            ObjectType::Tree => "tree",
+            ObjectType::Commit => "commit",
+            ObjectType::Conflict => "conflict",
+            ObjectType::Snapshot => "snapshot",
+            ObjectType::Contribution => "contribution",
+        };
+        self.store.meta.landmark(oid, kind, "explicit")?;
         Ok(())
     }
 
     pub fn log(&self, cap: &Cap, r#ref: &str, n: usize) -> Result<Vec<(ObjectId, String, String)>> {
         self.check(cap, Op::Read, Some(r#ref))?;
+        // Exiting 0 with no output made "this ref has no history" and "this ref
+        // does not exist" indistinguishable to a caller.
+        if self.store.meta.get_ref(r#ref)?.is_none() {
+            return Err(Error::NotFound(format!("ref {ref_name}", ref_name = r#ref)));
+        }
         let rows = self.store.meta.reflog(r#ref, n)?;
         Ok(rows
             .into_iter()

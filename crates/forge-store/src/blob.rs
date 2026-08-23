@@ -119,6 +119,7 @@ impl LocalBlobStore {
     }
 
     fn verify_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
+        require_regular_file(path, id)?;
         let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
         if hash_bytes(&bytes) != id {
             return Err(Error::Corrupt(format!(
@@ -129,6 +130,7 @@ impl LocalBlobStore {
     }
 
     fn verify_and_sync_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
+        require_regular_file(path, id)?;
         // Operate on one descriptor so the bytes verified are the bytes forced.
         // Opening writable is intentional: macOS F_FULLFSYNC is a fail-closed
         // durability contract, not a best-effort read hint.
@@ -150,6 +152,7 @@ impl LocalBlobStore {
 
     pub fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
         let p = self.object_path(id);
+        require_regular_file(&p, id)?;
         let bytes = fs::read(&p).map_err(|_| Error::NotFound(format!("object {id}")))?;
         if hash_bytes(&bytes) != id {
             return Err(Error::Corrupt(format!("hash mismatch {id}")));
@@ -276,6 +279,24 @@ impl PublishBatch<'_> {
 impl crate::Store {
     pub fn stats(&self) -> BlobStoreStats {
         self.blobs.stats()
+    }
+}
+
+/// A durable object must be a regular file. Without this check a FIFO planted
+/// at an object path made `fs::read` block forever, so fsck/export/import hung
+/// indefinitely instead of failing closed -- while a mere byte flip in the same
+/// file was correctly reported as corruption.
+fn require_regular_file(path: &Path, id: ObjectId) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(meta) => Err(Error::Corrupt(format!(
+            "object {id} is not a regular file: {:?}",
+            meta.file_type()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::NotFound(format!("object {id}")))
+        }
+        Err(e) => Err(Error::Io(e.to_string())),
     }
 }
 
@@ -593,6 +614,37 @@ mod tests {
         assert_eq!(after.puts, before.puts);
         assert_eq!(after.fsync_file, before.fsync_file + 1);
         assert_eq!(after.fsync_dir, before.fsync_dir + 3);
+    }
+
+    /// A byte flip at an object path is corruption; so is a FIFO. Before the
+    /// file-type check, fs::read on a FIFO blocked forever, so fsck/export/import
+    /// hung indefinitely instead of failing closed.
+    #[test]
+    #[cfg(unix)]
+    fn non_regular_file_at_an_object_path_is_corruption_not_a_hang() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let id = s.put(b"durable").unwrap();
+        let path = s.object_path(id);
+        fs::remove_file(&path).unwrap();
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+
+        // Would block forever before the check. Corrupt, promptly.
+        assert!(matches!(s.get(id), Err(Error::Corrupt(_))));
+        assert!(matches!(s.put(b"durable"), Err(Error::Corrupt(_))));
+
+        // A directory in an object's place is equally not an object.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(s.get(id), Err(Error::Corrupt(_))));
     }
 
     #[test]
