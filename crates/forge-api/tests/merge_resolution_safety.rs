@@ -45,12 +45,7 @@ fn raw_resolved_tree_is_rejected_without_advancing_destination() {
     assert_ne!(before_commit.tree, injected);
 
     let error = forge
-        .merge(
-            &root,
-            "main",
-            "heads/agents/alice/source",
-            Some(injected),
-        )
+        .merge(&root, "main", "heads/agents/alice/source", Some(injected))
         .unwrap_err();
     assert_resolution_disabled(error);
 
