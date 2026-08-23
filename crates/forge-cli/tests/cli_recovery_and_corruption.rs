@@ -103,6 +103,95 @@ fn cli_session_overlay_survives_process_exit() {
 }
 
 #[test]
+fn cli_process_dead_overlay_survives_shared_ref_advance_then_forks() {
+    let d = tempdir().unwrap();
+    let root_path = init(d.path());
+    let root = root_path.to_str().unwrap();
+
+    let mut branch = authenticated(d.path(), root);
+    branch.arg("branch").arg("main").arg("heads/hot");
+    run(&mut branch);
+
+    let open_shared = |dir: &Path, cap: &str| {
+        let mut open = authenticated(dir, cap);
+        open.arg("session")
+            .arg("open")
+            .arg("--from=heads/hot");
+        let ns = run_text(&mut open).trim().to_string();
+        let mut mount = authenticated(dir, cap);
+        mount
+            .arg("mount")
+            .arg("--ns")
+            .arg(&ns)
+            .arg("/")
+            .arg("heads/hot")
+            .arg("--rw");
+        run(&mut mount);
+        ns
+    };
+
+    let survivor = open_shared(d.path(), root);
+    let mut write_survivor = authenticated(d.path(), root);
+    write_survivor
+        .arg("write")
+        .arg("--ns")
+        .arg(&survivor)
+        .arg("/survivor.txt")
+        .arg("--text")
+        .arg("kept across processes");
+    run(&mut write_survivor);
+
+    // Producer process is gone. A fresh process must still see its overlay.
+    assert_eq!(
+        read(d.path(), root, &survivor, "/survivor.txt"),
+        b"kept across processes"
+    );
+
+    let winner = open_shared(d.path(), root);
+    let mut write_winner = authenticated(d.path(), root);
+    write_winner
+        .arg("write")
+        .arg("--ns")
+        .arg(&winner)
+        .arg("/winner.txt")
+        .arg("--text")
+        .arg("moves shared head");
+    run(&mut write_winner);
+    let mut winner_checkin = authenticated(d.path(), root);
+    winner_checkin
+        .arg("checkin")
+        .arg("--ns")
+        .arg(&winner)
+        .arg("-m")
+        .arg("winner");
+    let winner_result = run_text(&mut winner_checkin);
+    assert!(
+        winner_result.contains("updated heads/hot"),
+        "unexpected winner result: {winner_result}"
+    );
+
+    // Advancing the shared ref cannot erase the abandoned overlay. Its next
+    // checkin is an explicit fork because its pinned base lost the CAS race.
+    assert_eq!(
+        read(d.path(), root, &survivor, "/survivor.txt"),
+        b"kept across processes"
+    );
+    let mut survivor_checkin = authenticated(d.path(), root);
+    survivor_checkin
+        .arg("checkin")
+        .arg("--ns")
+        .arg(&survivor)
+        .arg("-m")
+        .arg("late survivor");
+    let survivor_result = run_text(&mut survivor_checkin);
+    assert!(
+        survivor_result.contains("forked heads/hot"),
+        "delayed shared checkin must fork, got: {survivor_result}"
+    );
+    fsck_full(d.path(), root);
+}
+
+#[test]
 fn cli_full_fsck_fails_closed_after_durable_blob_bitrot() {
     let d = tempdir().unwrap();
     let root_path = init(d.path());
