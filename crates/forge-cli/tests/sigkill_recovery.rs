@@ -118,7 +118,10 @@ fn cli_sigkill_live_concurrent_cell_reopens_and_accepts_new_work() {
     );
 
     let root = forge_root.join("keys/root.cap");
-    assert!(root.is_file(), "killed benchmark did not leave a valid cell");
+    assert!(
+        root.is_file(),
+        "killed benchmark did not leave a valid cell"
+    );
 
     // Cold SQLite/WAL + object-store recovery must be structurally clean.
     fsck_full(&cell, &root);
