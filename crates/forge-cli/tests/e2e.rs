@@ -1,5 +1,6 @@
 //! Process-level e2e: real `forge` binaries, required --cap, parallel checkin.
 
+use forge_api::RAW_MERGE_RESOLUTION_DISABLED;
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
@@ -264,5 +265,47 @@ fn cli_merge_conflict_has_stable_exit_code_four() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("conflict"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("conflict"), "{stderr}");
+
+    let conflict = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("conflict "))
+        .expect("machine-readable conflict line");
+    let shown = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "show",
+        &format!("oid:{conflict}"),
+    ]));
+    let ours = shown
+        .lines()
+        .find_map(|line| line.strip_prefix("ours "))
+        .expect("conflict ours tree");
+
+    // Keep accepting the legacy flag at the parser boundary, but never let a
+    // raw Tree OID replace a merge result without conflict-bound provenance.
+    let out = forge()
+        .args([
+            "--dir",
+            dir,
+            "--cap",
+            integ,
+            "merge",
+            "--into=main",
+            "--from",
+            &ref_b,
+            "--resolved",
+            ours,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(RAW_MERGE_RESOLUTION_DISABLED),
+        "unexpected stderr: {stderr}"
+    );
 }

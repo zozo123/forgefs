@@ -13,6 +13,15 @@ pub use fsck::{FsckFinding, FsckReport};
 pub use serve::{dispatch as dispatch_request, serve};
 pub use soak::{private_checkins_bounded, run_bench_with_workers, shared_stampede_bounded};
 
+/// Stable fail-closed error for the legacy raw-tree merge resolution input.
+///
+/// A replacement tree is not sufficient proof that it resolves the conflict
+/// produced by the current merge inputs. Keep the input in the API for
+/// compatibility, but reject it until resolution carries a conflict OID and
+/// durable provenance.
+pub const RAW_MERGE_RESOLUTION_DISABLED: &str =
+    "raw merge resolution is disabled; resolution must be bound to a conflict object";
+
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use forge_cap::{attenuate, mint_integrator, mint_root, verify, Cap, Op};
 use forge_core::cbor::{encode_map_sorted, encode_text};
@@ -701,14 +710,12 @@ impl Forge {
             self.check(cap, Op::Write, Some(into))?;
         }
         self.check_spec_read(cap, from)?;
+        if resolved.is_some() {
+            return Err(Error::Invalid(RAW_MERGE_RESOLUTION_DISABLED.into()));
+        }
         let ours_c = self.store.get_commit(into_row.oid)?;
         let (theirs_oid, theirs_c) = self.peel_commit(from)?;
-        let tree = if let Some(t) = resolved {
-            if self.store.object_type(t)? != ObjectType::Tree {
-                return Err(Error::Invalid("resolved oid is not a tree".into()));
-            }
-            t
-        } else {
+        let tree = {
             let bases = merge_bases(&self.store, into_row.oid, theirs_oid)?;
             if bases.len() > 1 {
                 let base_trees = bases
