@@ -109,7 +109,7 @@ fn cli_concurrent_integrator_merges_preserve_every_agent_commit() {
 
     let barrier = Arc::new(Barrier::new(MERGERS));
     let mut launchers = Vec::with_capacity(MERGERS);
-    for source in sources.iter().cloned() {
+    for source in sources.clone() {
         let barrier = Arc::clone(&barrier);
         let dir = d.path().to_path_buf();
         let cap = integrator.clone();
