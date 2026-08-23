@@ -1,4 +1,7 @@
-#![cfg(debug_assertions)]
+#![cfg(all(
+    debug_assertions,
+    any(target_os = "linux", target_os = "android", target_os = "macos")
+))]
 
 use forge_api::Forge;
 use forge_core::{hash_bytes, Blob, Tree, TreeEntry};
