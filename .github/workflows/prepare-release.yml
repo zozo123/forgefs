@@ -59,7 +59,7 @@ jobs:
           print(f'current={m.group(1)}.{m.group(2)}.{m.group(3)}')
           print(f'next={major}.{minor}.{patch}')
           PY
-      - name: Update the single version source and lockfile
+      - name: Update the single version source and minimally refresh Cargo.lock
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
@@ -78,7 +78,10 @@ jobs:
               raise SystemExit('failed to update exactly one workspace.package.version')
           open(path, 'w', encoding='utf-8').write(new)
           PY
-          cargo update -w
+          # Let Cargo update only what the manifest change requires in the
+          # existing lockfile. Do not use `cargo update`: a release bump must not
+          # pull unrelated dependency upgrades into the release-prep PR.
+          cargo check --workspace --all-targets
           scripts/verify-tag-version.sh "v$NEXT"
       - name: Gate the prepared release tree
         run: |
@@ -112,4 +115,4 @@ jobs:
             --base main \
             --head "$branch" \
             --title "release: prepare ForgeFS v$NEXT" \
-            --body "Bumps the single workspace version to **$NEXT** and refreshes Cargo.lock. The prepare workflow already ran fmt/check/clippy/test, the CLI ABI table, and the end-to-end release gate on this exact tree. After merge, tag the merge commit **v$NEXT**; the tag workflow independently re-verifies version + main ancestry, rebuilds all targets, gates the exact packaged binaries, assembles one checksummed payload, attests it, and publishes it."
+            --body "Bumps the single workspace version to **$NEXT** and refreshes Cargo.lock without updating unrelated dependencies. The prepare workflow already ran fmt/check/clippy/test, the CLI ABI table, and the end-to-end release gate on this exact tree. After merge, tag the merge commit **v$NEXT**; the tag workflow independently re-verifies version + main ancestry, rebuilds all targets, gates the exact packaged binaries, assembles one checksummed payload, attests it, and publishes it."
