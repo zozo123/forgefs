@@ -1,6 +1,6 @@
 //! Path-granular 3-way merge. Conflicts are objects, not lost work.
 
-use forge_core::{Conflict, ConflictPath, Tree};
+use forge_core::{Conflict, ConflictPath, Tree, TreeEntry};
 use forge_store::Store;
 use forge_types::{EntryKind, Error, ObjectId, Result};
 use std::collections::{HashMap, HashSet};
@@ -123,6 +123,12 @@ pub fn three_way(
     }
 }
 
+/// Full tree-entry identity for three-way resolution: two entries are the
+/// same entry only if their object id, kind AND executable bit all agree.
+fn same_entry(a: &TreeEntry, b: &TreeEntry) -> bool {
+    a.id == b.id && a.kind == b.kind && a.exec == b.exec
+}
+
 fn merge_trees(
     store: &Store,
     prefix: &str,
@@ -201,15 +207,21 @@ fn merge_trees(
                 }
             }
             (Some(x), Some(y), g) => {
-                if x.id == y.id && x.kind == y.kind {
+                // Entry identity is (id, kind, exec). Comparing only id+kind
+                // made a mode-only change invisible: `ours` always won, the
+                // incoming exec bit was dropped with exit 0 and no Conflict,
+                // and the merged tree depended on which side was --into.
+                // Including exec here fixes both, and keeps the result
+                // symmetric: whichever side still matches the base loses.
+                if same_entry(x, y) {
                     out.push(x.clone());
                     continue;
                 }
-                if g.map(|g| g.id) == Some(x.id) {
+                if g.is_some_and(|g| same_entry(g, x)) {
                     out.push(y.clone());
                     continue;
                 }
-                if g.map(|g| g.id) == Some(y.id) {
+                if g.is_some_and(|g| same_entry(g, y)) {
                     out.push(x.clone());
                     continue;
                 }
@@ -340,5 +352,81 @@ mod tests {
             }
             MergeOutcome::Tree(_) => panic!("expected conflict"),
         }
+    }
+    fn blob_entry(name: &str, id: ObjectId, exec: bool) -> TreeEntry {
+        TreeEntry {
+            name: name.into(),
+            kind: EntryKind::Blob,
+            id,
+            exec,
+        }
+    }
+
+    /// I11/I12: a mode-only change on one side is a real change. It must survive
+    /// the merge, and the merged tree must not depend on which side is `ours`.
+    #[test]
+    fn i11_i12_mode_only_change_survives_and_merge_is_direction_symmetric() {
+        let (_d, s) = setup();
+        let tool = s.put_blob_data(b"#!/bin/sh\n").unwrap();
+        let seed = s.put_blob_data(b"seed").unwrap();
+        let added = s.put_blob_data(b"added").unwrap();
+
+        // base: tool.sh not executable
+        let base = s
+            .put_tree(
+                &Tree::new(vec![
+                    blob_entry("seed.txt", seed, false),
+                    blob_entry("tool.sh", tool, false),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        // ours: an unrelated addition, tool.sh untouched
+        let ours = s
+            .put_tree(
+                &Tree::new(vec![
+                    blob_entry("a.txt", added, false),
+                    blob_entry("seed.txt", seed, false),
+                    blob_entry("tool.sh", tool, false),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        // theirs: chmod +x tool.sh and nothing else
+        let theirs = s
+            .put_tree(
+                &Tree::new(vec![
+                    blob_entry("seed.txt", seed, false),
+                    blob_entry("tool.sh", tool, true),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mut conflicts = Vec::new();
+        let forward = merge_trees(&s, "", Some(base), ours, theirs, &mut conflicts).unwrap();
+        assert!(
+            conflicts.is_empty(),
+            "a mode change against an unrelated add is not a conflict: {conflicts:?}"
+        );
+
+        let merged = s.get_tree(forward).unwrap();
+        let entry = merged
+            .entries
+            .iter()
+            .find(|e| e.name == "tool.sh")
+            .expect("tool.sh survives the merge");
+        assert!(entry.exec, "the incoming exec bit was dropped: {entry:?}");
+        assert_eq!(entry.id, tool, "the blob itself must not change");
+
+        // Same two inputs, opposite direction: the merged TREE must be identical.
+        // (The merge commit legitimately differs, because its parents differ.)
+        let mut mirror_conflicts = Vec::new();
+        let mirror = merge_trees(&s, "", Some(base), theirs, ours, &mut mirror_conflicts).unwrap();
+        assert!(mirror_conflicts.is_empty(), "{mirror_conflicts:?}");
+        assert_eq!(
+            forward, mirror,
+            "merge result depends on which side is --into; I12 says order comes only from the DAG"
+        );
     }
 }

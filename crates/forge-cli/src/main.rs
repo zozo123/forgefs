@@ -26,7 +26,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Init {
-        dir: Option<PathBuf>,
+        /// Where to create the forge. Not named `dir` for the same reason as
+        /// `import`: it would collide with the global `--dir` arg id.
+        path: Option<PathBuf>,
     },
     Serve {
         #[arg(long)]
@@ -70,7 +72,11 @@ enum Cmd {
         message: String,
     },
     Import {
-        dir: PathBuf,
+        /// Directory to import. Deliberately NOT named `dir`: the global
+        /// `--dir` (env FORGE_DIR) owns that clap arg id, and a subcommand
+        /// field of the same name silently overwrites it, so the repository
+        /// would be chosen by this path instead of by --dir.
+        source: PathBuf,
         #[arg(long)]
         r#ref: String,
     },
@@ -212,8 +218,8 @@ fn run() -> forge_types::Result<()> {
             print!("{}", report.render());
             Ok(())
         }
-        Cmd::Init { dir } => {
-            let dir = dir
+        Cmd::Init { path } => {
+            let dir = path
                 .or(cli.dir.clone())
                 .unwrap_or_else(|| PathBuf::from("."));
             let f = Forge::init(&dir)?;
@@ -302,8 +308,8 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
             CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
         },
-        Cmd::Import { dir, r#ref } => {
-            let id = f.import_dir(cap, &dir, &r#ref)?;
+        Cmd::Import { source, r#ref } => {
+            let id = f.import_dir(cap, &source, &r#ref)?;
             println!("imported {id} -> {ref_name}", ref_name = r#ref);
         }
         Cmd::Branch { from, name } => {
