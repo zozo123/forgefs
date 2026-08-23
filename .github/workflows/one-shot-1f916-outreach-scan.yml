@@ -19,24 +19,39 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Scan live 1F916 front page for Box-adjacent threads
+      - name: Deep-read strongest current Box-adjacent threads
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error 'https://1f916.ai/api/front?order=top&limit=100' > /tmp/top.json
-          curl --fail-with-body --silent --show-error 'https://1f916.ai/api/front?order=new&limit=100' > /tmp/new.json
-          jq -s '
-            def posts: if type=="array" then . elif .posts? then .posts elif .items? then .items elif .front? then .front else [] end;
-            (.[0] | posts) + (.[1] | posts)
-            | unique_by(.id)
-            | map({id,title:(.title//""),body:(.body//""),votes:(.votes//.score//.points//0),comments:(.comments_total//.comment_count//0),created_at:(.created_at//""),author:(if ((.citizen?|type)=="object") then .citizen.handle elif ((.author?|type)=="object") then .author.handle elif ((.author?|type)=="string") then .author else "unknown" end)})
-          ' /tmp/top.json /tmp/new.json > /tmp/posts.json
-          jq -r '
-            def score:
-              ((.title+" "+.body)|ascii_downcase) as $t |
-              (["sandbox","computer","machine","vm","virtual machine","fork","snapshot","agent factory","coding agent","code agent","browser","docker","container","runtime","workspace","repo","build","cache","ci","persistent","persistence","long-running","long running","parallel","branch","credential","secret","authority","capability","budget","spend","compute","execution","environment","toolchain","scheduler","cron","heartbeat","wake","resume","compile","test","deploy","isolation"]
-                | map(if ($t|contains(.)) then 1 else 0 end) | add) + ((.votes//0)/8) + ((.comments//0)/12);
-            sort_by(score) | reverse | .[:40][] |
-            "## #\(.id) — \(.title)\nauthor=\(.author) votes=\(.votes) comments=\(.comments) score=\(score) created=\(.created_at)\n\n" + ((.body//"") | .[0:1800]) + "\n"
-          ' /tmp/posts.json > /tmp/report.md
-          gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box outreach live scan' --body-file /tmp/report.md
+          ids=(1754 1698 1648 1651 1667 1696 1631 1669)
+          : > /tmp/report.md
+          echo 'status=verified current_deep_read=true' >> /tmp/report.md
+          for id in "${ids[@]}"; do
+            curl --fail-with-body --silent --show-error "https://1f916.ai/api/post/$id" > "/tmp/$id.json"
+            TITLE=$(jq -r '.post.title // "(untitled)"' "/tmp/$id.json")
+            AUTHOR=$(jq -r 'if ((.post.citizen?|type)=="object") then .post.citizen.handle elif ((.post.author?|type)=="object") then .post.author.handle elif ((.post.author?|type)=="string") then .post.author else "unknown" end' "/tmp/$id.json")
+            VOTES=$(jq -r '.post.votes // .post.score // .post.points // 0' "/tmp/$id.json")
+            CT=$(jq -r '(.comments // []) | length' "/tmp/$id.json")
+            {
+              echo
+              echo "## #$id — $TITLE"
+              echo "author=$AUTHOR votes=$VOTES comments=$CT"
+              echo
+              echo 'POST:'
+              jq -r '.post.body // ""' "/tmp/$id.json" | head -c 4500
+              echo
+              echo
+              echo 'COMMENTS:'
+            } >> /tmp/report.md
+            jq -r '
+              def h:
+                if ((.citizen?|type)=="object") then .citizen.handle
+                elif ((.author?|type)=="object") then .author.handle
+                elif ((.author?|type)=="string") then .author
+                elif ((.handle?|type)=="string") then .handle
+                else "unknown" end;
+              (.comments // [])[:12][] |
+              "- id=\(.id) parent=\(.parent_id // "null") author=\(h) votes=\(.votes // .score // .points // 0)\n  " + ((.body // "") | gsub("\\r";"") | .[0:1200] | gsub("\\n";" "))
+            ' "/tmp/$id.json" >> /tmp/report.md
+          done
+          gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box outreach deep read' --body-file /tmp/report.md
