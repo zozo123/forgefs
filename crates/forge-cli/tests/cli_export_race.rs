@@ -63,11 +63,14 @@ fn import_source(cell: &Path, root: &Path, source: &Path) {
         .arg("--ref")
         .arg("heads/source");
     let result = run(&mut cmd);
-    assert!(result.contains("heads/source"), "unexpected import: {result}");
+    assert!(
+        result.contains("heads/source"),
+        "unexpected import: {result}"
+    );
 }
 
-fn merge_source(cell: &Path, integrator: &Path) -> Output {
-    authenticated(cell, integrator)
+fn merge_source(cell: &Path, cap: &Path) -> Output {
+    authenticated(cell, cap)
         .arg("merge")
         .arg("--into=main")
         .arg("--from=heads/source")
@@ -114,7 +117,10 @@ fn cli_export_racing_main_merge_is_wholly_old_or_wholly_new() {
 
     rewrite_source(&source, 0);
     import_source(d.path(), &root, &source);
-    let initial = merge_source(d.path(), &integrator);
+    // Root is intentionally used for this race: it can both merge protected
+    // main and read the arbitrary heads/source ref. The built-in integrator
+    // capability correctly denies that source ref by default.
+    let initial = merge_source(d.path(), &root);
     assert!(
         initial.status.success(),
         "initial merge failed: {}",
@@ -147,7 +153,7 @@ fn cli_export_racing_main_merge_is_wholly_old_or_wholly_new() {
         let integrate = {
             let barrier = Arc::clone(&barrier);
             let cell = d.path().to_path_buf();
-            let cap = integrator.clone();
+            let cap = root.clone();
             std::thread::spawn(move || {
                 barrier.wait();
                 merge_source(&cell, &cap)
