@@ -244,10 +244,7 @@ fn parse_caveats(caveats: &[String]) -> Result<ParsedCaveats> {
             let set = parse_ref_set(refs, "allow")?;
             op_ref_sets.entry(op).or_default().push(set);
         } else if let Some(rest) = c.strip_prefix("ref!=") {
-            if rest.is_empty() {
-                return Err(Error::Cap("empty ref!= caveat".into()));
-            }
-            nots.push(rest.to_string());
+            nots.extend(parse_ref_set(rest, "ref!=")?);
         } else if let Some(rest) = c.strip_prefix("ref=") {
             ref_sets.push(parse_ref_set(rest, "ref=")?);
         } else if let Some(rest) = c.strip_prefix("time<=") {
