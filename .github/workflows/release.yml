@@ -1,0 +1,880 @@
+# ForgeFS release pipeline.
+#
+# Issues served: #51 (protect main with the executable correctness gates),
+# #45 (harden the dependency and release supply chain), #24 (record the
+# reproducible benchmark environment line), plus release-time verification of
+# #234 and #237.
+#
+# The shape of this workflow is deliberate:
+#
+#   verify-tag      cheapest possible gate, no toolchain, runs first
+#     -> gate           the ci.yml correctness gates, on Linux AND macOS
+#     -> msrv           1.89.0 still compiles and tests
+#     -> supply-chain   audit + deny + "the build did not rewrite Cargo.lock"
+#     -> build          the four shipped target triples
+#          -> e2e-release-gate   ForgeFS seals and verifies ITSELF, using the
+#                                exact bytes that will be published
+#          -> readonly-verify    non-blocking, red until #234 is fixed
+#     -> provenance   SLSA attestation over the published checksums
+#       -> publish    gh release create
+#
+# e2e-release-gate deliberately depends on `build` rather than compiling its
+# own binary: gating a rebuild proves something about a rebuild, while gating
+# the downloaded artifact proves something about the bytes users will run.
+#
+# Third-party and first-party actions are pinned by commit SHA with the tag in
+# a trailing comment. A release workflow is precisely where a movable tag is a
+# supply-chain hole (#45); actions/checkout is pinned to the same SHA the
+# repository already uses in trusted-pr-integration.yml.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run every release gate but publish nothing'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the ref so two tags can be released independently, and never
+  # cancel-in-progress: cancelling a release halfway through leaves published
+  # artifacts without provenance, which is worse than a queued run.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Refuse the release before spending a single toolchain minute on it.
+  # ---------------------------------------------------------------------------
+  verify-tag:
+    name: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      tagged: ${{ steps.identity.outputs.tagged }}
+      dry_run: ${{ steps.identity.outputs.dry_run }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
+      publish: ${{ steps.identity.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # Full history so the ancestor-of-main check below can run.
+          fetch-depth: 0
+
+      - name: Assert the release scripts are executable
+        # A lost exec bit would otherwise surface much later as an opaque
+        # "permission denied" inside the e2e gate. Fail here, in 30 seconds,
+        # with the fix in the message.
+        run: |
+          set -euo pipefail
+          for script in \
+            scripts/release-gate.sh \
+            scripts/cli-abi-conformance.sh \
+            scripts/forge-env-line.sh \
+            scripts/verify-tag-version.sh
+          do
+            if [ ! -x "$script" ]; then
+              echo "::error title=Script not executable::$script must be committed with mode 100755 (git update-index --chmod=+x $script)"
+              exit 1
+            fi
+          done
+          echo "all release scripts are executable"
+
+      - name: Resolve release identity and verify the tag
+        id: identity
+        env:
+          # Never interpolate github.* directly into a run body. Every value
+          # crosses into the shell as an environment variable.
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          tag=""
+          tagged=false
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+            tagged=true
+          fi
+
+          # A manual run publishes nothing unless the operator explicitly
+          # unticks dry_run. Default-safe, not default-convenient.
+          dry_run=false
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN_INPUT" != "false" ]; then
+            dry_run=true
+          fi
+
+          prerelease=false
+          if [ "$tagged" = true ]; then
+            # Constrain the tag to a shape that cannot carry a shell
+            # metacharacter, because git refnames happily accept $ ` ; & | ( ).
+            if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+              echo "::error title=Bad release tag::'$tag' is not v<major>.<minor>.<patch>[-prerelease]"
+              exit 1
+            fi
+            case "$tag" in
+              *-*) prerelease=true ;;
+            esac
+            report="$(scripts/verify-tag-version.sh "$tag")"
+          else
+            echo "no tag on this ref; checking workspace version self-consistency only"
+            report="$(scripts/verify-tag-version.sh)"
+          fi
+          printf '%s\n' "$report"
+
+          version="$(printf '%s\n' "$report" | sed -n 's/^workspace_version=//p')"
+          if [ -z "$version" ]; then
+            echo "::error title=No workspace version::verify-tag-version.sh did not report workspace_version="
+            exit 1
+          fi
+
+          publish=false
+          if [ "$tagged" = true ] && [ "$dry_run" = false ]; then
+            publish=true
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "tagged=$tagged"
+            echo "dry_run=$dry_run"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "### release identity"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`${tag:-<none>}\` |"
+            echo "| workspace version | \`$version\` |"
+            echo "| prerelease | \`$prerelease\` |"
+            echo "| dry run | \`$dry_run\` |"
+            echo "| will publish | \`$publish\` |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. #51: the executable correctness gates, on both durability platforms.
+  #    macOS is the F_FULLFSYNC path (docs/RECOVERY.md) and the platform least
+  #    covered by evidence, so a release may not skip it.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: gate (${{ matrix.os }})
+    needs: verify-tag
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Refuse a tag that is not contained in main
+        # A tag is not a review. Anyone holding contents:write can tag an
+        # arbitrary commit; without this, every gate below would pass on it and
+        # provenance would be minted over code that never passed review.
+        if: steps.identity.outputs.tagged == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error title=Tag not on main::$GITHUB_SHA is not an ancestor of origin/main; release only from main"
+            exit 1
+          fi
+          echo "tagged commit is contained in origin/main"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-gate-${{ matrix.os }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
+  msrv:
+    name: msrv 1.89.0
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-msrv-1.89
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --locked
+      - name: Test MSRV
+        run: cargo test --workspace --all-targets --locked
+
+  # ---------------------------------------------------------------------------
+  # 3. #45: the dependency supply chain, against the committed lockfile.
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: supply-chain
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    # cargo-audit and cargo-deny are both built from source, matching
+    # security.yml. That is slow on a 2 vCPU runner with a cold
+    # Swatinem/rust-cache bin cache; the budget is deliberately generous.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-supply-chain
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Audit the committed lockfile
+        run: cargo audit --deny warnings
+      - name: cargo-deny advisories, bans, licenses, sources
+        run: cargo deny --locked check advisories bans licenses sources
+      - name: Resolve the graph with the committed lockfile only
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo metadata --locked --format-version 1 >/dev/null
+      - name: Assert the build did not rewrite Cargo.lock
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- Cargo.lock; then
+            echo "::error title=Cargo.lock is dirty::the release build modified the committed lockfile"
+            git --no-pager diff --stat -- Cargo.lock
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- Cargo.lock)" ]; then
+            echo "::error title=Cargo.lock is dirty::git reports Cargo.lock as changed"
+            git status --porcelain -- Cargo.lock
+            exit 1
+          fi
+          echo "Cargo.lock unchanged; every cargo invocation in this workflow uses --locked"
+
+  # ---------------------------------------------------------------------------
+  # 4. Release binaries for the four supported target triples.
+  #
+  # Cross-compilation choices, stated rather than assumed:
+  #  * aarch64-unknown-linux-gnu builds on a NATIVE arm64 runner. rusqlite is
+  #    used with `bundled`, so a foreign-arch build needs a C cross toolchain
+  #    for SQLite; a native runner removes that whole class of problem instead
+  #    of inventing a cross setup nobody validates.
+  #  * x86_64-apple-darwin builds on the arm64 macos-15 runner. That is a real
+  #    cross build, but the macOS SDK is universal and clang accepts
+  #    -target x86_64-apple-darwin with no extra toolchain, so the `cc` crate
+  #    compiles bundled SQLite for x86_64 with the same SDK.
+  #  * Nothing here is statically linked against musl. See docs/RELEASING.md,
+  #    "Why the Linux artifacts are glibc-dynamic": swapping the C toolchain
+  #    that compiles bundled SQLite changes the durability-critical code being
+  #    shipped, so a musl artifact needs its own e2e-release-gate row before it
+  #    can be trusted. Shipping an ungated musl binary would break the one
+  #    property this pipeline exists to provide.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify-tag
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-build-${{ matrix.target }}
+      - name: Build forge
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p forge-cli --target "$TARGET"
+      - name: Package, checksum and record the build
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+          RUNNER_ARCH_NAME: ${{ runner.arch }}
+          RUNNER_IMAGE: ${{ matrix.os }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # macOS has shasum, Linux has sha256sum; both emit "<hex>  <name>".
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256() { sha256sum "$@"; }
+          else
+            sha256() { shasum -a 256 "$@"; }
+          fi
+
+          bin="target/$TARGET/release/forge"
+          test -x "$bin"
+
+          # Only execute a binary built for THIS host. The arm64 macos-15 runner
+          # is not guaranteed to ship Rosetta 2, so running the
+          # x86_64-apple-darwin artifact here would fail with "Bad CPU type in
+          # executable" and kill every release. For a cross build, prove the
+          # architecture instead of running it.
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "$TARGET" = "$host" ]; then
+            observed="$("$bin" --version | awk '{print $2}')"
+            if [ "$observed" != "$VERSION" ]; then
+              echo "::error title=Version mismatch::built binary reports $observed, release is $VERSION"
+              exit 1
+            fi
+            version_evidence="$observed"
+          else
+            case "$TARGET" in
+              *-apple-darwin)
+                want="${TARGET%%-*}"
+                got="$(lipo -archs "$bin")"
+                if [ "$got" != "$want" ]; then
+                  echo "::error title=Wrong architecture::$bin is $got, expected $want"
+                  exit 1
+                fi
+                ;;
+              *)
+                if ! file -b "$bin" | grep -qi "$(printf '%s' "${TARGET%%-*}" | sed 's/_/-/')\|${TARGET%%-*}"; then
+                  echo "::error title=Wrong architecture::$bin does not look like ${TARGET%%-*}"
+                  exit 1
+                fi
+                ;;
+            esac
+            observed="$VERSION"
+            version_evidence="not executed (cross build for $TARGET on $host)"
+            echo "cross-built for $TARGET on $host; --version deliberately not executed"
+          fi
+
+          name="forge-$VERSION-$TARGET"
+          stage="stage/$name"
+          mkdir -p "$stage" dist
+          cp "$bin" "$stage/forge"
+          cp LICENSE README.md CLI_ABI.md INVARIANTS.md "$stage/"
+          tar -czf "dist/$name.tar.gz" -C stage "$name"
+          ( cd dist && sha256 "$name.tar.gz" >"$name.tar.gz.sha256" )
+
+          {
+            echo "artifact:         $name.tar.gz"
+            echo "forge version:    $version_evidence"
+            echo "target triple:    $TARGET"
+            echo "commit:           $COMMIT_SHA"
+            echo "build command:    cargo build --release --locked -p forge-cli --target $TARGET"
+            echo "build profile:    release (not stripped; symbols retained for crash triage)"
+            echo "runner image:     $RUNNER_IMAGE ($RUNNER_OS_NAME/$RUNNER_ARCH_NAME)"
+            echo "rustc:            $(rustc --version)"
+            echo "cargo:            $(cargo --version)"
+            echo "sqlite:           rusqlite 'bundled' - SQLite compiled from source by the cc crate"
+            case "$RUNNER_OS_NAME" in
+              Linux)
+                echo "libc:             glibc, dynamically linked"
+                echo "glibc build floor: $(ldd --version 2>&1 | head -n1)"
+                echo "dynamic deps:     $(ldd "$bin" 2>&1 | tr -s ' \n' ' ')"
+                ;;
+              macOS)
+                echo "libc:             Apple libSystem, dynamically linked"
+                echo "sdk:              $(xcrun --show-sdk-version 2>/dev/null || echo unavailable)"
+                echo "dynamic deps:     $(otool -L "$bin" 2>/dev/null | tr -s ' \n' ' ' || echo unavailable)"
+                ;;
+            esac
+            echo "sha256:           $(cat "dist/$name.tar.gz.sha256")"
+          } >"dist/$name.BUILD-INFO.txt"
+
+          cat "dist/$name.BUILD-INFO.txt"
+      - name: Upload target artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: forge-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 5. THE gate that belongs to this project: ForgeFS seals and verifies
+  #    itself, using the exact artifact that will be published.
+  #
+  #    Covered natively: 3 of the 4 shipped triples. x86_64-apple-darwin is
+  #    built and attested but cannot be self-verified here, because the arm64
+  #    macOS runner is not guaranteed to have Rosetta 2. That gap is stated in
+  #    docs/RELEASING.md rather than papered over.
+  # ---------------------------------------------------------------------------
+  e2e-release-gate:
+    name: e2e-release-gate ${{ matrix.target }}
+    needs: [verify-tag, build]
+    runs-on: ${{ matrix.os }}
+    # The gate itself is ~1.4 s of wall time on a 2 vCPU Linux box (measured,
+    # excluding cargo build - this job compiles nothing). The budget is
+    # checkout + artifact download + first-run overhead, sized to catch a hang.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download the artifact that will be published
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: forge-${{ matrix.target }}
+          path: dist
+      - name: Unpack and verify the shipped bytes
+        id: unpack
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            verify() { sha256sum -c "$1"; }
+          else
+            verify() { shasum -a 256 -c "$1"; }
+          fi
+
+          name="forge-$VERSION-$TARGET"
+          cd dist
+          verify "$name.tar.gz.sha256"
+          tar -xzf "$name.tar.gz"
+          chmod +x "$name/forge"
+          bin="$PWD/$name/forge"
+
+          observed="$("$bin" --version | awk '{print $2}')"
+          if [ "$observed" != "$VERSION" ]; then
+            echo "::error title=Version mismatch::shipped binary reports $observed, release is $VERSION"
+            exit 1
+          fi
+          echo "bin=$bin" >>"$GITHUB_OUTPUT"
+      - name: ForgeFS seals and verifies itself
+        env:
+          FORGE_BIN: ${{ steps.unpack.outputs.bin }}
+          FORGE_ENV_COMMIT: ${{ github.sha }}
+          FORGE_ENV_PROFILE: release
+        run: scripts/release-gate.sh "$FORGE_BIN" release-gate-out
+      - name: Label the gate artifacts with their target
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p labelled
+          if [ -d release-gate-out ]; then
+            for f in release-gate-out/*; do
+              [ -e "$f" ] || continue
+              base="$(basename "$f")"
+              stem="${base%.*}"
+              ext="${base##*.}"
+              cp "$f" "labelled/$stem-$TARGET.$ext"
+            done
+          fi
+          ls -la labelled || true
+      - name: Upload the gate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-gate-${{ matrix.target }}
+          path: labelled/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 6. #234: a repository on read-only media cannot be opened, so fsck/verify
+  #    fail there. This job is EXPECTED TO FAIL today. It is wired
+  #    continue-on-error so it is never on a blocking path, and it becomes a
+  #    real gate for free the moment #234 is fixed - at which point delete the
+  #    continue-on-error line and add this job to `provenance.needs`.
+  # ---------------------------------------------------------------------------
+  readonly-verify:
+    name: readonly-verify (non-blocking, #234)
+    needs: [verify-tag, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download the linux x86_64 artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: forge-x86_64-unknown-linux-gnu
+          path: dist
+      - name: Build a read-only ext4 loop filesystem and verify a forge on it
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="forge-$VERSION-x86_64-unknown-linux-gnu"
+          tar -xzf "dist/$name.tar.gz" -C dist
+          bin="$PWD/dist/$name/forge"
+          chmod +x "$bin"
+
+          img="$RUNNER_TEMP/forge-readonly.img"
+          mnt="$RUNNER_TEMP/forge-readonly-mnt"
+          dd if=/dev/zero of="$img" bs=1M count=256 status=none
+          mkfs.ext4 -q -F "$img"
+          mkdir -p "$mnt"
+          sudo mount -o loop "$img" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+
+          # Populate a real, sealed repository while the filesystem is writable.
+          demo="$mnt/demo"
+          "$bin" init "$demo"
+          root="$demo/.forge/keys/root.cap"
+          integrator="$demo/.forge/keys/integrator.cap"
+          ns="$("$bin" --dir "$demo" --cap "$root" session open --from=main)"
+          "$bin" --dir "$demo" --cap "$root" write --ns "$ns" /ro.txt --text 'read-only media'
+          "$bin" --dir "$demo" --cap "$root" checkin --ns "$ns" -m ro
+          "$bin" --dir "$demo" --cap "$integrator" merge --into=main --from "heads/agents/anon/$ns"
+          "$bin" --dir "$demo" --cap "$integrator" seal main --tag ro-check --attest
+          "$bin" --dir "$demo" --cap "$root" fsck --full
+          sync
+
+          # Freeze the media. Everything below is a pure read path by contract:
+          # INVARIANTS I15 says verify/fsck reread durable bytes, and
+          # README says fsck is read-only.
+          sudo mount -o remount,ro "$mnt"
+          mount | grep -F "$mnt"
+
+          mkdir -p readonly-out
+          set +e
+          "$bin" --dir "$demo" --cap "$root" fsck --full >readonly-out/fsck.txt 2>&1
+          fsck_exit=$?
+          "$bin" --dir "$demo" --cap "$root" fsck --full --json >readonly-out/fsck.json 2>&1
+          fsck_json_exit=$?
+          "$bin" --dir "$demo" --cap "$root" verify ro-check >readonly-out/verify.txt 2>&1
+          verify_exit=$?
+          set -e
+
+          {
+            echo "read-only media verification (#234)"
+            echo "filesystem:      ext4 on a loopback image, remounted read-only"
+            echo "mount:           $(mount | grep -F "$mnt" || echo unavailable)"
+            echo "fsck --full:        exit $fsck_exit"
+            echo "fsck --full --json: exit $fsck_json_exit"
+            echo "verify ro-check:    exit $verify_exit"
+            echo ""
+            echo "Contract: fsck and verify are read-only paths (README, I15), so all"
+            echo "three must exit 0 on read-only media. #234 records that they do not."
+          } | tee readonly-out/summary.txt
+
+          if [ "$fsck_exit" -ne 0 ] || [ "$fsck_json_exit" -ne 0 ] || [ "$verify_exit" -ne 0 ]; then
+            echo "::warning title=#234 still open::read-only fsck/verify failed (fsck=$fsck_exit json=$fsck_json_exit verify=$verify_exit)"
+            cat readonly-out/fsck.txt readonly-out/verify.txt || true
+            exit 1
+          fi
+          echo "::notice title=#234 appears fixed::read-only fsck and verify both succeeded; promote this job to a blocking gate"
+      - name: Upload the read-only evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: readonly-verify-234
+          path: readonly-out/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Unmount
+        if: always()
+        run: sudo umount "$RUNNER_TEMP/forge-readonly-mnt" || true
+
+  # ---------------------------------------------------------------------------
+  # 7. SLSA build provenance over the exact bytes that will be published.
+  #    id-token and attestations write live ONLY here.
+  # ---------------------------------------------------------------------------
+  provenance:
+    name: provenance
+    # Requires a GitHub Environment named "release" with required reviewers and
+    # a deployment tag rule of v*. This is the only mechanism that stops a
+    # re-run of an old tag from re-publishing unattended. See docs/RELEASING.md.
+    environment: release
+    needs: [verify-tag, gate, msrv, supply-chain, build, e2e-release-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download every build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: forge-*
+          merge-multiple: true
+          path: dist
+      - name: Download the release-gate evidence
+        # The release notes tell a consumer to read these files to decide
+        # whether to trust the binary, so they must be attestation subjects
+        # too. Otherwise the bytes get a strong integrity story and the claims
+        # ABOUT the bytes get none.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-gate-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble and cross-check SHA256SUMS
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+
+          # Hash what actually arrived, then prove it agrees with the checksum
+          # each build job recorded next to the bytes it produced. A mismatch
+          # means the artifact pipeline changed the bytes.
+          # Every asset that `publish` attaches to the release must appear here,
+          # not just the tarballs.
+          : >SHA256SUMS
+          for f in *.tar.gz *.BUILD-INFO.txt gate-summary-*.json fsck-full-*.json \
+                   abi-conformance-*.json seal-attestation-*.txt env-line-*.txt \
+                   env-line-*.json conflict-object-*.txt; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" >>SHA256SUMS
+          done
+          sort -k2 -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+
+          for recorded in *.tar.gz.sha256; do
+            expected="$(awk '{print $1}' "$recorded")"
+            subject="$(awk '{print $2}' "$recorded")"
+            actual="$(awk -v s="$subject" '$2 == s {print $1}' SHA256SUMS)"
+            if [ -z "$actual" ] || [ "$expected" != "$actual" ]; then
+              echo "::error title=Checksum mismatch::$subject build-time=$expected now=$actual"
+              exit 1
+            fi
+          done
+
+          tarballs="$(find . -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')"
+          if [ "$tarballs" -ne 4 ]; then
+            echo "::error title=Wrong artifact count::expected 4 target tarballs, found $tarballs"
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+          count="$(wc -l <SHA256SUMS | tr -d ' ')"
+          echo "$tarballs tarballs and $count total assets for $VERSION checksum-verified end to end"
+      - name: Attest build provenance
+        if: needs.verify-tag.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Dry run - report what would have been attested
+        if: needs.verify-tag.outputs.publish != 'true'
+        run: |
+          set -euo pipefail
+          echo "dry run: skipping attestation. Subjects that would be attested:"
+          cat dist/SHA256SUMS
+          {
+            echo "### provenance (dry run)"
+            echo ""
+            echo "No attestation was minted. An attestation is a durable public claim"
+            echo "about bytes, so it is only created for a real publish."
+            echo ""
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Upload SHA256SUMS
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 8. Publish. contents: write lives ONLY here, and the whole job is skipped
+  #    on a dry run or on any ref that is not a release tag.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish
+    environment: release
+    needs: [verify-tag, provenance]
+    if: needs.verify-tag.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: forge-*
+          merge-multiple: true
+          path: dist
+      - name: Download SHA256SUMS
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: SHA256SUMS
+          path: dist
+      - name: Stage the release payload
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          ( cd dist && sha256sum -c SHA256SUMS )
+          cp dist/*.tar.gz dist/SHA256SUMS dist/*.BUILD-INFO.txt upload/
+          # Strict on purpose: a release without its gate evidence is not a
+          # release this pipeline is willing to publish.
+          cp -a dist/. upload/
+          test -n "$(find upload -name 'gate-summary-*.json' -print -quit)"
+          test -n "$(find upload -name 'fsck-full-*.json' -print -quit)"
+          ls -la upload
+
+          # Release notes are composed from files, never from an interpolated
+          # expression, and every value arrives through the environment.
+          {
+            echo "ForgeFS $TAG"
+            echo ""
+            echo "Commit \`$COMMIT_SHA\`. Built and gated by workflow run $RUN_ID."
+            echo ""
+            echo "## What gated this release"
+            echo ""
+            echo "- \`cargo fmt --check\`, \`check\`, \`clippy -D warnings\`, \`test --workspace --all-targets --locked\` on Rust 1.97.0, on ubuntu-latest **and** macos-15 (the \`F_FULLFSYNC\` durability path)."
+            echo "- Rust 1.89.0 MSRV check and test."
+            echo "- \`cargo audit --deny warnings\` and \`cargo deny check advisories bans licenses sources\` against the committed \`Cargo.lock\`, which the build did not modify."
+            echo "- The tag matches \`workspace.package.version\` exactly, and every workspace member inherits it."
+            echo "- **ForgeFS sealed and verified itself using these exact artifacts**: the README two-agent path, a deliberate same-path overlap that produced a Conflict object and exit 4, a stale observation that produced exit 4 without advancing the destination ref, \`seal --attest\`, \`verify\`, and a clean \`fsck --full --json\`."
+            echo "- The CLI exit-code ABI in \`CLI_ABI.md\` was asserted row by row (see \`abi-conformance-*.json\`)."
+            echo ""
+            echo "## Verifying what you downloaded"
+            echo ""
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS            # or: shasum -a 256 -c SHA256SUMS"
+            echo "gh attestation verify forge-$VERSION-<target>.tar.gz --repo $REPO"
+            echo '```'
+            echo ""
+            echo "## Evidence attached to this release"
+            echo ""
+            echo "| file | what it records |"
+            echo "|---|---|"
+            echo "| \`SHA256SUMS\` | checksums of every artifact, cross-checked against the checksum each build job recorded |"
+            echo "| \`gate-summary-<target>.json\` | machine-readable release-gate result |"
+            echo "| \`fsck-full-<target>.json\` | \`forge fsck --full --json\` report, verbatim |"
+            echo "| \`seal-attestation-<target>.txt\` | the sealed tag, its snapshot OID and the verify result |"
+            echo "| \`abi-conformance-<target>.json\` | the \`CLI_ABI.md\` exit-code table, including rows still blocked on #237 |"
+            echo "| \`conflict-object-<target>.txt\` | the Conflict object produced by the overlap phase |"
+            echo "| \`env-line-<target>.txt\` | the \`docs/BENCH.md\` environment line these gates ran under |"
+            echo "| \`forge-$VERSION-<target>.BUILD-INFO.txt\` | toolchain, runner image, libc floor and linkage of each binary |"
+            echo ""
+            echo "## Known gaps in this release's evidence"
+            echo ""
+            echo "- \`x86_64-apple-darwin\` is built and attested but not self-verified; the arm64 macOS runner is not guaranteed to have Rosetta 2."
+            echo "- Read-only media (#234): \`fsck\`/\`verify\` on a read-only filesystem is exercised by a non-blocking job and is expected to fail."
+            echo "- CLI ABI (#237): duplicate \`branch\`/\`seal\` and a non-UTF-8 \`--cap\` file still surface as exit 5. Those rows are reported and non-blocking."
+            echo "- Linux artifacts are glibc-dynamic; see the \`BUILD-INFO\` files for the glibc floor."
+          } >notes.md
+          cat notes.md
+
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "prerelease: yes (tag contains a hyphen)"
+          else
+            echo "prerelease: no"
+          fi
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          args=(--title "ForgeFS $TAG" --notes-file notes.md --verify-tag)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}" upload/*
+          gh release view "$TAG" --json name,isPrerelease,assets \
+            --jq '{name, isPrerelease, assets: [.assets[].name]}'
+      - name: Summarise
+        if: always()
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### published"
+            echo ""
+            echo "- tag: \`$TAG\`"
+            echo "- prerelease: \`$PRERELEASE\`"
+            echo "- https://github.com/$REPO/releases/tag/$TAG"
+          } >>"$GITHUB_STEP_SUMMARY"

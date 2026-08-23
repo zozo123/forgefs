@@ -72,3 +72,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Concurrent agent smoke benchmark
         run: cargo run --locked -p forge-cli -- bench --agents 32 --shared 16 --workers 16
+
+  gates:
+    # #51: the executable correctness gates, on every PR, under a stable job
+    # name so it can be a required status check. These are the same scripts the
+    # release pipeline runs, so a release cannot pass a gate that main does not.
+    name: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gates
+      - name: Build forge
+        run: cargo build --locked -p forge-cli
+      - name: CLI ABI conformance
+        run: scripts/cli-abi-conformance.sh target/debug/forge
+      - name: End-to-end release gate
+        run: scripts/release-gate.sh target/debug/forge
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-gate-evidence
+          path: |
+            gate-summary.json
+            abi-conformance.json
+          if-no-files-found: warn
