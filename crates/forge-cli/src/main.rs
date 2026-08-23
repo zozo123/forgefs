@@ -70,7 +70,7 @@ enum Cmd {
         message: String,
     },
     Import {
-        dir: PathBuf,
+        source: PathBuf,
         #[arg(long)]
         r#ref: String,
     },
@@ -302,8 +302,8 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
             CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
         },
-        Cmd::Import { dir, r#ref } => {
-            let id = f.import_dir(cap, &dir, &r#ref)?;
+        Cmd::Import { source, r#ref } => {
+            let id = f.import_dir(cap, &source, &r#ref)?;
             println!("imported {id} -> {ref_name}", ref_name = r#ref);
         }
         Cmd::Branch { from, name } => {
@@ -429,4 +429,32 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
         Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Bench { .. } => unreachable!(),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_source_does_not_override_global_repository_dir() {
+        let cli = Cli::try_parse_from([
+            "forge",
+            "--dir",
+            "/repo-a",
+            "import",
+            "/repo-b/src",
+            "--ref",
+            "heads/import",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.dir.as_deref(), Some(Path::new("/repo-a")));
+        match cli.cmd {
+            Cmd::Import { source, r#ref } => {
+                assert_eq!(source, PathBuf::from("/repo-b/src"));
+                assert_eq!(r#ref, "heads/import");
+            }
+            _ => panic!("expected import command"),
+        }
+    }
 }
