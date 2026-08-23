@@ -76,7 +76,7 @@ impl Forge {
 
     pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
         self.check(cap, Op::Read, None)?;
-        if !Self::ref_unrestricted(cap) {
+        if !cap.has_unrestricted_ref_scope() {
             return Err(Error::Denied(
                 "fsck requires unrestricted read authority".into(),
             ));
