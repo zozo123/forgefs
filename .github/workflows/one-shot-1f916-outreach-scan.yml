@@ -2,7 +2,7 @@ name: one-shot-1f916-outreach-scan
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize]
 
 permissions:
   contents: read
@@ -19,24 +19,24 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Scan live 1F916 feeds for Box-adjacent threads
+      - name: Scan live 1F916 front page for Box-adjacent threads
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error 'https://1f916.ai/api/feed?sort=front' > /tmp/front.json
-          curl --fail-with-body --silent --show-error 'https://1f916.ai/api/feed?sort=new' > /tmp/new.json
+          curl --fail-with-body --silent --show-error 'https://1f916.ai/api/front?order=top&limit=100' > /tmp/top.json
+          curl --fail-with-body --silent --show-error 'https://1f916.ai/api/front?order=new&limit=100' > /tmp/new.json
           jq -s '
-            def posts: if type=="array" then . elif .posts? then .posts elif .items? then .items elif .feed? then .feed else [] end;
+            def posts: if type=="array" then . elif .posts? then .posts elif .items? then .items elif .front? then .front else [] end;
             (.[0] | posts) + (.[1] | posts)
             | unique_by(.id)
             | map({id,title:(.title//""),body:(.body//""),votes:(.votes//.score//.points//0),comments:(.comments_total//.comment_count//0),created_at:(.created_at//""),author:(if ((.citizen?|type)=="object") then .citizen.handle elif ((.author?|type)=="object") then .author.handle elif ((.author?|type)=="string") then .author else "unknown" end)})
-          ' /tmp/front.json /tmp/new.json > /tmp/posts.json
+          ' /tmp/top.json /tmp/new.json > /tmp/posts.json
           jq -r '
             def score:
               ((.title+" "+.body)|ascii_downcase) as $t |
-              (["sandbox","computer","machine","vm","virtual machine","fork","snapshot","agent factory","coding agent","code agent","browser","docker","container","runtime","workspace","repo","build","cache","ci","continuous integration","persistent","persistence","long-running","long running","parallel","branch","credential","secret","authority","capability","budget","spend","compute","execution","environment","toolchain","scheduler","cron","heartbeat","wake","resume"]
+              (["sandbox","computer","machine","vm","virtual machine","fork","snapshot","agent factory","coding agent","code agent","browser","docker","container","runtime","workspace","repo","build","cache","ci","persistent","persistence","long-running","long running","parallel","branch","credential","secret","authority","capability","budget","spend","compute","execution","environment","toolchain","scheduler","cron","heartbeat","wake","resume","compile","test","deploy","isolation"]
                 | map(if ($t|contains(.)) then 1 else 0 end) | add) + ((.votes//0)/8) + ((.comments//0)/12);
-            sort_by(score) | reverse | .[:35][] |
+            sort_by(score) | reverse | .[:40][] |
             "## #\(.id) — \(.title)\nauthor=\(.author) votes=\(.votes) comments=\(.comments) score=\(score) created=\(.created_at)\n\n" + ((.body//"") | .[0:1800]) + "\n"
           ' /tmp/posts.json > /tmp/report.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box outreach live scan' --body-file /tmp/report.md
