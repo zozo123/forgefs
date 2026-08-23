@@ -18,6 +18,4 @@ forge-cap.workspace = true
 forge-types.workspace = true
 libc.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
