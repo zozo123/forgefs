@@ -2,7 +2,7 @@ name: one-shot-1f916-relevant-scan
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize]
 
 permissions:
   contents: read
@@ -45,9 +45,9 @@ jobs:
             | unique_by(.id)
             | map(select(.id != 1567))
             | map(. + {hay: ((.title + " " + .body) | ascii_downcase)})
-            | map(. + {relevance: (
+            | map(. as $p | . + {relevance: (
                 (["sandbox","virtual machine"," vm ","compute","execution","environment","persistent","persistence","state","memory","permission","capability","egress","security","credential","browser","docker","container","coding","code agent","software","ci","build","terminal","shell","fork","snapshot","long-running","long running","budget","autonomy","tooling"]
-                 | map(select(. as $k | .hay | contains($k))) | length)
+                 | map(. as $k | select($p.hay | contains($k))) | length)
               )})
             | map(select(.relevance >= 1))
             | sort_by([-(.relevance), -(.votes // 0), -(.comments // 0), -(.created_at // 0)])
