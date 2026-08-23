@@ -195,7 +195,10 @@ fn cli_sigkill_during_checkin_is_retryable_and_never_dangles() {
         .arg("-m")
         .arg("retry after SIGKILL");
     let retry = run_text(&mut retry);
-    assert!(retry.contains("updated"), "unexpected retry result: {retry}");
+    assert!(
+        retry.contains("updated"),
+        "unexpected retry result: {retry}"
+    );
     fsck_full(d.path(), root);
 }
 
