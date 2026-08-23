@@ -21,6 +21,22 @@ fn run(cmd: &mut Command) -> String {
     stdout
 }
 
+fn run_denied(cmd: &mut Command) -> String {
+    let out = cmd.output().expect("spawn forge");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected denied exit\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("denied:"),
+        "expected capability denial\nstdout={stdout}\nstderr={stderr}"
+    );
+    stderr
+}
+
 fn assert_repo_operational(dir: &Path) {
     let dir = dir.to_str().unwrap();
     let cap = Path::new(dir).join(".forge/keys/root.cap");
@@ -99,6 +115,140 @@ fn cli_requires_cap() {
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no ambient root"), "{err}");
+}
+
+#[test]
+fn cli_attenuated_cap_is_not_root() {
+    let d = tempdir().unwrap();
+    run(forge().arg("init").current_dir(d.path()));
+    let dir = d.path().to_str().unwrap();
+    let root = d.path().join(".forge/keys/root.cap");
+    let root = root.to_str().unwrap();
+
+    let alice = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "grant",
+        "--ops",
+        "read,write,branch",
+        "--ref",
+        "main,heads/agents/alice/*",
+        "--agent",
+        "alice",
+    ]));
+    let alice = alice.trim().to_string();
+    let bob = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        root,
+        "grant",
+        "--ops",
+        "read,write,branch",
+        "--ref",
+        "main,heads/agents/bob/*",
+        "--agent",
+        "bob",
+    ]));
+    let bob = bob.trim().to_string();
+
+    let a = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &alice,
+        "session",
+        "open",
+        "--from=main",
+    ]));
+    let a = a.trim().to_string();
+    run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &alice,
+        "write",
+        "--ns",
+        &a,
+        "/alice.txt",
+        "--text",
+        "alice",
+    ]));
+    let checked_in = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &alice,
+        "checkin",
+        "--ns",
+        &a,
+        "-m",
+        "alice",
+    ]));
+    assert!(checked_in.contains("updated"), "{checked_in}");
+
+    let b = run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &bob,
+        "session",
+        "open",
+        "--from=main",
+    ]));
+    let b = b.trim().to_string();
+    run(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &bob,
+        "write",
+        "--ns",
+        &b,
+        "/bob.txt",
+        "--text",
+        "bob",
+    ]));
+    run(forge().args([
+        "--dir", dir, "--cap", &bob, "checkin", "--ns", &b, "-m", "bob",
+    ]));
+
+    let alice_ref = format!("heads/agents/alice/{a}");
+    let bob_ref = format!("heads/agents/bob/{b}");
+    let visible = run(forge().args(["--dir", dir, "--cap", &alice, "refs"]));
+    assert!(visible.contains("main"), "{visible}");
+    assert!(visible.contains(&alice_ref), "{visible}");
+    assert!(!visible.contains(&bob_ref), "{visible}");
+
+    run_denied(forge().args([
+        "--dir", dir, "--cap", &alice, "seal", "main", "--tag", "forbidden",
+    ]));
+    run_denied(forge().args(["--dir", dir, "--cap", &alice, "fsck", "--full"]));
+    run_denied(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &alice,
+        "merge",
+        "--into=main",
+        "--from",
+        &bob_ref,
+    ]));
+    run_denied(forge().args([
+        "--dir", dir, "--cap", &alice, "grant", "--ops", "read",
+    ]));
+    run_denied(forge().args([
+        "--dir",
+        dir,
+        "--cap",
+        &alice,
+        "session",
+        "open",
+        "--from",
+        &bob_ref,
+    ]));
 }
 
 #[test]
