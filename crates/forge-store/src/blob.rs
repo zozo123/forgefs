@@ -290,11 +290,7 @@ fn ensure_dir_durable(
         }
         Err(e) => return Err(Error::Io(e.to_string())),
     }
-    sync_dir_counted(
-        parent,
-        stats,
-        crate::DurabilityBarrier::ObjectPathDirectory,
-    )?;
+    sync_dir_counted(parent, stats, crate::DurabilityBarrier::ObjectPathDirectory)?;
     durable_dirs.lock().put(child.to_path_buf(), ());
     Ok(())
 }

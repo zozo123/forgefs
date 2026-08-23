@@ -173,8 +173,14 @@ fn failed_init_publication_barrier_exposes_only_a_complete_repository() {
     let fault = barrier_fault::fail_at(DurabilityBarrier::InitPublicationDirectory, 1);
     let result = Forge::init(dir.path());
     assert!(fault.fired());
-    assert!(result.is_err(), "failed publication barrier was acknowledged");
-    assert_eq!(std::fs::read(dir.path().join(".forge/VERSION")).unwrap(), b"1\n");
+    assert!(
+        result.is_err(),
+        "failed publication barrier was acknowledged"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".forge/VERSION")).unwrap(),
+        b"1\n"
+    );
     drop(fault);
 
     // A cold open joins the parent-directory durability proof. The repository

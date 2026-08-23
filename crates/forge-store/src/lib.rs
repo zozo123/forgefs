@@ -92,7 +92,10 @@ pub mod barrier_fault {
     pub fn fail_at(point: DurabilityBarrier, occurrence: usize) -> Guard {
         assert!(occurrence > 0, "barrier occurrence is one-based");
         ACTIVE.with(|active| {
-            assert!(active.get().is_none(), "a barrier fault plan is already armed");
+            assert!(
+                active.get().is_none(),
+                "a barrier fault plan is already armed"
+            );
             active.set(Some(Plan {
                 point,
                 occurrence,
