@@ -127,7 +127,9 @@ fn cli_inbox_push_list_and_continue_from_snapshot() {
     list.arg("inbox").arg("list");
     let listed = run_text(&mut list);
     assert!(
-        listed.lines().any(|line| line == format!("{inbox_ref} {snapshot_oid}")),
+        listed
+            .lines()
+            .any(|line| line == format!("{inbox_ref} {snapshot_oid}")),
         "Bob cannot see handoff: {listed}"
     );
 
