@@ -17,7 +17,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I1 | Decode(encode(x)) is encode(x). Non-canonical bytes are Corrupt. |
 | I2 | One logical object ⇒ one byte string ⇒ one ObjectId. |
 | I3 | Put is idempotent iff bytes match; never overwrite. |
-| I4 | A committed ref implies fsynced object bytes and parent directory. |
+| I4 | A committed ref implies fsynced object bytes and every directory edge needed to reach them; visibility alone is never a durability proof. |
 | I5 | Refs move only expected→new. Lost CAS forks or denies. Protected refs deny. |
 | I6 | Ref + reflog (+ seal) commit together. |
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |

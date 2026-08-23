@@ -53,6 +53,59 @@ fn future_or_malformed_repository_version_fails_closed() {
 }
 
 #[test]
+fn oversized_repository_version_fails_closed_without_unbounded_read() {
+    let dir = tempdir().unwrap();
+    drop(Forge::init(dir.path()).unwrap());
+    fs::write(dir.path().join(".forge/VERSION"), vec![b'1'; 1024]).unwrap();
+    let error = Forge::open(dir.path())
+        .err()
+        .expect("oversized VERSION must fail");
+    assert!(matches!(error, Error::Invalid(_)), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_version_symlink_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    drop(Forge::init(dir.path()).unwrap());
+    let version = dir.path().join(".forge/VERSION");
+    fs::remove_file(&version).unwrap();
+    fs::write(dir.path().join("outside-version"), b"1\n").unwrap();
+    symlink("../outside-version", &version).unwrap();
+
+    let error = Forge::open(dir.path())
+        .err()
+        .expect("VERSION symlink must fail");
+    assert!(matches!(error, Error::Invalid(_)), "{error}");
+}
+
+#[test]
+fn init_durably_creates_missing_parent_chain() {
+    let dir = tempdir().unwrap();
+    let nested = dir.path().join("new/deep/worktree");
+    let forge = Forge::init(&nested).unwrap();
+    assert_eq!(forge.root(), nested.join(".forge"));
+    drop(forge);
+    drop(Forge::open(&nested).unwrap());
+}
+
+#[test]
+fn local_unversioned_control_directory_blocks_parent_discovery() {
+    let outer = tempdir().unwrap();
+    let _forge = Forge::init(outer.path()).unwrap();
+    let nested = outer.path().join("work/tree");
+    fs::create_dir_all(nested.join(".forge")).unwrap();
+    fs::write(nested.join(".forge/sentinel"), b"partial local repo").unwrap();
+
+    let error = Forge::open(&nested)
+        .err()
+        .expect("a local .forge must shadow every parent repository");
+    assert!(matches!(error, Error::Invalid(_)), "{error}");
+}
+
+#[test]
 fn import_excludes_only_root_control_directories() {
     let source = tempdir().unwrap();
     fs::create_dir_all(source.path().join(".git")).unwrap();

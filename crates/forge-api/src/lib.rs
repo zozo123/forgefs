@@ -93,7 +93,7 @@ impl Forge {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
+        create_dir_all_durable(parent)?;
         let base = root
             .file_name()
             .and_then(|name| name.to_str())
@@ -104,11 +104,13 @@ impl Forge {
             ulid::Ulid::new()
         ));
         fs::create_dir(&staging)?;
+        init_crash_point("staging-created");
 
         let prepared = (|| -> Result<File> {
             secure_key_dir(&staging.join("keys"))?;
             fs::create_dir_all(staging.join("objects"))?;
             fs::create_dir_all(staging.join("tmp"))?;
+            init_crash_point("directories-created");
 
             let mut hmac_key = [0u8; 32];
             let mut seal_seed = [0u8; 32];
@@ -120,9 +122,11 @@ impl Forge {
             write_secret(staging.join("keys/root.secret"), &hmac_key)?;
             write_secret(staging.join("keys/seal.ed25519"), &seal_seed)?;
             write_public(staging.join("keys/seal.pub"), &pk)?;
+            init_crash_point("keys-written");
 
             let store = Store::open(&staging)?;
             store.meta.set_cap_root(&pk)?;
+            init_crash_point("catalog-created");
 
             let root_cap = mint_root(&hmac_key)?;
             let integ = mint_integrator(&hmac_key)?;
@@ -147,6 +151,7 @@ impl Forge {
                 contrib: None,
             };
             let cid = store.put_commit(&commit)?;
+            init_crash_point("initial-objects-written");
             let intro_oids = store.collect_intros(None, empty)?;
             store.meta.insert_ref_with_intros(
                 "main",
@@ -159,14 +164,17 @@ impl Forge {
                 &intro_oids,
             )?;
             store.meta.landmark(cid, "commit", "init")?;
+            init_crash_point("main-ref-written");
             drop(store);
 
             write_public(staging.join("VERSION"), b"1\n")?;
+            init_crash_point("version-written");
             // Acquire the direct-client shared ownership while LOCK is still in
             // staging. The descriptor keeps the same inode locked across rename,
             // eliminating the post-publication daemon race.
             let cell_lock = acquire_cell_lock(&staging, false)?;
             sync_dir(&staging)?;
+            init_crash_point("staging-durable");
             Ok(cell_lock)
         })();
 
@@ -183,12 +191,17 @@ impl Forge {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
+        // The rename is now atomically visible to concurrent processes. The
+        // parent-directory barrier below is still required for power-loss
+        // durability; the failpoint models process death, not power failure.
+        init_crash_point("published");
         if let Err(error) = sync_dir(parent) {
             return Err(Error::Io(format!(
                 "repository published at {} but parent directory fsync failed: {error}",
                 root.display()
             )));
         }
+        init_crash_point("parent-durable");
 
         // Ownership was acquired before publication; opening the committed cell
         // cannot race a daemon. All repository contents were already validated in
@@ -214,6 +227,14 @@ impl Forge {
     }
 
     fn open_locked(root: PathBuf, cell_lock: File, exclusive: bool) -> Result<Self> {
+        // Revalidate after acquiring ownership. An updater may replace the
+        // repository between discovery's read-only check and this lock grant.
+        // No key, object, or SQLite state may be read or mutated first.
+        validate_repo_version(&root)?;
+        // A previous initializer may have died after the no-replace rename but
+        // before forcing this directory entry. Every cold open joins that
+        // publication before exposing a handle that can acknowledge writes.
+        sync_repo_parent(&root)?;
         validate_key_permissions(&root.join("keys"))?;
         let hmac = read32(&root.join("keys/root.secret"))?;
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
@@ -1384,14 +1405,86 @@ fn acquire_cell_lock(root: &Path, exclusive: bool) -> Result<File> {
 }
 
 fn validate_repo_version(root: &Path) -> Result<()> {
-    let version = fs::read(root.join("VERSION"))?;
-    match version.as_slice() {
+    let path = root.join("VERSION");
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() || metadata.len() > 3 {
+        return Err(Error::Invalid(format!(
+            "ForgeFS VERSION must be a regular file of at most 3 bytes: {}",
+            path.display()
+        )));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options.open(&path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() || opened_metadata.len() > 3 {
+        return Err(Error::Invalid(format!(
+            "ForgeFS VERSION changed while opening or is not a bounded regular file: {}",
+            path.display()
+        )));
+    }
+    let mut version = [0u8; 4];
+    let read = file.read(&mut version)?;
+    match &version[..read] {
         b"1" | b"1\n" | b"1\r\n" => Ok(()),
         _ => Err(Error::Invalid(format!(
             "unsupported ForgeFS repository VERSION at {} (this binary supports VERSION 1)",
             root.display()
         ))),
     }
+}
+
+fn sync_repo_parent(root: &Path) -> Result<()> {
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_dir(parent)
+}
+
+/// Create only missing parent components and force each new directory entry
+/// before building below it. Existing user-supplied ancestors are assumed to
+/// predate this operation; ForgeFS owns and re-proves the final `.forge` edge.
+fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component);
+        match fs::metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => continue,
+            Ok(_) => {
+                return Err(Error::Invalid(format!(
+                    "init parent component is not a directory: {}",
+                    current.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !fs::metadata(&current)?.is_dir() {
+                    return Err(Error::Invalid(format!(
+                        "init parent component is not a directory: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let parent = current.parent().unwrap_or_else(|| Path::new("."));
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 fn forge_root(dir: &Path) -> PathBuf {
@@ -1414,9 +1507,25 @@ pub fn find_forge(start: &Path) -> Result<PathBuf> {
         } else {
             cur.join(".forge")
         };
-        if cand.join("VERSION").exists() {
-            validate_repo_version(&cand)?;
-            return Ok(cand);
+        match fs::symlink_metadata(&cand) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(Error::Invalid(format!(
+                        "{} is not a ForgeFS repository directory",
+                        cand.display()
+                    )));
+                }
+                if !cand.join("VERSION").exists() {
+                    return Err(Error::Invalid(format!(
+                        "{} exists without a ForgeFS VERSION; refusing to search a parent repository",
+                        cand.display()
+                    )));
+                }
+                validate_repo_version(&cand)?;
+                return Ok(cand);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         if !cur.pop() {
             break;
@@ -1426,6 +1535,27 @@ pub fn find_forge(start: &Path) -> Result<PathBuf> {
         "no .forge above {}",
         start.display()
     )))
+}
+
+/// Debug-build-only process crash hook used by the cross-process init matrix.
+/// `_exit` skips Rust and SQLite destructors, matching abrupt process loss while
+/// keeping production builds free of an environment-controlled exit path.
+fn init_crash_point(point: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("FORGEFS_TEST_INIT_CRASH_AFTER")
+        .ok()
+        .as_deref()
+        == Some(point)
+    {
+        #[cfg(unix)]
+        unsafe {
+            libc::_exit(86)
+        }
+        #[cfg(not(unix))]
+        std::process::exit(86);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
 }
 
 fn secure_key_dir(path: &Path) -> Result<()> {
@@ -1477,7 +1607,7 @@ fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&path)?;
     f.write_all(bytes)?;
-    f.sync_all()?;
+    forge_store::durable_sync_file(&f)?;
     Ok(())
 }
 
@@ -1487,16 +1617,12 @@ fn write_public(path: PathBuf, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&path)?;
     f.write_all(bytes)?;
-    f.sync_all()?;
+    forge_store::durable_sync_file(&f)?;
     Ok(())
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    fs::File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    forge_store::durable_sync_dir(path)
 }
 
 fn read32(path: &Path) -> Result<[u8; 32]> {
@@ -1557,6 +1683,25 @@ mod tests {
         ));
         drop(shared);
         drop(acquire_cell_lock(&root, true).unwrap());
+    }
+
+    #[test]
+    fn repository_version_is_revalidated_after_lock_acquisition() {
+        let d = tempdir().unwrap();
+        let initialized = Forge::init(d.path()).unwrap();
+        let root = initialized.root().to_path_buf();
+        drop(initialized);
+
+        // Model discovery by an old binary, followed by an exclusive updater
+        // publishing a newer format before the old binary acquires its lock.
+        validate_repo_version(&root).unwrap();
+        let lock = acquire_cell_lock(&root, false).unwrap();
+        fs::write(root.join("VERSION"), b"2\n").unwrap();
+
+        let error = Forge::open_locked(root, lock, false)
+            .err()
+            .expect("locked open must revalidate VERSION");
+        assert!(matches!(error, Error::Invalid(_)), "{error}");
     }
 
     #[cfg(unix)]
