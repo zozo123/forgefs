@@ -23,6 +23,7 @@ use std::sync::Arc;
 /// injector. The enum is present in release builds so the real barrier calls
 /// stay identical, but injection state and branches are compiled out.
 #[doc(hidden)]
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurabilityBarrier {
     ObjectFile,
