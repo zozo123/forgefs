@@ -26,9 +26,9 @@ The workflow:
 - reads the current workspace version;
 - computes the next stable SemVer;
 - edits the single workspace version field;
-- runs `cargo update -w` so every local workspace package entry in `Cargo.lock` matches;
+- runs Cargo once without `--locked` so the existing lockfile is minimally refreshed for the local workspace-version change; it deliberately does not run `cargo update` and therefore does not opt into unrelated dependency upgrades;
 - proves `scripts/verify-tag-version.sh vX.Y.Z`;
-- runs fmt, check, clippy, tests, the CLI ABI table and the end-to-end release gate;
+- runs fmt, locked check, clippy, tests, the CLI ABI table and the end-to-end release gate;
 - pushes `release/vX.Y.Z` and opens a release-preparation PR.
 
 The generated PR contains only the version/lockfile transition. Review and merge it normally.
