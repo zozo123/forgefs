@@ -53,9 +53,7 @@ fn cli_shared_ref_stampede_has_one_winner_and_seven_forks() {
     let mut sessions = Vec::with_capacity(WRITERS);
     for i in 0..WRITERS {
         let mut open = authenticated(d.path(), &root);
-        open.arg("session")
-            .arg("open")
-            .arg("--from=heads/hot");
+        open.arg("session").arg("open").arg("--from=heads/hot");
         let ns = run(&mut open).trim().to_string();
 
         // Replace this session's private root mount with the same shared live
@@ -124,7 +122,11 @@ fn cli_shared_ref_stampede_has_one_winner_and_seven_forks() {
     }
 
     assert_eq!(updated, 1, "shared CAS must have exactly one winner");
-    assert_eq!(forked, WRITERS - 1, "every loser must be preserved as a fork");
+    assert_eq!(
+        forked,
+        WRITERS - 1,
+        "every loser must be preserved as a fork"
+    );
 
     let mut refs = authenticated(d.path(), &root);
     refs.arg("refs");
