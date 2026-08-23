@@ -4,11 +4,15 @@
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+const KILL_ATTEMPTS: usize = 4;
+const KILL_WINDOW: Duration = Duration::from_secs(20);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 fn forge() -> Command {
     Command::new(env!("CARGO_BIN_EXE_forge"))
@@ -68,32 +72,34 @@ fn recursive_file_count(root: &Path) -> usize {
 
 fn wait_for_active_publication(child: &mut Child, forge_root: &Path) -> bool {
     let objects = forge_root.join("objects");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + KILL_WINDOW;
     while Instant::now() < deadline {
+        // Establish that the child is still live before trusting persistent
+        // filesystem evidence it may have left behind.
         if child.try_wait().expect("poll benchmark child").is_some() {
             return false;
         }
-        if forge_root.join("VERSION").is_file() && recursive_file_count(&objects) >= 12 {
+        if forge_root.join("VERSION").is_file()
+            && forge_root.join("keys/root.cap").is_file()
+            && recursive_file_count(&objects) >= 12
+        {
             return true;
         }
-        thread::yield_now();
+        thread::sleep(POLL_INTERVAL);
     }
+
+    // A timeout is test infrastructure failure, but it must not leak a process
+    // that holds the cell lock or consumes CI resources.
+    let _ = child.kill();
+    let _ = child.wait();
     false
 }
 
-#[test]
-fn cli_sigkill_live_concurrent_cell_reopens_and_accepts_new_work() {
-    let d = tempdir().unwrap();
-    let cell = d.path().join("bench-cell");
-    let forge_root = cell.join(".forge");
-
-    // This is the shipped concurrent workload: private checkins plus shared-ref
-    // stampede running inside a real `forge` process. Kill only after the cell
-    // is valid and immutable object publication has advanced beyond bootstrap.
+fn spawn_active_bench(cell: &Path) -> Child {
     let mut bench = forge();
     bench
         .arg("--dir")
-        .arg(&cell)
+        .arg(cell)
         .arg("bench")
         .arg("--agents")
         .arg("256")
@@ -103,21 +109,45 @@ fn cli_sigkill_live_concurrent_cell_reopens_and_accepts_new_work() {
         .arg("16")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = bench.spawn().expect("spawn forge bench");
+    bench.spawn().expect("spawn forge bench")
+}
 
-    assert!(
-        wait_for_active_publication(&mut child, &forge_root),
-        "benchmark completed or stalled before observable concurrent publication"
-    );
-    child.kill().expect("SIGKILL active benchmark");
-    let status = child.wait().expect("wait killed benchmark");
-    assert_eq!(
-        status.signal(),
-        Some(9),
-        "benchmark was not actually terminated by SIGKILL: {status:?}"
-    );
+fn catch_real_sigkill(root: &Path) -> Option<PathBuf> {
+    for attempt in 0..KILL_ATTEMPTS {
+        let cell = root.join(format!("bench-cell-{attempt}"));
+        let forge_root = cell.join(".forge");
+        let mut child = spawn_active_bench(&cell);
 
+        if !wait_for_active_publication(&mut child, &forge_root) {
+            continue;
+        }
+
+        // The workload can finish in the tiny observation-to-signal race. That
+        // is a missed attempt, not crash evidence; retry on a fresh cell.
+        if child.kill().is_err() {
+            let _ = child.wait();
+            continue;
+        }
+        let status = child.wait().expect("wait killed benchmark");
+        if status.signal() == Some(9) {
+            return Some(cell);
+        }
+    }
+    None
+}
+
+#[test]
+fn cli_sigkill_live_concurrent_cell_reopens_and_accepts_new_work() {
+    let d = tempdir().unwrap();
+
+    // This is the shipped concurrent workload: private checkins plus shared-ref
+    // stampede running inside a real `forge` process. Do not count a completed
+    // run as crash evidence; retry until a real SIGKILL exit is observed.
+    let cell = catch_real_sigkill(d.path())
+        .expect("never caught an active concurrent ForgeFS workload with real SIGKILL");
+    let forge_root = cell.join(".forge");
     let root = forge_root.join("keys/root.cap");
+
     assert!(
         root.is_file(),
         "killed benchmark did not leave a valid cell"
