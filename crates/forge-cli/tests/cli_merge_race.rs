@@ -153,7 +153,10 @@ fn cli_concurrent_integrator_merges_preserve_every_agent_commit() {
     let refs = run(&mut refs);
     let fork_refs = refs
         .lines()
-        .filter(|line| line.split_whitespace().any(|field| field.starts_with("forks/main/")))
+        .filter(|line| {
+            line.split_whitespace()
+                .any(|field| field.starts_with("forks/main/"))
+        })
         .count();
     assert_eq!(
         fork_refs, forked,
@@ -176,12 +179,7 @@ fn cli_concurrent_integrator_merges_preserve_every_agent_commit() {
     let ns = run(&mut open).trim().to_string();
     for i in 0..MERGERS {
         assert_eq!(
-            read(
-                d.path(),
-                &root,
-                &ns,
-                &format!("/main/agent-{i}.txt")
-            ),
+            read(d.path(), &root, &ns, &format!("/main/agent-{i}.txt")),
             format!("agent-{i}").as_bytes(),
             "agent {i} disappeared during concurrent integration"
         );
