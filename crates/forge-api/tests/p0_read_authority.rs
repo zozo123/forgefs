@@ -54,6 +54,57 @@ fn show_obeys_concrete_ref_scope_and_raw_oid_policy() {
 }
 
 #[test]
+fn negative_ref_scope_cannot_bypass_authority_with_raw_oids() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+    let main_oid = f.peel_commit("main").unwrap().0;
+    let raw = format!("oid:{}", main_oid.hex());
+    let ns = f.session_open(&root, "main").unwrap();
+
+    let excluding_main = f
+        .grant(
+            &root,
+            vec!["ops=read,write".into(), "ref!=main".into()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        f.show(&excluding_main, "main"),
+        Err(Error::Denied(_))
+    ));
+    assert!(matches!(
+        f.show(&excluding_main, &raw),
+        Err(Error::Denied(_))
+    ));
+    assert!(matches!(
+        f.mount(&excluding_main, &ns, "/raw-ro", &raw, false),
+        Err(Error::Denied(_))
+    ));
+    assert!(matches!(
+        f.mount(&excluding_main, &ns, "/raw-rw", &raw, true),
+        Err(Error::Denied(_))
+    ));
+
+    let export = d.path().join("excluded.tar");
+    assert!(matches!(
+        f.export_tar(&excluding_main, &raw, &export),
+        Err(Error::Denied(_))
+    ));
+    assert!(!export.exists());
+    assert!(matches!(
+        f.landmark(&excluding_main, main_oid),
+        Err(Error::Denied(_))
+    ));
+    assert!(matches!(
+        f.fsck(&excluding_main, false),
+        Err(Error::Denied(_))
+    ));
+
+    assert!(f.show(&root, &raw).is_ok());
+}
+
+#[test]
 fn scoped_agent_can_open_its_authorized_live_ref() {
     let d = tempdir().unwrap();
     let f = Forge::init(d.path()).unwrap();
