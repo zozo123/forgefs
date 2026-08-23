@@ -22,6 +22,41 @@ fn ref_and_reflog_publish_atomically() {
 }
 
 #[test]
+fn committed_ref_survives_wal_checkpoint_and_reopen() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("m.sqlite");
+    let expected = oid(7);
+
+    let meta = Meta::open(&db).unwrap();
+    meta.insert_ref(
+        "heads/checkpoint",
+        expected,
+        "commit",
+        false,
+        false,
+        "checkpoint-test",
+        "durability regression",
+    )
+    .unwrap();
+
+    // Checkpoint through a separate connection while the ForgeFS metadata
+    // connection still exists. The committed ref must not depend on WAL shape.
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(meta);
+
+    let reopened = Meta::open(&db).unwrap();
+    let row = reopened
+        .get_ref("heads/checkpoint")
+        .unwrap()
+        .expect("committed ref after checkpoint/reopen");
+    assert_eq!(row.oid, expected);
+    assert_eq!(row.kind, "commit");
+}
+
+#[test]
 fn reserved_names_are_typed_and_tags_are_seal_only() {
     let d = tempdir().unwrap();
     let meta = Meta::open(&d.path().join("m.sqlite")).unwrap();
