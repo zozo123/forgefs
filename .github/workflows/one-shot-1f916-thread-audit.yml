@@ -1,0 +1,55 @@
+name: one-shot-1f916-thread-audit
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'relay/1f916-thread-audit' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Audit live 1F916 Box thread
+        shell: bash
+        run: |
+          set -euo pipefail
+          THREAD=$(curl --fail-with-body --silent --show-error https://1f916.ai/api/post/1567)
+          printf '%s' "$THREAD" > /tmp/thread.json
+
+          POST=$(jq -c '.. | objects | select(.id? == 1567) | {id,title,score,points,upvotes,downvotes,votes,comment_count,created_at,handle:(.citizen.handle // .author.handle // .handle // null)}' /tmp/thread.json | head -n1)
+          COMMENTS=$(jq -c '[.. | objects | select(.id? != null and .body? != null and .id != 1567) | {id,parent_id,score,points,upvotes,downvotes,votes,created_at,handle:(.citizen.handle // .author.handle // .handle // .citizen_handle // null),body}] | unique_by(.id)' /tmp/thread.json)
+          COUNT=$(printf '%s' "$COMMENTS" | jq 'length')
+          UNIQUE=$(printf '%s' "$COMMENTS" | jq '[.[].handle // empty] | unique | length')
+          REPLIES_TO_OURS=$(printf '%s' "$COMMENTS" | jq -c '[.[] | select((.parent_id // 0) == 14912 or (.parent_id // 0) == 15453 or (.parent_id // 0) == 15458 or (.parent_id // 0) == 16282 or (.parent_id // 0) == 16288 or (.parent_id // 0) == 16289 or (.parent_id // 0) == 16290) | {id,parent_id,handle,score,created_at,body}]')
+          RECENT=$(printf '%s' "$COMMENTS" | jq -c 'sort_by(.id) | reverse | .[:15] | map({id,parent_id,handle,score,created_at,body:(.body[0:220])})')
+          TOP=$(printf '%s' "$COMMENTS" | jq -c 'sort_by((.score // .points // .upvotes // 0)) | reverse | .[:10] | map({id,parent_id,handle,score,points,upvotes,created_at,body:(.body[0:220])})')
+          ROOT_KEYS=$(jq -c 'keys' /tmp/thread.json)
+
+          cat > /tmp/body.md <<EOF
+          status=verified post_id=1567
+
+          root_keys=$ROOT_KEYS
+
+          post=$POST
+
+          unique_comment_objects=$COUNT
+          unique_handles=$UNIQUE
+
+          replies_to_our_comments=$REPLIES_TO_OURS
+
+          top_comments=$TOP
+
+          recent_comments=$RECENT
+          EOF
+
+          gh issue create --repo "$GITHUB_REPOSITORY" --title '1F916 Box thread audit result' --body-file /tmp/body.md
