@@ -106,12 +106,15 @@ fn v1_object_type_registry_is_frozen() {
         (0x05, ObjectType::Snapshot),
         (0x06, ObjectType::Contribution),
     ];
-    for (tag, expected) in assigned {
+    for &(tag, expected) in &assigned {
         assert_eq!(expected as u8, tag);
         assert_eq!(ObjectType::from_u8(tag).unwrap(), expected);
     }
 
-    for unassigned in [0x00, 0x07, 0xff] {
+    for unassigned in u8::MIN..=u8::MAX {
+        if assigned.iter().any(|(tag, _)| *tag == unassigned) {
+            continue;
+        }
         assert!(
             ObjectType::from_u8(unassigned).is_err(),
             "VERSION 1 must reject unassigned type 0x{unassigned:02x}"
