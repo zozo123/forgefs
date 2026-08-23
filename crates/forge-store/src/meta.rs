@@ -322,6 +322,10 @@ impl Meta {
     /// busy checkpoint in the result row rather than as an execution error, so
     /// treat partial completion as an explicit failure.
     pub fn checkpoint_truncate(&self) -> Result<CheckpointResult> {
+        // SQLite owns the VFS barriers inside this call. Bracket the operation
+        // so the state machine covers both "never started" and "completed but
+        // not acknowledged" failures without installing a production VFS.
+        crate::inject_barrier_failure(crate::DurabilityBarrier::MetadataCheckpointBefore)?;
         let conn = self.write.lock();
         let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -333,6 +337,7 @@ impl Meta {
                 "WAL checkpoint incomplete: busy={busy} log={log_frames} checkpointed={checkpointed_frames}"
             )));
         }
+        crate::inject_barrier_failure(crate::DurabilityBarrier::MetadataCheckpointAfter)?;
         Ok(CheckpointResult {
             log_frames,
             checkpointed_frames,

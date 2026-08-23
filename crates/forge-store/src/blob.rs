@@ -125,7 +125,7 @@ impl LocalBlobStore {
                 "existing object does not match its id: {id}"
             )));
         }
-        crate::durable_sync_file(&file)?;
+        crate::durable_sync_file_at(&file, crate::DurabilityBarrier::ObjectExistingFile)?;
         self.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -203,7 +203,7 @@ impl PublishBatch<'_> {
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
-            crate::durable_sync_file(&f)?;
+            crate::durable_sync_file_at(&f, crate::DurabilityBarrier::ObjectFile)?;
             self.store.stats.fsync_file.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -238,7 +238,11 @@ impl PublishBatch<'_> {
 
     pub fn finish(self) -> Result<()> {
         for dir in &self.dirs {
-            sync_dir_counted(dir, &self.store.stats)?;
+            sync_dir_counted(
+                dir,
+                &self.store.stats,
+                crate::DurabilityBarrier::ObjectPublicationDirectory,
+            )?;
         }
         // This is the sole OID-proof publication point. A dropped or failed
         // batch never teaches later callers that its visible links are durable.
@@ -286,7 +290,11 @@ fn ensure_dir_durable(
         }
         Err(e) => return Err(Error::Io(e.to_string())),
     }
-    sync_dir_counted(parent, stats)?;
+    sync_dir_counted(
+        parent,
+        stats,
+        crate::DurabilityBarrier::ObjectPathDirectory,
+    )?;
     durable_dirs.lock().put(child.to_path_buf(), ());
     Ok(())
 }
@@ -322,13 +330,21 @@ fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {
         }
     }
     if removed {
-        sync_dir_counted(tmp, stats)?;
+        sync_dir_counted(
+            tmp,
+            stats,
+            crate::DurabilityBarrier::ObjectTemporaryDirectory,
+        )?;
     }
     Ok(())
 }
 
-fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {
-    crate::durable_sync_dir(path)?;
+fn sync_dir_counted(
+    path: &Path,
+    stats: &BlobStoreCounters,
+    point: crate::DurabilityBarrier,
+) -> Result<()> {
+    crate::durable_sync_dir_at(path, point)?;
     stats.fsync_dir.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

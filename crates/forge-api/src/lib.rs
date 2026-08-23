@@ -138,7 +138,10 @@ impl Forge {
                 staging.join("keys/integrator.cap"),
                 integ.to_token().as_bytes(),
             )?;
-            sync_dir(&staging.join("keys"))?;
+            sync_dir_at(
+                &staging.join("keys"),
+                forge_store::DurabilityBarrier::InitKeyDirectory,
+            )?;
 
             let empty = store.empty_tree_id()?;
             let commit = Commit {
@@ -173,7 +176,10 @@ impl Forge {
             // staging. The descriptor keeps the same inode locked across rename,
             // eliminating the post-publication daemon race.
             let cell_lock = acquire_cell_lock(&staging, false)?;
-            sync_dir(&staging)?;
+            sync_dir_at(
+                &staging,
+                forge_store::DurabilityBarrier::InitStagingDirectory,
+            )?;
             init_crash_point("staging-durable");
             Ok(cell_lock)
         })();
@@ -195,7 +201,10 @@ impl Forge {
         // parent-directory barrier below is still required for power-loss
         // durability; the failpoint models process death, not power failure.
         init_crash_point("published");
-        if let Err(error) = sync_dir(parent) {
+        if let Err(error) = sync_dir_at(
+            parent,
+            forge_store::DurabilityBarrier::InitPublicationDirectory,
+        ) {
             return Err(Error::Io(format!(
                 "repository published at {} but parent directory fsync failed: {error}",
                 root.display()
@@ -1442,7 +1451,10 @@ fn sync_repo_parent(root: &Path) -> Result<()> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    sync_dir(parent)
+    sync_dir_at(
+        parent,
+        forge_store::DurabilityBarrier::OpenPublicationDirectory,
+    )
 }
 
 /// Create only missing parent components and force each new directory entry
@@ -1482,7 +1494,10 @@ fn create_dir_all_durable(path: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
         let parent = current.parent().unwrap_or_else(|| Path::new("."));
-        sync_dir(parent)?;
+        sync_dir_at(
+            parent,
+            forge_store::DurabilityBarrier::InitParentDirectory,
+        )?;
     }
     Ok(())
 }
@@ -1607,7 +1622,7 @@ fn write_secret(path: PathBuf, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&path)?;
     f.write_all(bytes)?;
-    forge_store::durable_sync_file(&f)?;
+    forge_store::durable_sync_file_at(&f, forge_store::DurabilityBarrier::InitFile)?;
     Ok(())
 }
 
@@ -1617,12 +1632,12 @@ fn write_public(path: PathBuf, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&path)?;
     f.write_all(bytes)?;
-    forge_store::durable_sync_file(&f)?;
+    forge_store::durable_sync_file_at(&f, forge_store::DurabilityBarrier::InitFile)?;
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
-    forge_store::durable_sync_dir(path)
+fn sync_dir_at(path: &Path, point: forge_store::DurabilityBarrier) -> Result<()> {
+    forge_store::durable_sync_dir_at(path, point)
 }
 
 fn read32(path: &Path) -> Result<[u8; 32]> {
