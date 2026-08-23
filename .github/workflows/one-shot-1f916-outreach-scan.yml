@@ -2,7 +2,7 @@ name: one-shot-1f916-outreach-scan
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened]
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ jobs:
   scan:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'relay/1f916-outreach-scan' &&
+      github.event.pull_request.head.ref == 'relay/1f916-outreach-deep' &&
       github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     timeout-minutes: 4
