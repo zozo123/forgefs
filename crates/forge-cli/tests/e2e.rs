@@ -26,9 +26,7 @@ fn assert_repo_operational(dir: &Path) {
     let cap = cap.to_str().unwrap();
     let refs = run(forge().args(["--dir", dir, "--cap", cap, "refs"]));
     assert!(refs.contains("main"), "{refs}");
-    run(forge().args([
-        "--dir", dir, "--cap", cap, "fsck", "--full",
-    ]));
+    run(forge().args(["--dir", dir, "--cap", cap, "fsck", "--full"]));
 }
 
 #[test]
