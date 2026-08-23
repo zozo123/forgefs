@@ -138,7 +138,7 @@ impl BenchReport {
         }
         if let Some(stats) = self.store {
             s.push_str(&format!(
-                "storage lifetime puts={} fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} lifetime_barrier_us={}\n",
+                "storage lifetime puts={} bytes=unavailable fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} lifetime_barrier_us={}\n",
                 stats.puts,
                 stats.fsync_file,
                 stats.fsync_file_us,
@@ -177,8 +177,7 @@ impl BenchReport {
         if let Some(stats) = self.api {
             s.push_str(&format!(
                 "api lifetime     stale={} conflict={}\n",
-                stats.stale_observation,
-                stats.merge_conflict,
+                stats.stale_observation, stats.merge_conflict,
             ));
         }
         s
@@ -413,17 +412,16 @@ mod tests {
         let rendered = report.render();
         assert!(rendered
             .contains("counter scope = cumulative whole-run process lifetime, never per-checkin"));
-        assert!(rendered.contains(
-            "counter start = storage at blob-store construction; sqlite/api post-open"
-        ));
+        assert!(rendered
+            .contains("counter start = storage at blob-store construction; sqlite/api post-open"));
         assert!(rendered.contains(
             "counter end   = after init + all workloads + merge/seal + verify (+ worker fsck)"
         ));
         assert!(rendered.contains(
-            "storage lifetime puts=2 fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 lifetime_barrier_us=24"
+            "storage lifetime puts=2 bytes=unavailable fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 lifetime_barrier_us=24"
         ));
         assert!(rendered.contains(
-            "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=5 txn_us=17 lifetime_accounted_us=36"
+            "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=5 txn_us=17 lifetime_accounted_us=36 busy=0 updated=7 forked=1 denied=0"
         ));
         assert!(rendered.contains(
             "fsync_file_us=11 + fsync_dir_us=13 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=60"
@@ -435,5 +433,6 @@ mod tests {
         assert!(!rendered.contains("observed mix"));
         assert!(!rendered.contains("observed_us"));
         assert!(!rendered.contains("stale=2 ("));
+        assert!(!rendered.contains("conflict=3 ("));
     }
 }

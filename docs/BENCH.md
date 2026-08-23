@@ -89,7 +89,12 @@ For each concurrency point report at minimum:
 
 Correctness counters are gates. Absolute latency and throughput are measurements, not CI pass/fail thresholds on shared runners.
 
-If the checked-in build cannot expose one of the required SQLite/fsync measurements, mark that field **`unavailable`** in the raw result. Such a run may support user-visible latency/throughput claims, but it is **not eligible for cross-version architectural attribution** (for example, “SQLite was the bottleneck” or “directory barriers caused the speedup”) until the missing instrumentation is available.
+If the checked-in build cannot expose a required measurement, render that
+specific field as **`unavailable`** in the raw result. Such a run may support
+user-visible latency/throughput claims, but it is **not eligible for
+architectural attribution involving the missing field** until instrumentation
+is available. For example, do not claim byte amplification, SQLite contention,
+or directory-barrier improvements when the corresponding field is unavailable.
 
 ## Whole-run process-lifetime counters
 
@@ -111,6 +116,9 @@ snapshot, not a workload delta and not a checkin profile. Its boundaries are:
 
 The individual counter semantics are deliberately mechanical:
 
+- `puts` counts newly published OIDs. Object-byte accumulation is not yet
+  instrumented, so the renderer emits the explicit literal
+  `bytes=unavailable`; do not derive bytes from puts.
 - `fsync_file` / `fsync_file_us` count and time successful file durability
   barriers; `fsync_dir` / `fsync_dir_us` do the same for directories. Failed
   barriers fail the operation and are not reported as successful work.
@@ -173,8 +181,8 @@ A performance PR attaches or links the exact command and unedited machine-readab
 5. correctness result;
 6. all repetition outputs plus the median aggregation rule above;
 7. p50/p95/p99/max plus throughput;
-8. whole-run storage/SQLite lifetime totals, plus explicit `unavailable`
-   markers for per-checkin attribution;
+8. whole-run storage/SQLite lifetime totals, including `bytes=unavailable`,
+   plus explicit `unavailable` markers for per-checkin attribution;
 9. the mechanism believed to explain the change;
 10. for W7, the comparator metadata and durability-equivalence verdict.
 
