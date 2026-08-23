@@ -41,8 +41,18 @@ fn import_rejects_symlink_fifo_socket_and_non_utf8_name() {
     {
         let source = tempdir().unwrap();
         let bad = OsString::from_vec(b"bad-\xff".to_vec());
-        fs::write(source.path().join(bad), b"data").unwrap();
-        import_fails(source.path());
+        match fs::write(source.path().join(bad), b"data") {
+            Ok(()) => import_fails(source.path()),
+            // APFS may reject the fixture before ForgeFS can observe it. That
+            // is already fail-closed; accept only the platform's invalid-byte
+            // errors rather than skipping the whole Unix adapter test.
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::EILSEQ || code == libc::EINVAL
+                ) => {}
+            Err(error) => panic!("unexpected non-UTF-8 fixture error: {error}"),
+        }
     }
 }
 

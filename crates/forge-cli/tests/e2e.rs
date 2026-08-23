@@ -20,6 +20,73 @@ fn run(cmd: &mut Command) -> String {
     stdout
 }
 
+fn assert_repo_operational(dir: &Path) {
+    let dir = dir.to_str().unwrap();
+    let cap = Path::new(dir).join(".forge/keys/root.cap");
+    let cap = cap.to_str().unwrap();
+    let refs = run(forge().args(["--dir", dir, "--cap", cap, "refs"]));
+    assert!(refs.contains("main"), "{refs}");
+    run(forge().args(["--dir", dir, "--cap", cap, "fsck", "--full"]));
+}
+
+#[test]
+fn cli_init_crash_matrix_never_publishes_a_partial_repository() {
+    let before_publication = [
+        "staging-created",
+        "directories-created",
+        "keys-written",
+        "catalog-created",
+        "initial-objects-written",
+        "main-ref-written",
+        "version-written",
+        "staging-durable",
+    ];
+
+    for point in before_publication {
+        let d = tempdir().unwrap();
+        let output = forge()
+            .arg("init")
+            .current_dir(d.path())
+            .env("FORGEFS_TEST_INIT_CRASH_AFTER", point)
+            .output()
+            .expect("spawn crashing forge init");
+        assert_eq!(output.status.code(), Some(86), "phase={point}");
+        assert!(
+            !d.path().join(".forge").exists(),
+            "phase={point} published a partial repository"
+        );
+
+        // A fresh process can safely initialize despite the orphaned sibling
+        // staging directory, then open and verify the complete repository.
+        run(forge().arg("init").current_dir(d.path()));
+        assert_repo_operational(d.path());
+    }
+
+    // Rename is the visibility linearization point. A process crash either
+    // immediately after rename or after the parent barrier must expose a
+    // complete repository, never one that a retry overwrites. A cold open also
+    // re-proves the parent edge left unforced by the `published` case.
+    for point in ["published", "parent-durable"] {
+        let d = tempdir().unwrap();
+        let output = forge()
+            .arg("init")
+            .current_dir(d.path())
+            .env("FORGEFS_TEST_INIT_CRASH_AFTER", point)
+            .output()
+            .expect("spawn crashing forge init");
+        assert_eq!(output.status.code(), Some(86), "phase={point}");
+        assert_eq!(
+            std::fs::read(d.path().join(".forge/VERSION")).unwrap(),
+            b"1\n",
+            "phase={point}"
+        );
+        assert_repo_operational(d.path());
+
+        let retry = forge().arg("init").current_dir(d.path()).output().unwrap();
+        assert_eq!(retry.status.code(), Some(1), "phase={point}");
+    }
+}
+
 #[test]
 fn cli_requires_cap() {
     let d = tempdir().unwrap();

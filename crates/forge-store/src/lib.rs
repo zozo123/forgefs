@@ -5,7 +5,8 @@ pub mod meta;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use meta::{
-    sanitize_agent, Meta, MetaStats, MountRow, NsRow, OverlayRow, CURRENT_SCHEMA_VERSION,
+    sanitize_agent, CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow,
+    OverlayRow, CURRENT_SCHEMA_VERSION,
 };
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};
@@ -17,6 +18,33 @@ use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Complete the strongest durability barrier supported by the platform.
+/// macOS `fsync(2)` does not flush device caches, so match SQLite's
+/// `fullfsync=ON` policy with `F_FULLFSYNC` for immutable objects and bootstrap
+/// files too. Failure is fatal: a weaker object plane could violate I4 after a
+/// power loss even while the SQLite ref survives.
+pub fn durable_sync_file(file: &std::fs::File) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()?;
+    Ok(())
+}
+
+pub fn durable_sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    durable_sync_file(&std::fs::File::open(path)?)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 
 pub struct Store {
     pub blobs: LocalBlobStore,

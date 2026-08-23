@@ -209,6 +209,7 @@ pub fn run_bench_with_workers(
         shared: Some(shared_result),
         merge_seal: Some(merge_seal),
         verify: Some(verify),
+        durability: Some(forge.store.meta.durability_policy().clone()),
         store: Some(store),
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
