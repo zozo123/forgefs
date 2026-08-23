@@ -244,13 +244,22 @@ fn oid_from_blob(v: Vec<u8>) -> Result<ObjectId> {
     Ok(ObjectId(a))
 }
 
+/// Classify on SQLite's primary result code, never on its message text.
+/// Matching prose meant SQLITE_LOCKED ("database table is locked") missed the
+/// "database is locked" test and became exit 5, turning a retryable contention
+/// into an unretryable internal failure, and left SQLITE_CONSTRAINT with
+/// nowhere to go but Error::Sqlite -> exit 5 for a benign name clash.
 fn map_sql(e: rusqlite::Error) -> Error {
-    let s = e.to_string();
-    if s.contains("database is locked") || s.contains("busy") {
-        Error::Busy(s)
-    } else {
-        Error::Sqlite(s)
+    use rusqlite::ffi::ErrorCode;
+    if let rusqlite::Error::SqliteFailure(inner, ref message) = e {
+        let text = message.clone().unwrap_or_else(|| inner.to_string());
+        return match inner.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Error::Busy(text),
+            ErrorCode::ConstraintViolation => Error::Invalid(text),
+            _ => Error::Sqlite(text),
+        };
     }
+    Error::Sqlite(e.to_string())
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
@@ -297,6 +306,15 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     )
     .map_err(map_sql)?;
     tx.commit().map_err(map_sql)
+}
+
+fn ref_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
+    let found: i64 = tx
+        .query_row("SELECT COUNT(*) FROM refs WHERE name=?1", [name], |r| {
+            r.get(0)
+        })
+        .map_err(map_sql)?;
+    Ok(found != 0)
 }
 
 fn validate_ref_name(name: &str) -> Result<()> {
@@ -581,6 +599,11 @@ impl Meta {
         let txn_timer = self.txn_timer();
         let tx = self.begin_tx(&mut conn)?;
         let ts = now_ms() as i64;
+        // Name the condition ourselves rather than leaking "UNIQUE constraint
+        // failed: refs.name" to the caller.
+        if ref_exists(&tx, name)? {
+            return Err(Error::Invalid(format!("ref {name} already exists")));
+        }
         tx.execute(
         "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
         params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
@@ -1477,6 +1500,11 @@ impl Meta {
         let ts = now_ms() as i64;
         let tag_ref = format!("tags/{tag}");
         validate_ref_kind(&tag_ref, "snapshot")?;
+        // A frozen tag is sealed state, so re-sealing must surface as
+        // Error::Sealed (exit 2), not as a PRIMARY KEY violation.
+        if ref_exists(&tx, &tag_ref)? {
+            return Err(Error::Sealed(tag_ref));
+        }
         tx.execute(
             "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'snapshot',1,1,?3)",
             params![tag_ref, snap.as_bytes().as_slice(), ts],

@@ -173,7 +173,25 @@ enum InboxCmd {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    restore_default_sigpipe();
+
+    // clap exits the process itself on a usage error, with its own default code
+    // 2 -- which CLI_ABI.md reserves for "corruption or sealed-state violation".
+    // Parse explicitly so a typo is reported as the input error it is, and only
+    // an explicit --help/--version succeeds.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+                _ => 1,
+            };
+            let _ = error.print();
+            return ExitCode::from(code);
+        }
+    };
+
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("forge: {e}");
@@ -197,8 +215,17 @@ fn error_exit_code(error: &Error) -> u8 {
     }
 }
 
-fn run() -> forge_types::Result<()> {
-    let cli = Cli::parse();
+/// Rust sets SIGPIPE to SIG_IGN, so a closed reader (`forge ... | head`) makes
+/// the next `eprintln!` fail and panic, exiting 101 -- a code that appears
+/// nowhere in CLI_ABI.md. Restore the default so the shell contract holds.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+fn run(cli: Cli) -> forge_types::Result<()> {
     match cli.cmd {
         Cmd::Bench {
             agents,
@@ -249,7 +276,11 @@ fn open(cli: &Cli) -> forge_types::Result<Forge> {
 fn load_cap(f: &Forge, cli: &Cli) -> forge_types::Result<Cap> {
     if let Some(c) = &cli.cap {
         let tok = if Path::new(c).is_file() {
-            std::fs::read_to_string(c)?
+            // Not read_to_string: its InvalidData becomes Error::Io -> exit 5,
+            // while forge-cap maps the same failure to Error::Cap -> exit 1.
+            let bytes = std::fs::read(c)?;
+            String::from_utf8(bytes)
+                .map_err(|_| Error::Cap(format!("capability file {c} is not valid UTF-8")))?
         } else {
             c.clone()
         };
@@ -289,6 +320,12 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             text,
         } => {
             let data = if let Some(p) = file {
+                if !p.is_file() {
+                    return Err(Error::Invalid(format!(
+                        "--file {} is not a readable file",
+                        p.display()
+                    )));
+                }
                 std::fs::read(p)?
             } else if let Some(t) = text {
                 t.into_bytes()
@@ -309,6 +346,12 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
         },
         Cmd::Import { source, r#ref } => {
+            if !source.is_dir() {
+                return Err(Error::Invalid(format!(
+                    "import source {} is not a directory",
+                    source.display()
+                )));
+            }
             let id = f.import_dir(cap, &source, &r#ref)?;
             println!("imported {id} -> {ref_name}", ref_name = r#ref);
         }
