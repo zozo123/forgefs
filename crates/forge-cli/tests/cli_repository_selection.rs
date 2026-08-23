@@ -4,7 +4,7 @@
 //! to whichever repository sat above the SOURCE path.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -32,6 +32,31 @@ fn refs(dir: &Path) -> String {
         .expect("spawn forge");
     assert!(out.status.success(), "refs failed: {out:?}");
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn file_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
 }
 
 #[test]
@@ -101,4 +126,69 @@ fn init_positional_path_does_not_shadow_the_global_dir_flag() {
         !d.path().join("ignored/.forge").exists(),
         "init created a forge at the --dir path as well"
     );
+}
+
+#[test]
+fn bench_rejects_repository_selectors_before_mutating_any_bytes() {
+    let d = tempdir().unwrap();
+    let repo = d.path().join("victim");
+    init(&repo);
+    fs::write(repo.join("sentinel"), b"do not delete").unwrap();
+    let before = file_snapshot(&repo);
+
+    for use_env in [false, true] {
+        let mut cmd = forge();
+        if use_env {
+            cmd.env("FORGE_DIR", &repo);
+        } else {
+            cmd.arg("--dir").arg(&repo);
+        }
+        let out = cmd
+            .arg("bench")
+            .args(["--agents", "1", "--shared", "1", "--workers", "1"])
+            .output()
+            .expect("spawn forge bench");
+        assert_eq!(out.status.code(), Some(1), "unexpected result: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("does not accept --dir/FORGE_DIR"),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(file_snapshot(&repo), before, "repository bytes changed");
+    }
+}
+
+#[test]
+fn bench_uses_only_a_new_explicit_scratch_workspace() {
+    let d = tempdir().unwrap();
+    let existing = d.path().join("existing");
+    fs::create_dir(&existing).unwrap();
+    fs::write(existing.join("sentinel"), b"keep").unwrap();
+
+    let rejected = forge()
+        .arg("bench")
+        .arg("--scratch")
+        .arg(&existing)
+        .args(["--agents", "1", "--shared", "1", "--workers", "1"])
+        .output()
+        .expect("spawn forge bench");
+    assert_eq!(rejected.status.code(), Some(1), "result: {rejected:?}");
+    assert_eq!(fs::read(existing.join("sentinel")).unwrap(), b"keep");
+
+    let scratch = d.path().join("new-benchmark-cell");
+    let completed = forge()
+        .arg("bench")
+        .arg("--scratch")
+        .arg(&scratch)
+        .args(["--agents", "1", "--shared", "1", "--workers", "1"])
+        .output()
+        .expect("spawn forge bench");
+    assert!(
+        completed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert_eq!(fs::read(scratch.join(".forge/VERSION")).unwrap(), b"1\n");
 }
