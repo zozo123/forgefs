@@ -1,5 +1,6 @@
 use forge_store::Meta;
 use forge_types::{Error, ObjectId};
+use rusqlite::Connection;
 use tempfile::tempdir;
 
 fn oid(n: u8) -> ObjectId {
