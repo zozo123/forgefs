@@ -61,7 +61,10 @@ fn make_commit(dir: &Path, cap: &Path, path: &str, text: &str) -> String {
         .arg("-m")
         .arg(text);
     let result = run(&mut checkin);
-    assert!(result.contains("updated"), "checkin did not update: {result}");
+    assert!(
+        result.contains("updated"),
+        "checkin did not update: {result}"
+    );
     format!("heads/agents/anon/{ns}")
 }
 
