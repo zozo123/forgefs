@@ -19,5 +19,4 @@ forge-types.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-forge-core.workspace = true
 tempfile.workspace = true
