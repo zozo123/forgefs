@@ -10,7 +10,7 @@ pub use bench::{
     merge_all_and_seal, private_checkins, run as run_bench, shared_stampede, BenchReport,
 };
 pub use fsck::{FsckFinding, FsckReport};
-pub use serve::{dispatch as dispatch_request, serve};
+pub use serve::{dispatch as dispatch_request, serve, unix_worker_count};
 pub use soak::{private_checkins_bounded, run_bench_with_workers, shared_stampede_bounded};
 
 /// Stable fail-closed error for the legacy raw-tree merge resolution input.

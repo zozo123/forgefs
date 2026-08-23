@@ -1,5 +1,5 @@
 use crate::Forge;
-use forge_protocol::{read_frame, write_frame, Request, Response};
+use forge_protocol::{read_frame_body, read_frame_len_after, write_frame, Request, Response};
 use forge_types::{Error, Result};
 use serde_json::{json, Value};
 use std::io::{BufReader, BufWriter, Read};
@@ -11,7 +11,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_HTTP_BODY: usize = 1024 * 1024;
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:4077";
@@ -24,7 +24,36 @@ fn http_addr() -> String {
 }
 const MAX_UNIX_WORKERS: usize = 64;
 const MAX_PENDING_UNIX: usize = 256;
-const UNIX_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a worker will wait for the FIRST byte of a frame.
+///
+/// An idle connection is legitimate: a client may hold one open between
+/// requests. Nothing is committed and no buffer is reserved while we wait here,
+/// so this stays generous.
+const UNIX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a worker will wait for the NEXT byte once a frame has begun.
+///
+/// `SO_RCVTIMEO` is a per-`read`-syscall deadline, not a per-frame budget, so a
+/// slow-but-progressing sender resets it on every chunk it delivers and is
+/// never penalised for being slow; only a sender that has gone silent
+/// mid-frame is reaped. That distinction is the entire point of having two
+/// numbers here -- do NOT collapse them back into one. The capability is
+/// parsed only after a whole frame arrives, so a single long deadline lets
+/// unauthenticated peers each pin a worker for the full duration, and
+/// `worker_count()` of them pin the whole pool.
+const UNIX_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a worker will spend on a single blocking write.
+const UNIX_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an accepted connection may sit in the admission queue before a
+/// worker discards it instead of serving it.
+///
+/// `MAX_PENDING_UNIX` bounds memory but imposed no time bound: a queued
+/// connection waited for a free worker however long that took. Reject late
+/// instead of never, so the client gets `busy` and can retry.
+const UNIX_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
     if !forge.has_exclusive_cell_lock() {
@@ -69,6 +98,14 @@ pub fn serve(forge: Arc<Forge>, http: bool) -> Result<()> {
     result
 }
 
+/// Number of unix-socket worker threads this build will run.
+///
+/// Exposed so a test can saturate exactly the pool that exists on the machine
+/// it happens to be running on, instead of guessing.
+pub fn unix_worker_count() -> usize {
+    worker_count()
+}
+
 fn worker_count() -> usize {
     thread::available_parallelism()
         .map(|n| n.get().saturating_mul(4).clamp(8, MAX_UNIX_WORKERS))
@@ -78,7 +115,9 @@ fn worker_count() -> usize {
 fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
     // Fixed workers + bounded admission queue: a connection flood consumes a
     // bounded amount of memory and threads instead of spawning without limit.
-    let (tx, rx) = sync_channel::<UnixStream>(MAX_PENDING_UNIX);
+    // Queued connections carry their accept time so a worker can tell how long
+    // they have been waiting and give up on stale ones.
+    let (tx, rx) = sync_channel::<(UnixStream, Instant)>(MAX_PENDING_UNIX);
     let rx = Arc::new(Mutex::new(rx));
     for i in 0..worker_count() {
         let f = forge.clone();
@@ -86,16 +125,20 @@ fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
         thread::Builder::new()
             .name(format!("forge-unix-{i}"))
             .spawn(move || loop {
-                let stream = {
+                let (stream, queued_at) = {
                     let guard = match rx.lock() {
                         Ok(guard) => guard,
                         Err(_) => return,
                     };
                     match guard.recv() {
-                        Ok(stream) => stream,
+                        Ok(item) => item,
                         Err(_) => return,
                     }
                 };
+                if queued_at.elapsed() > UNIX_ADMISSION_TIMEOUT {
+                    reject_stale_admission(stream);
+                    continue;
+                }
                 handle_unix(&f, stream);
             })
             .map_err(|e| Error::Internal(format!("spawn unix worker: {e}")))?;
@@ -103,9 +146,9 @@ fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
 
     for stream in listener.incoming() {
         let stream = stream?;
-        match tx.try_send(stream) {
+        match tx.try_send((stream, Instant::now())) {
             Ok(()) => {}
-            Err(TrySendError::Full(stream)) => {
+            Err(TrySendError::Full((stream, _))) => {
                 // Fast overload rejection is safer than queueing unbounded work.
                 let _ = stream.shutdown(Shutdown::Both);
             }
@@ -117,16 +160,58 @@ fn accept_loop(forge: Arc<Forge>, listener: UnixListener) -> Result<()> {
     Ok(())
 }
 
+/// Tell a connection that waited too long in the admission queue to retry,
+/// rather than serving a request whose caller has very likely given up.
+fn reject_stale_admission(stream: UnixStream) {
+    let _ = stream.set_write_timeout(Some(UNIX_FRAME_TIMEOUT));
+    let mut w = BufWriter::new(&stream);
+    let _ = write_frame(
+        &mut w,
+        &Response::err(
+            0,
+            &Error::Busy("server saturated; connection queued too long".into()),
+        ),
+    );
+    drop(w);
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
 fn handle_unix(forge: &Forge, stream: UnixStream) {
-    let _ = stream.set_read_timeout(Some(UNIX_IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(UNIX_IO_TIMEOUT));
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+    let _ = stream.set_write_timeout(Some(UNIX_WRITE_TIMEOUT));
+    // Two extra handles on the same socket: `deadline` exists only to retune
+    // SO_RCVTIMEO mid-frame, because `stream` itself is moved into the
+    // BufWriter and `reader_stream` is buried inside the BufReader.
+    let Ok(deadline) = stream.try_clone() else {
+        return;
+    };
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
     };
     let mut r = BufReader::new(reader_stream);
     let mut w = BufWriter::new(stream);
-    while let Ok(buf) = read_frame(&mut r) {
+    loop {
+        // Phase 1: the connection is idle and has committed to nothing. Wait
+        // generously for the first byte of the next frame.
+        if deadline.set_read_timeout(Some(UNIX_IDLE_TIMEOUT)).is_err() {
+            return;
+        }
+        let mut first = [0u8; 1];
+        if r.read_exact(&mut first).is_err() {
+            return;
+        }
+        // Phase 2: a frame is now in flight. Tighten the per-read deadline
+        // BEFORE reading byte two of the length prefix, because sending one
+        // byte and stopping is the cheapest way to pin this worker. See
+        // UNIX_FRAME_TIMEOUT: this reaps stalled senders, not slow ones.
+        if deadline.set_read_timeout(Some(UNIX_FRAME_TIMEOUT)).is_err() {
+            return;
+        }
+        let Ok(n) = read_frame_len_after(&mut r, first[0]) else {
+            return;
+        };
+        let Ok(buf) = read_frame_body(&mut r, n) else {
+            return;
+        };
         let req: Request = match serde_json::from_slice(&buf) {
             Ok(x) => x,
             Err(e) => {
@@ -136,7 +221,7 @@ fn handle_unix(forge: &Forge, stream: UnixStream) {
         };
         let resp = dispatch(forge, req);
         if write_frame(&mut w, &resp).is_err() {
-            break;
+            return;
         }
     }
 }
@@ -359,6 +444,19 @@ mod tests {
     fn worker_pool_is_bounded() {
         assert!((8..=MAX_UNIX_WORKERS).contains(&worker_count()));
         assert_eq!(MAX_PENDING_UNIX, 256);
+    }
+
+    #[test]
+    fn frame_deadline_is_far_shorter_than_the_idle_deadline() {
+        // The two-phase deadline is only a defence if the committed-frame
+        // deadline is much tighter than the idle one; collapsing them back
+        // together restores the pre-auth slow loris.
+        assert!(
+            UNIX_FRAME_TIMEOUT * 4 < UNIX_IDLE_TIMEOUT,
+            "frame deadline {UNIX_FRAME_TIMEOUT:?} is not meaningfully tighter \
+             than idle deadline {UNIX_IDLE_TIMEOUT:?}"
+        );
+        assert!(UNIX_ADMISSION_TIMEOUT < UNIX_IDLE_TIMEOUT);
     }
 
     #[test]
