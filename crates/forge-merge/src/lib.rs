@@ -332,7 +332,10 @@ mod tests {
         let forward = merged_tree(three_way(&s, Some(base), ours, theirs).unwrap());
         let reverse = merged_tree(three_way(&s, Some(base), theirs, ours).unwrap());
 
-        assert_eq!(forward, reverse, "I12: clean merge must be direction-independent");
+        assert_eq!(
+            forward, reverse,
+            "I12: clean merge must be direction-independent"
+        );
         let merged = s.get_tree(forward).unwrap();
         assert_eq!(merged.entries.len(), 2);
         assert!(merged.get("tool.sh").unwrap().exec);
