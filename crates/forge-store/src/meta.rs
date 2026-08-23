@@ -3,6 +3,8 @@ use forge_core::now_ms;
 use forge_types::{CasResult, Error, ObjectId, RefRow, Result};
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -256,6 +258,63 @@ fn oid_from_blob(v: Vec<u8>) -> Result<ObjectId> {
 /// "database is locked" test and became exit 5, turning a retryable contention
 /// into an unretryable internal failure, and left SQLITE_CONSTRAINT with
 /// nowhere to go but Error::Sqlite -> exit 5 for a benign name clash.
+/// Bytes in the first wal-index (`-shm`) region that SQLite maps.
+///
+/// `os_unix.c:unixShmMap` sparse-extends the wal-index by writing a single byte
+/// to the last byte of every 4096-byte OS page in the region and then maps the
+/// whole span. On a filesystem whose block size is smaller than the CPU page
+/// size (mkfs.ext4 auto-selects 1024 or 2048 for images under 512 MB) those
+/// one-byte writes allocate only the *final* block of each page, so a 32 KiB
+/// wal-index is mapped while only 8 KiB of it is backed by disk blocks. When the
+/// remaining 24 KiB cannot be allocated at fault time the kernel delivers
+/// SIGBUS, which no Rust error path can observe: the process dies with wait
+/// status 135, no exit code and empty stderr.
+///
+/// The value is SQLite's own region size, not a tuning knob: it is exactly the
+/// span `unixShmMap` extends and maps for a fresh wal-index.
+const WAL_INDEX_REGION_BYTES: u64 = 32768;
+
+/// Free bytes available to this user on the filesystem holding `dir`.
+///
+/// `None` means the query itself failed; callers must then proceed rather than
+/// invent a number, because refusing to open a repository on the strength of a
+/// failed `statvfs` would be worse than the hazard it guards.
+// The statvfs field widths are target-dependent (64-bit here, 32-bit elsewhere),
+// so the widening casts below are only redundant on some of the targets we build.
+#[allow(clippy::unnecessary_cast)]
+fn available_bytes(dir: &Path) -> Option<u64> {
+    let raw = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `raw` is a NUL-terminated path and `stat` is a live, correctly
+    // sized allocation that libc only writes on success.
+    let rc = unsafe { libc::statvfs(raw.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned 0, so it initialized the whole struct.
+    let stat = unsafe { stat.assume_init() };
+    // Widening casts: both fields are unsigned, and are 32-bit on some targets.
+    let blocks = stat.f_bavail as u64;
+    let block_size = stat.f_frsize as u64;
+    blocks.checked_mul(block_size)
+}
+
+/// Decide whether a wal-index may be created with `available` free bytes.
+///
+/// Separated from the syscall so the boundary is testable: at or above one
+/// wal-index region the mapping can be fully backed, below it the process is in
+/// the SIGBUS band and must fail as I/O instead of dying by signal.
+fn wal_index_space_check(available: u64) -> Result<()> {
+    if available >= WAL_INDEX_REGION_BYTES {
+        return Ok(());
+    }
+    Err(Error::Io(format!(
+        "refusing to open metadata: {available} bytes free on the filesystem \
+         holding the repository, below the {WAL_INDEX_REGION_BYTES} bytes SQLite \
+         maps for the wal-index; continuing risks SIGBUS instead of an error"
+    )))
+}
+
 fn map_sql(e: rusqlite::Error) -> Error {
     use rusqlite::ffi::ErrorCode;
     if let rusqlite::Error::SqliteFailure(inner, ref message) = e {
@@ -630,6 +689,18 @@ impl Meta {
     }
 
     fn open_writable(path: &Path) -> Result<Self> {
+        // Checked before SQLite can create the wal-index: inside the band the
+        // mapping is made but cannot be backed, and the process dies by SIGBUS
+        // with no exit code at all. See wal_index_space_check.
+        //
+        // Writable opens only. A read-only open never creates the wal-index, so
+        // it has no sparse mapping to fault on, and refusing it here would make
+        // `fsck`/`verify` unavailable on a nearly-full filesystem -- precisely
+        // when an operator needs a diagnostic.
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        if let Some(available) = available_bytes(dir) {
+            wal_index_space_check(available)?;
+        }
         let mut conn = Connection::open(path).map_err(map_sql)?;
         Self::configure_connection(&conn)?;
         let version = Self::compatible_schema_version(&conn)?;
@@ -1919,6 +1990,74 @@ mod durability_policy_tests {
             !path.exists(),
             "a read-only open must not create meta.sqlite"
         );
+    }
+
+    /// Path of the wal-index sidecar SQLite derives from a database path.
+    fn wal_index_path(db: &Path) -> std::path::PathBuf {
+        let mut name = db.as_os_str().to_os_string();
+        name.push("-shm");
+        std::path::PathBuf::from(name)
+    }
+
+    /// The band this guards is not "out of space": at 0 bytes free SQLite
+    /// already fails cleanly. It is the range where the wal-index mapping is
+    /// created but cannot be fully backed.
+    #[test]
+    fn wal_index_space_check_rejects_only_below_one_region() {
+        assert!(wal_index_space_check(WAL_INDEX_REGION_BYTES).is_ok());
+        assert!(wal_index_space_check(WAL_INDEX_REGION_BYTES * 4096).is_ok());
+        for available in [0u64, 3072, 7168, 9216, 15360, WAL_INDEX_REGION_BYTES - 1] {
+            let error = wal_index_space_check(available)
+                .expect_err("below one wal-index region must fail as I/O, never by signal");
+            assert!(
+                matches!(error, Error::Io(_)),
+                "the near-full filesystem band must map to exit 5, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains("wal-index"),
+                "diagnostic must name the wal-index: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_index_path_is_the_sqlite_shm_sidecar() {
+        assert_eq!(
+            wal_index_path(Path::new("/x/.forge/meta.sqlite")),
+            std::path::PathBuf::from("/x/.forge/meta.sqlite-shm")
+        );
+    }
+
+    /// Characterisation of the SIGBUS precondition.
+    ///
+    /// After `Meta::open`, no page of the first wal-index region may be a hole,
+    /// because SQLite has already mapped the whole region and a fault into a
+    /// hole on a full filesystem is delivered as SIGBUS, not as an error.
+    ///
+    /// On a filesystem whose block size equals the CPU page size, SQLite's own
+    /// one-byte-per-page extension already allocates everything and this holds
+    /// without our preallocation. Point `TMPDIR` at an ext4 image small enough
+    /// that mkfs picked a 1024- or 2048-byte block (see
+    /// `scripts/enospc-sigbus-probe.sh`) and it fails without `back_wal_index`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn open_leaves_no_hole_in_the_mapped_wal_index() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("meta.sqlite");
+        let meta = Meta::open(&db).unwrap();
+        let shm = std::fs::metadata(wal_index_path(&db))
+            .expect("WAL mode must have created the wal-index");
+        let mapped = shm.len().min(WAL_INDEX_REGION_BYTES);
+        let backed = shm.blocks() * 512;
+        assert!(
+            backed >= mapped,
+            "wal-index maps {mapped} bytes but only {backed} are backed by blocks; \
+             a page fault into the hole on a near-full filesystem is SIGBUS, \
+             which no exit code can report"
+        );
+        drop(meta);
     }
 
     #[test]
