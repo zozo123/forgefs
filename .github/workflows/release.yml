@@ -1,0 +1,419 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to retry"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.97.0"
+  MSRV: "1.89.0"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate release identity
+        id: release
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$TAG" =~ $semver ]]; then
+            echo "::error::Release tag must be strict SemVer with a leading v (for example v0.2.0 or v0.2.0-rc.1)."
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
+          SHA="$(git rev-parse "$TAG^{commit}")"
+          if [[ "$(git rev-parse HEAD)" != "$SHA" ]]; then
+            echo "::error::Checkout does not resolve to $TAG ($SHA)."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$TAG does not point to a commit already merged into main."
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          WORKSPACE_VERSION="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print(tomllib.load(f)["workspace"]["package"]["version"])
+          PY
+          )"
+          if [[ "$VERSION" != "$WORKSPACE_VERSION" ]]; then
+            echo "::error::Tag $TAG does not match workspace version $WORKSPACE_VERSION."
+            exit 1
+          fi
+
+          PRERELEASE=false
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install release Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup override set "$RUST_VERSION"
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
+      - name: CLI version smoke test
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cargo run --quiet --locked -p forge-cli -- --version)" = "forge $VERSION"
+
+      - name: Concurrent-agent smoke benchmark
+        run: cargo run --locked -p forge-cli -- bench --agents 32 --shared 16 --workers 16
+
+  msrv:
+    name: MSRV ${{ env.MSRV }}
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install MSRV
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$MSRV" --profile minimal
+          rustup override set "$MSRV"
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Test MSRV
+        run: cargo test --workspace --all-targets --locked
+
+  prepare-release:
+    name: Prepare draft release
+    needs: [validate, msrv]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate.outputs.tag }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      SHA: ${{ needs.validate.outputs.sha }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+    steps:
+      - name: Create or reset draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GENERATED="$RUNNER_TEMP/generated-notes.md"
+          NOTES="$RUNNER_TEMP/release-notes.md"
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            -f target_commitish="$SHA" \
+            --jq '.body' > "$GENERATED"
+
+          cat > "$NOTES" <<EOF
+          Prebuilt \`forge\` CLI archives are produced from the tagged source after the full release test gate passes.
+
+          ## Binaries
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux x86_64 | \`forgefs-$VERSION-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Linux arm64 | \`forgefs-$VERSION-aarch64-unknown-linux-gnu.tar.gz\` |
+          | macOS x86_64 | \`forgefs-$VERSION-x86_64-apple-darwin.tar.gz\` |
+          | macOS arm64 | \`forgefs-$VERSION-aarch64-apple-darwin.tar.gz\` |
+
+          Every release also contains \`SHA256SUMS\`. GitHub artifact attestations bind each archive to this repository, workflow, and source commit.
+
+          ## Verify
+
+          \`\`\`bash
+          shasum -a 256 -c SHA256SUMS
+          gh attestation verify forgefs-$VERSION-<target>.tar.gz --repo $GITHUB_REPOSITORY
+          \`\`\`
+
+          ## What's changed
+          EOF
+          cat "$GENERATED" >> "$NOTES"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            if [[ "$IS_DRAFT" != "true" ]]; then
+              echo "::error::$TAG is already published. Releases are never mutated in place; cut a new version instead."
+              exit 1
+            fi
+
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "ForgeFS $TAG" \
+              --notes-file "$NOTES" \
+              --prerelease="$PRERELEASE"
+
+            while read -r asset_id; do
+              [[ -z "$asset_id" ]] && continue
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            done < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[].id')
+          else
+            args=(
+              gh release create "$TAG"
+              --repo "$GITHUB_REPOSITORY"
+              --verify-tag
+              --target "$SHA"
+              --draft
+              --title "ForgeFS $TAG"
+              --notes-file "$NOTES"
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+            "${args[@]}"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [validate, prepare-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate.outputs.tag }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install release Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustup override set "$RUST_VERSION"
+          rustc --version --verbose
+          rustc -vV | grep '^host:'
+          cargo --version --verbose
+
+      - name: Test native release target
+        run: cargo test --workspace --all-targets --locked --target "$TARGET"
+
+      - name: Build forge
+        run: cargo build --locked --release -p forge-cli --bin forge --target "$TARGET"
+
+      - name: Package and smoke test
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="target/$TARGET/release/forge"
+          test -x "$BIN"
+          test "$("$BIN" --version)" = "forge $VERSION"
+
+          DIST="$PWD/dist"
+          STAGE="$RUNNER_TEMP/forgefs-$VERSION-$TARGET"
+          ARCHIVE="forgefs-$VERSION-$TARGET.tar.gz"
+          mkdir -p "$DIST" "$STAGE"
+          install -m 0755 "$BIN" "$STAGE/forge"
+          install -m 0644 README.md LICENSE SECURITY.md "$STAGE/"
+
+          COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "$DIST/$ARCHIVE" forge README.md LICENSE SECURITY.md
+          test -s "$DIST/$ARCHIVE"
+
+          echo "archive=$DIST/$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "archive_name=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Attest archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - name: Upload archive to draft release
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "true"
+          gh release upload "$TAG" "$ARCHIVE" --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    name: Verify and publish
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate.outputs.tag }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Download draft assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "true"
+          mkdir release-assets
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern 'forgefs-*.tar.gz'
+
+      - name: Verify exact asset set and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+
+          expected=(
+            "forgefs-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+            "forgefs-$VERSION-aarch64-unknown-linux-gnu.tar.gz"
+            "forgefs-$VERSION-x86_64-apple-darwin.tar.gz"
+            "forgefs-$VERSION-aarch64-apple-darwin.tar.gz"
+          )
+
+          mapfile -t actual < <(printf '%s\n' forgefs-*.tar.gz | LC_ALL=C sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          if [[ "${actual[*]}" != "${wanted[*]}" ]]; then
+            printf 'Expected assets:\n%s\n' "${wanted[*]}"
+            printf 'Actual assets:\n%s\n' "${actual[*]}"
+            exit 1
+          fi
+
+          for archive in "${expected[@]}"; do
+            test -s "$archive"
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          done
+
+          shasum -a 256 "${expected[@]}" | LC_ALL=C sort -k2 > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Attest checksum manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/SHA256SUMS
+
+      - name: Upload checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" release-assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Verify final draft and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=(
+            "SHA256SUMS"
+            "forgefs-$VERSION-aarch64-apple-darwin.tar.gz"
+            "forgefs-$VERSION-aarch64-unknown-linux-gnu.tar.gz"
+            "forgefs-$VERSION-x86_64-apple-darwin.tar.gz"
+            "forgefs-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          mapfile -t actual < <(
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | LC_ALL=C sort
+          )
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          if [[ "${actual[*]}" != "${wanted[*]}" ]]; then
+            printf 'Final release assets differ from the expected set.\nExpected: %s\nActual: %s\n' \
+              "${wanted[*]}" "${actual[*]}"
+            exit 1
+          fi
+
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "true"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "false"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '.url'
