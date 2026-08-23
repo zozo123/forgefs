@@ -53,6 +53,27 @@ impl Forge {
     /// Verify the repository from durable bytes. `full=false` verifies all
     /// metadata roots and reachable objects; `full=true` additionally scans
     /// every object file, including unreachable/orphan objects.
+    /// Re-resolve a ref that was absent from fsck's `refs` snapshot.
+    ///
+    /// fsck reads refs, then namespaces, then each namespace's mounts, as
+    /// separate queries. A concurrent forking checkin commits a new
+    /// `forks/<ref>/<agent>/<ulid>` and repoints the losing session's mount at
+    /// it atomically, so an fsck that snapshotted refs *before* that commit and
+    /// read mounts *after* it would see a mount naming a ref it never loaded
+    /// and report MOUNT_REF corruption -- exit 2 on a repository whose bytes
+    /// are intact. Forking is the designed outcome of losing a race, so the
+    /// trigger is ordinary contention, not an exotic state.
+    ///
+    /// This is sound rather than a mitigation: nothing in this store ever
+    /// deletes from `refs`, so a name that resolves now was necessarily created
+    /// after the snapshot and is not corruption. Returning it also lets the
+    /// caller adopt it as a graph root, so re-resolving costs no coverage.
+    fn late_ref(&self, name: &str) -> Option<(ObjectId, ObjectType)> {
+        let row = self.store.meta.get_ref(name).ok().flatten()?;
+        let ty = object_type_for_kind(&row.kind).ok()?;
+        Some((row.oid, ty))
+    }
+
     pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
         self.check(cap, Op::Read, None)?;
         if !Self::ref_unrestricted(cap) {
@@ -61,6 +82,12 @@ impl Forge {
             ));
         }
 
+        // `refs` below is a point-in-time snapshot, read before namespaces and
+        // mounts. A checkin that loses a CAS atomically inserts a `forks/...`
+        // ref and repoints the losing session's mount at it, so a mount or live
+        // ref naming something absent from that snapshot may simply have been
+        // created mid-scan on a repository whose bytes are entirely intact.
+        // `late_ref` re-resolves those before they are reported as corruption.
         let mut report = FsckReport::new(full);
         let refs = self.store.meta.list_refs()?;
         report.checked_refs = refs.len();
@@ -114,11 +141,23 @@ impl Forge {
                         &ns_resource,
                         format!("live ref {live} is {}, expected commit", ty.as_str()),
                     ),
-                    None => report.finding(
-                        "NS_LIVE_REF",
-                        &ns_resource,
-                        format!("missing live ref {live}"),
-                    ),
+                    None => match self.late_ref(live) {
+                        Some((oid, ObjectType::Commit)) => roots.push((
+                            oid,
+                            Some(ObjectType::Commit),
+                            format!("{ns_resource}:live_ref:{live}"),
+                        )),
+                        Some((_oid, ty)) => report.finding(
+                            "NS_LIVE_TYPE",
+                            &ns_resource,
+                            format!("live ref {live} is {}, expected commit", ty.as_str()),
+                        ),
+                        None => report.finding(
+                            "NS_LIVE_REF",
+                            &ns_resource,
+                            format!("missing live ref {live}"),
+                        ),
+                    },
                 }
             }
 
@@ -130,11 +169,16 @@ impl Forge {
                         Some((oid, ty)) => {
                             roots.push((*oid, Some(*ty), format!("{mount_resource}:ref:{name}")))
                         }
-                        None => report.finding(
-                            "MOUNT_REF",
-                            &mount_resource,
-                            format!("missing ref {name}"),
-                        ),
+                        None => match self.late_ref(&name) {
+                            Some((oid, ty)) => {
+                                roots.push((oid, Some(ty), format!("{mount_resource}:ref:{name}")))
+                            }
+                            None => report.finding(
+                                "MOUNT_REF",
+                                &mount_resource,
+                                format!("missing ref {name}"),
+                            ),
+                        },
                     },
                     Ok(Spec::Oid(id)) => {
                         if mount.mode == "rw" {
