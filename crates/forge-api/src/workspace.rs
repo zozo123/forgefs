@@ -1,6 +1,16 @@
 //! I8/I9 pinned workspaces, mounts, observations, overlays, and checkin.
 
-use super::*;
+use crate::Forge;
+use forge_cap::{Cap, Op};
+use forge_core::tree::{apply_overlay, split_path};
+use forge_core::{now_ms, Commit, Contribution, ContributionRead};
+use forge_ns::{
+    longest_mount, ls as ns_ls, normalize_abs, overlay_map, parse_spec, rel_of, resolve, Mode,
+    Mount, Resolved, Spec,
+};
+use forge_store::{sanitize_agent, Store};
+use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, Result};
+use std::sync::atomic::Ordering;
 
 impl Forge {
     pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {

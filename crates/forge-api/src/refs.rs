@@ -1,6 +1,11 @@
 //! Typed refs, inbox handoffs, history, and object/ref resolution.
 
-use super::*;
+use crate::Forge;
+use forge_cap::{Cap, Op};
+use forge_core::{now_ms, Commit};
+use forge_ns::{parse_spec, Spec};
+use forge_store::sanitize_agent;
+use forge_types::{CasResult, Error, ObjectId, ObjectType, RefRow, Result};
 
 impl Forge {
     pub fn refs(&self, cap: &Cap) -> Result<Vec<RefRow>> {

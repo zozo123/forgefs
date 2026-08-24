@@ -29,25 +29,9 @@ pub use soak::{private_checkins_bounded, run_bench_with_workers, shared_stampede
 pub const RAW_MERGE_RESOLUTION_DISABLED: &str =
     "raw merge resolution is disabled; resolution must be bound to a conflict object";
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use forge_cap::{attenuate, verify, Cap, Op};
-use forge_core::cbor::{encode_map_sorted, encode_text};
-use forge_core::tree::{apply_overlay, split_path};
-use forge_core::{
-    hash_bytes, now_ms, Blob, Commit, Conflict, Contribution, ContributionRead, Snapshot, Tree,
-};
-use forge_merge::{merge_bases, three_way, MergeOutcome};
-use forge_ns::{
-    longest_mount, ls as ns_ls, normalize_abs, overlay_map, parse_spec, rel_of, resolve, Mode,
-    Mount, Resolved, Spec,
-};
-use forge_store::{sanitize_agent, Store};
-use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, RefRow, Result};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use forge_store::Store;
+use std::fs::File;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

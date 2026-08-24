@@ -1,6 +1,15 @@
 //! Lossless host-filesystem import with bounded TOCTOU detection.
 
-use super::*;
+use crate::Forge;
+use forge_cap::{Cap, Op};
+use forge_core::{now_ms, Commit, Tree};
+use forge_store::Store;
+use forge_types::{Error, ObjectId, Result};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
 
 impl Forge {
     pub fn import_dir(&self, cap: &Cap, dir: &Path, r#ref: &str) -> Result<ObjectId> {

@@ -1,6 +1,13 @@
 //! I11/I12 deterministic integration and I15 sealed release verification.
 
-use super::*;
+use crate::{Forge, RAW_MERGE_RESOLUTION_DISABLED};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use forge_cap::{Cap, Op};
+use forge_core::cbor::{encode_map_sorted, encode_text};
+use forge_core::{hash_bytes, now_ms, Blob, Commit, Conflict, Snapshot};
+use forge_merge::{merge_bases, three_way, MergeOutcome};
+use forge_types::{CasResult, Error, ObjectId, Result};
+use std::sync::atomic::Ordering;
 
 impl Forge {
     pub fn merge(

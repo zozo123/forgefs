@@ -1,6 +1,11 @@
 //! I13/I14 capability verification, attenuation, and namespace ownership.
 
-use super::*;
+use crate::Forge;
+use forge_cap::{attenuate, verify, Cap, Op};
+use forge_core::now_ms;
+use forge_ns::{parse_spec, Spec};
+use forge_types::{Error, Result};
+use std::fs;
 
 impl Forge {
     pub fn load_cap(&self, token: &str) -> Result<Cap> {
