@@ -105,8 +105,9 @@ are strictly increasing and unique by raw UTF-8 bytes. Limits are 1024 parents,
 ## Snapshot provenance manifest
 
 `Snapshot.prov` names a Blob whose payload is a canonical CBOR text map from
-lowercase 64-character ObjectId hex to a UTF-8 attribution label. The map has
-at most 1,000,000 entries. Its exact key set is the union of:
+lowercase 64-character ObjectId hex to a UTF-8 attribution label of at most
+1024 bytes. The map has at most 1,000,000 entries and its complete canonical
+encoding is at most 64 MiB. Its exact key set is the union of:
 
 - every Tree and Blob reachable from `Snapshot.tree`; and
 - every Contribution reachable from `Snapshot.commit` through the typed
