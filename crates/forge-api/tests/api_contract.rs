@@ -419,9 +419,7 @@ fn full_fsck_reports_a_missing_schema_ledger() {
 }
 
 fn malformed_storage_classes_are_findings() {
-    let report = corrupted_catalog_report(
-        "UPDATE refs SET protected='corrupt' WHERE name='main';",
-    );
+    let report = corrupted_catalog_report("UPDATE refs SET protected='corrupt' WHERE name='main';");
     assert_eq!(
         finding_resources(&report, "CATALOG_VALUE"),
         ["catalog:refs:row:1"]
@@ -440,13 +438,8 @@ fn malformed_oids_are_findings() {
 }
 
 fn ref_names_retain_their_kind_invariant() {
-    let report = corrupted_catalog_report(
-        "UPDATE refs SET kind='snapshot' WHERE name='main';",
-    );
-    assert_eq!(
-        finding_resources(&report, "REF_KIND"),
-        ["catalog:ref:main"]
-    );
+    let report = corrupted_catalog_report("UPDATE refs SET kind='snapshot' WHERE name='main';");
+    assert_eq!(finding_resources(&report, "REF_KIND"), ["catalog:ref:main"]);
 }
 
 fn seal_row_must_agree_with_snapshot_payload() {
