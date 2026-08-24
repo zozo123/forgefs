@@ -216,7 +216,10 @@ fn failed_staging_cleanup_barrier_is_retryable() {
     assert!(fault.fired());
     assert!(result.is_err());
     assert!(!dir.path().join(".forge").exists());
-    assert!(!stale.exists(), "cleanup failure left reclaimed debris visible");
+    assert!(
+        !stale.exists(),
+        "cleanup failure left reclaimed debris visible"
+    );
     drop(fault);
 
     let initialized = Forge::init(dir.path()).unwrap();
@@ -262,7 +265,10 @@ fn failed_cold_open_publication_join_never_exposes_a_handle() {
     let fault = barrier_fault::fail_at(DurabilityBarrier::OpenPublicationDirectory, 1);
     let result = Forge::open(dir.path());
     assert!(fault.fired());
-    assert!(result.is_err(), "failed open barrier returned a live handle");
+    assert!(
+        result.is_err(),
+        "failed open barrier returned a live handle"
+    );
     drop(fault);
 
     assert_reopens_clean(dir.path(), &expected);

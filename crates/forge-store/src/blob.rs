@@ -267,11 +267,7 @@ impl PublishBatch<'_> {
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
-            sync_file_counted(
-                &f,
-                &self.store.stats,
-                crate::DurabilityBarrier::ObjectFile,
-            )?;
+            sync_file_counted(&f, &self.store.stats, crate::DurabilityBarrier::ObjectFile)?;
             crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectFileAfter)?;
         }
 
@@ -380,11 +376,7 @@ fn ensure_dir_durable(
         }
         Err(e) => return Err(Error::Io(e.to_string())),
     }
-    sync_dir_counted(
-        parent,
-        stats,
-        crate::DurabilityBarrier::ObjectPathDirectory,
-    )?;
+    sync_dir_counted(parent, stats, crate::DurabilityBarrier::ObjectPathDirectory)?;
     durable_dirs.lock().put(child.to_path_buf(), ());
     Ok(())
 }

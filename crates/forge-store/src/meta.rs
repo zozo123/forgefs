@@ -627,8 +627,7 @@ impl Meta {
     }
 
     fn commit_ref_tx(&self, tx: rusqlite::Transaction<'_>) -> Result<()> {
-        tx.commit()
-            .map_err(|error| self.map_sql_counted(error))?;
+        tx.commit().map_err(|error| self.map_sql_counted(error))?;
         crate::inject_barrier_failure(crate::DurabilityBarrier::MetadataRefCommitAfter)
     }
 

@@ -488,10 +488,7 @@ fn cleanup_init_staging_siblings(root: &Path) -> Result<()> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    sync_dir_at(
-        parent,
-        forge_store::DurabilityBarrier::InitCleanupDirectory,
-    )?;
+    sync_dir_at(parent, forge_store::DurabilityBarrier::InitCleanupDirectory)?;
     Ok(())
 }
 
@@ -593,10 +590,7 @@ fn create_dir_all_durable(path: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
         let parent = current.parent().unwrap_or_else(|| Path::new("."));
-        sync_dir_at(
-            parent,
-            forge_store::DurabilityBarrier::InitParentDirectory,
-        )?;
+        sync_dir_at(parent, forge_store::DurabilityBarrier::InitParentDirectory)?;
     }
     Ok(())
 }
