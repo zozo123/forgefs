@@ -387,8 +387,16 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
                     source.display()
                 )));
             }
-            let id = f.import_dir(cap, &source, &r#ref)?;
-            println!("imported {id} -> {ref_name}", ref_name = r#ref);
+            match f.import_dir(cap, &source, &r#ref)? {
+                CasResult::Updated { name, oid } => println!("imported {oid} -> {name}"),
+                CasResult::Forked {
+                    requested,
+                    fork,
+                    ours,
+                    theirs,
+                } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
+                CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
+            }
         }
         Cmd::Branch { from, name } => {
             let id = f.branch(cap, &from, &name)?;

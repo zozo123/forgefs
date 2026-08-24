@@ -4,7 +4,7 @@ use crate::Forge;
 use forge_cap::{Cap, Op};
 use forge_core::{now_ms, Commit, Tree};
 use forge_store::Store;
-use forge_types::{Error, ObjectId, Result};
+use forge_types::{CasResult, Error, ObjectId, Result};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
@@ -12,13 +12,24 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 impl Forge {
-    pub fn import_dir(&self, cap: &Cap, dir: &Path, r#ref: &str) -> Result<ObjectId> {
+    /// Import an exact directory snapshot and return the ref publication outcome.
+    /// A lost compare-and-swap is preserved and reported as an explicit fork.
+    pub fn import_dir(&self, cap: &Cap, dir: &Path, r#ref: &str) -> Result<CasResult> {
         self.check(cap, Op::Write, Some(r#ref))?;
         let previous = self.store.meta.get_ref(r#ref)?;
         let previous_commit = match previous.as_ref() {
             Some(row) => Some(self.store.get_commit(row.oid)?),
             None => None,
         };
+        let expected = previous
+            .as_ref()
+            .map(|row| row.oid)
+            .unwrap_or(ObjectId::ZERO);
+        crate::test_hooks::process_barrier(
+            "FORGEFS_TEST_IMPORT_SNAPSHOT_BARRIER",
+            2,
+            "import snapshot",
+        )?;
         let tree = import_walk(&self.store, dir, true)?;
         let parents = previous
             .as_ref()
@@ -37,33 +48,16 @@ impl Forge {
         let intro_oids = self
             .store
             .collect_intros(previous_commit.as_ref().map(|c| c.tree), tree)?;
-        match previous {
-            Some(row) => {
-                self.store.meta.cas_ref_with_intros(
-                    r#ref,
-                    row.oid,
-                    cid,
-                    "commit",
-                    cap.agent_id(),
-                    cap.agent_id(),
-                    false,
-                    &intro_oids,
-                )?;
-            }
-            None => {
-                self.store.meta.insert_ref_with_intros(
-                    r#ref,
-                    cid,
-                    "commit",
-                    false,
-                    false,
-                    cap.agent_id(),
-                    "import",
-                    &intro_oids,
-                )?;
-            }
-        }
-        Ok(cid)
+        self.store.meta.cas_ref_with_intros(
+            r#ref,
+            expected,
+            cid,
+            "commit",
+            cap.agent_id(),
+            cap.agent_id(),
+            false,
+            &intro_oids,
+        )
     }
 }
 
