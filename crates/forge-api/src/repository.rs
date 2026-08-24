@@ -276,6 +276,7 @@ impl Forge {
             _cell_lock: cell_lock,
             exclusive_cell_lock: exclusive,
             read_only,
+            fsck_catalog,
         })
     }
 
