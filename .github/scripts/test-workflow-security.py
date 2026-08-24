@@ -18,6 +18,9 @@ SPEC.loader.exec_module(POLICY)
 PIN = "a" * 40
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 SAFE_RUN = "cargo fmt --all -- --check"
+UPLOAD = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+DOWNLOAD = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+ATTEST = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
 
 
 def workflow(body: str) -> str:
@@ -120,6 +123,79 @@ class WorkflowSecurityTests(unittest.TestCase):
             "permissions:\n  contents: read", 'permissions: "write-all"'
         )
         self.assertTrue(any("write-all" in error for error in self.check(write_all)))
+
+    def test_exact_release_actions_are_allowlisted(self) -> None:
+        for action in (UPLOAD, DOWNLOAD, ATTEST):
+            with self.subTest(action=action):
+                self.assertEqual(self.check(workflow(f"      - uses: {action}\n")), [])
+
+    def test_runner_labels_and_matrix_values_fail_closed(self) -> None:
+        for runner in ("ubuntu-latest", "macos-latest", "self-hosted"):
+            with self.subTest(runner=runner):
+                source = workflow(f"      - run: {SAFE_RUN}\n").replace(
+                    "runs-on: ubuntu-24.04", f"runs-on: {runner}"
+                )
+                self.assertTrue(
+                    any("runner label" in error for error in self.check(source))
+                )
+
+        fixed_matrix = workflow(f"      - run: {SAFE_RUN}\n").replace(
+            "    runs-on: ubuntu-24.04",
+            """    strategy:
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    runs-on: ${{ matrix.os }}""",
+        )
+        self.assertEqual(self.check(fixed_matrix), [])
+
+        mutable_matrix = fixed_matrix.replace("- macos-15", "- ubuntu-latest")
+        self.assertTrue(
+            any("runner label" in error for error in self.check(mutable_matrix))
+        )
+
+        dynamic_matrix = fixed_matrix.replace(
+            "matrix:\n        os:\n          - ubuntu-24.04\n          - macos-15",
+            "matrix: ${{ fromJSON(inputs.matrix) }}",
+        )
+        self.assertTrue(
+            any("matrices are forbidden" in error for error in self.check(dynamic_matrix))
+        )
+
+    def test_release_helpers_are_exact_commands(self) -> None:
+        accepted = workflow(
+            "      - run: .github/scripts/release-verify-payload.sh payload\n"
+        )
+        self.assertEqual(self.check(accepted), [])
+
+        arbitrary = workflow("      - run: .github/scripts/release-surprise.sh\n")
+        self.assertTrue(
+            any("not allowlisted" in error for error in self.check(arbitrary))
+        )
+
+    def test_shell_container_and_execution_environment_overrides_are_rejected(self) -> None:
+        explicit_shell = workflow(
+            f"""      - run: {SAFE_RUN}
+        shell: bash -c 'malicious' {{0}}
+"""
+        )
+        self.assertTrue(any("shell is forbidden" in error for error in self.check(explicit_shell)))
+
+        bash_env = workflow(f"      - run: {SAFE_RUN}\n").replace(
+            "jobs:\n", "env:\n  BASH_ENV: ./bootstrap.sh\njobs:\n"
+        )
+        self.assertTrue(
+            any("alter command execution" in error for error in self.check(bash_env))
+        )
+
+        container = workflow(f"      - run: {SAFE_RUN}\n").replace(
+            "    runs-on: ubuntu-24.04\n",
+            "    runs-on: ubuntu-24.04\n    container: ubuntu:latest\n",
+        )
+        self.assertTrue(
+            any("container is forbidden" in error for error in self.check(container))
+        )
 
     def test_multiline_quoted_sensitive_values_fail_closed(self) -> None:
         continued_write = 'permissions: "write-' + "\\\n" + '  all"'

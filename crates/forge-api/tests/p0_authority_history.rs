@@ -1,5 +1,5 @@
 use forge_api::Forge;
-use forge_types::Error;
+use forge_types::{CasResult, Error, ObjectId};
 use std::fs;
 use tempfile::tempdir;
 
@@ -55,13 +55,20 @@ fn repeated_import_preserves_commit_ancestry() {
     let src = d.path().join("source");
     fs::create_dir(&src).unwrap();
 
+    fn updated_oid(result: CasResult) -> ObjectId {
+        match result {
+            CasResult::Updated { oid, .. } => oid,
+            other => panic!("sequential import unexpectedly did not update: {other:?}"),
+        }
+    }
+
     fs::write(src.join("data.txt"), b"v1").unwrap();
-    let first = f.import_dir(&root, &src, "imports/test").unwrap();
+    let first = updated_oid(f.import_dir(&root, &src, "imports/test").unwrap());
     let (_, c1) = f.peel_commit("imports/test").unwrap();
     assert!(c1.parents.is_empty());
 
     fs::write(src.join("data.txt"), b"v2").unwrap();
-    let second = f.import_dir(&root, &src, "imports/test").unwrap();
+    let second = updated_oid(f.import_dir(&root, &src, "imports/test").unwrap());
     assert_ne!(first, second);
     let (head, c2) = f.peel_commit("imports/test").unwrap();
     assert_eq!(head, second);

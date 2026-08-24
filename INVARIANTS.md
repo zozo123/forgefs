@@ -34,4 +34,23 @@ cap         (operation, resource); attenuation ⊆ parent
 
 A composed Unicode name and its canonically equivalent decomposed spelling are distinct ForgeFS entries if their UTF-8 byte strings differ. Likewise `Foo` and `foo` are distinct. Export adapters must detect target-filesystem collisions and fail rather than silently normalize, fold, or overwrite names.
 
-Tests are named after these IDs. A PR that cannot name an invariant does not merge.
+## Executable evidence
+
+The public cross-cutting seam is table-tested in
+[`api_contract.rs`](crates/forge-api/tests/api_contract.rs). Mechanism-specific
+proofs stay separate so a real race, process, crash, or filesystem boundary is
+not diluted into a mock:
+
+| Invariants | Production owner | Primary evidence |
+|---|---|---|
+| I1, I2, I10, I17 | `forge-core`, `forge-api/import.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `checkin_contribution.rs`, `bootstrap_contract.rs` |
+| I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `docs/RECOVERY.md` |
+| I5, I7, I8 | `forge-store/meta.rs`, `forge-api/workspace.rs`, `refs.rs` | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs` |
+| I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs` |
+| I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs` |
+| I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs` |
+| I15 | `forge-api/integration.rs`, `fsck.rs` | `api_contract.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs` |
+| I16 | `forge-core/tree.rs`, `forge-api/export.rs` | `path_identity.rs`, `export_long_names.rs` |
+
+Tests are named after these IDs or state the invariant in a one-line rationale.
+A PR that cannot name an invariant does not merge.

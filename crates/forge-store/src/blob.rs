@@ -51,6 +51,9 @@ struct BlobStoreCounters {
 #[derive(Clone, Debug)]
 pub struct LocalBlobStore {
     root: PathBuf,
+    /// A read-only store refuses every publication instead of discovering that
+    /// the media is immutable halfway through one.
+    read_only: bool,
     stats: Arc<BlobStoreCounters>,
     // Positive durability proofs only. A directory is inserted after its
     // parent barrier succeeds; an OID is inserted only after the batch's leaf
@@ -87,10 +90,39 @@ impl LocalBlobStore {
         cleanup_stale_tmp(&tmp, &stats)?;
         Ok(Self {
             root,
+            read_only: false,
             stats,
             durable_dirs,
             durable_oids,
         })
+    }
+
+    /// Open an existing object store without writing anything: no directory
+    /// creation, no directory fsync barrier, and no stale-tmp reclamation.
+    /// `objects/` must already exist, because nothing here may create it.
+    pub fn open_read_only(root: PathBuf) -> Result<Self> {
+        let objects = root.join("objects");
+        if !objects.is_dir() {
+            return Err(Error::Invalid(format!(
+                "missing object directory {}",
+                objects.display()
+            )));
+        }
+        Ok(Self {
+            root,
+            read_only: true,
+            stats: Arc::new(BlobStoreCounters::default()),
+            durable_dirs: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(DURABLE_DIR_CACHE_CAPACITY).expect("non-zero directory cache"),
+            ))),
+            durable_oids: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(DURABLE_OID_CACHE_CAPACITY).expect("non-zero OID cache"),
+            ))),
+        })
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn root(&self) -> &Path {
@@ -119,6 +151,7 @@ impl LocalBlobStore {
     }
 
     fn verify_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
+        require_regular_file(path, id)?;
         let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
         if hash_bytes(&bytes) != id {
             return Err(Error::Corrupt(format!(
@@ -129,6 +162,7 @@ impl LocalBlobStore {
     }
 
     fn verify_and_sync_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
+        require_regular_file(path, id)?;
         // Operate on one descriptor so the bytes verified are the bytes forced.
         // Opening writable is intentional: macOS F_FULLFSYNC is a fail-closed
         // durability contract, not a best-effort read hint.
@@ -140,7 +174,11 @@ impl LocalBlobStore {
                 "existing object does not match its id: {id}"
             )));
         }
-        sync_file_counted(&file, &self.stats)?;
+        sync_file_counted(
+            &file,
+            &self.stats,
+            crate::DurabilityBarrier::ObjectExistingFile,
+        )?;
         Ok(())
     }
 
@@ -150,6 +188,7 @@ impl LocalBlobStore {
 
     pub fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
         let p = self.object_path(id);
+        require_regular_file(&p, id)?;
         let bytes = fs::read(&p).map_err(|_| Error::NotFound(format!("object {id}")))?;
         if hash_bytes(&bytes) != id {
             return Err(Error::Corrupt(format!("hash mismatch {id}")));
@@ -176,6 +215,13 @@ impl LocalBlobStore {
 
 impl PublishBatch<'_> {
     pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
+        // Every object write in the process funnels through here, so this is
+        // the whole write boundary for a read-only store.
+        if self.store.read_only {
+            return Err(Error::Denied(
+                "repository is open read-only; objects cannot be published".into(),
+            ));
+        }
         let id = hash_bytes(bytes);
         let dest = self.store.object_path(id);
         let (a, b) = id.shard_dirs();
@@ -221,11 +267,13 @@ impl PublishBatch<'_> {
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
-            sync_file_counted(&f, &self.store.stats)?;
+            sync_file_counted(&f, &self.store.stats, crate::DurabilityBarrier::ObjectFile)?;
+            crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectFileAfter)?;
         }
 
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
+                crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectLinkAfter)?;
                 self.dirs.insert(shard_b);
                 self.oids.insert(id);
                 self.new_puts += 1;
@@ -255,7 +303,14 @@ impl PublishBatch<'_> {
 
     pub fn finish(self) -> Result<()> {
         for dir in &self.dirs {
-            sync_dir_counted(dir, &self.store.stats)?;
+            sync_dir_counted(
+                dir,
+                &self.store.stats,
+                crate::DurabilityBarrier::ObjectPublicationDirectory,
+            )?;
+            crate::inject_barrier_failure(
+                crate::DurabilityBarrier::ObjectPublicationDirectoryAfter,
+            )?;
         }
         // This is the sole OID-proof publication point. A dropped or failed
         // batch never teaches later callers that its visible links are durable.
@@ -276,6 +331,24 @@ impl PublishBatch<'_> {
 impl crate::Store {
     pub fn stats(&self) -> BlobStoreStats {
         self.blobs.stats()
+    }
+}
+
+/// A durable object must be a regular file. Without this check a FIFO planted
+/// at an object path made `fs::read` block forever, so fsck/export/import hung
+/// indefinitely instead of failing closed -- while a mere byte flip in the same
+/// file was correctly reported as corruption.
+fn require_regular_file(path: &Path, id: ObjectId) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(meta) => Err(Error::Corrupt(format!(
+            "object {id} is not a regular file: {:?}",
+            meta.file_type()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::NotFound(format!("object {id}")))
+        }
+        Err(e) => Err(Error::Io(e.to_string())),
     }
 }
 
@@ -303,7 +376,7 @@ fn ensure_dir_durable(
         }
         Err(e) => return Err(Error::Io(e.to_string())),
     }
-    sync_dir_counted(parent, stats)?;
+    sync_dir_counted(parent, stats, crate::DurabilityBarrier::ObjectPathDirectory)?;
     durable_dirs.lock().put(child.to_path_buf(), ());
     Ok(())
 }
@@ -339,21 +412,33 @@ fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {
         }
     }
     if removed {
-        sync_dir_counted(tmp, stats)?;
+        sync_dir_counted(
+            tmp,
+            stats,
+            crate::DurabilityBarrier::ObjectTemporaryDirectory,
+        )?;
     }
     Ok(())
 }
 
-fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {
+fn sync_dir_counted(
+    path: &Path,
+    stats: &BlobStoreCounters,
+    point: crate::DurabilityBarrier,
+) -> Result<()> {
     let started = Instant::now();
-    crate::durable_sync_dir(path)?;
+    crate::durable_sync_dir_at(path, point)?;
     stats.fsync_dir.observe(started.elapsed());
     Ok(())
 }
 
-fn sync_file_counted(file: &std::fs::File, stats: &BlobStoreCounters) -> Result<()> {
+fn sync_file_counted(
+    file: &std::fs::File,
+    stats: &BlobStoreCounters,
+    point: crate::DurabilityBarrier,
+) -> Result<()> {
     let started = Instant::now();
-    crate::durable_sync_file(file)?;
+    crate::durable_sync_file_at(file, point)?;
     stats.fsync_file.observe(started.elapsed());
     Ok(())
 }
@@ -593,6 +678,37 @@ mod tests {
         assert_eq!(after.puts, before.puts);
         assert_eq!(after.fsync_file, before.fsync_file + 1);
         assert_eq!(after.fsync_dir, before.fsync_dir + 3);
+    }
+
+    /// A byte flip at an object path is corruption; so is a FIFO. Before the
+    /// file-type check, fs::read on a FIFO blocked forever, so fsck/export/import
+    /// hung indefinitely instead of failing closed.
+    #[test]
+    #[cfg(unix)]
+    fn non_regular_file_at_an_object_path_is_corruption_not_a_hang() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let id = s.put(b"durable").unwrap();
+        let path = s.object_path(id);
+        fs::remove_file(&path).unwrap();
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+
+        // Would block forever before the check. Corrupt, promptly.
+        assert!(matches!(s.get(id), Err(Error::Corrupt(_))));
+        assert!(matches!(s.put(b"durable"), Err(Error::Corrupt(_))));
+
+        // A directory in an object's place is equally not an object.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(s.get(id), Err(Error::Corrupt(_))));
     }
 
     #[test]

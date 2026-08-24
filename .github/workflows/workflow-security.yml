@@ -7,15 +7,13 @@ on:
   pull_request:
     paths:
       - '.github/workflows/**'
-      - '.github/scripts/check-workflow-security.py'
-      - '.github/scripts/test-workflow-security.py'
+      - '.github/scripts/**'
   push:
     branches:
       - main
     paths:
       - '.github/workflows/**'
-      - '.github/scripts/check-workflow-security.py'
-      - '.github/scripts/test-workflow-security.py'
+      - '.github/scripts/**'
   workflow_dispatch:
 
 permissions:
@@ -35,5 +33,7 @@ jobs:
           persist-credentials: false
       - name: Test policy against YAML bypasses
         run: python3 .github/scripts/test-workflow-security.py
+      - name: Test release tooling contracts
+        run: python3 .github/scripts/test-release-tooling.py
       - name: Enforce immutable workflow dependencies
         run: python3 .github/scripts/check-workflow-security.py

@@ -35,27 +35,69 @@ BLOCK_SCALAR = re.compile(r"^[|>](?:[-+]?[1-9]?|[1-9][-+]?)$")
 ALLOWED_REMOTE_ACTIONS = frozenset(
     {
         "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
         "dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb",
     }
 )
+ALLOWED_RUNNERS = frozenset(
+    {"macos-15", "macos-15-intel", "ubuntu-24.04", "ubuntu-24.04-arm"}
+)
+MATRIX_RUNNER = "${{ matrix.os }}"
+FORBIDDEN_STRUCTURE_KEYS = frozenset(
+    {"container", "services", "shell", "working-directory"}
+)
+FORBIDDEN_ENV_KEYS = frozenset(
+    {
+        "bash_env",
+        "dyld_insert_libraries",
+        "ld_preload",
+        "path",
+        "pythonpath",
+        "rustc_wrapper",
+        "shellopts",
+    }
+)
 ALLOWED_RUN_COMMANDS = frozenset(
     {
+        ".github/scripts/prepare-release-gate.sh",
+        ".github/scripts/prepare-release-apply.sh",
+        ".github/scripts/prepare-release-package.sh",
+        ".github/scripts/prepare-release-pr.sh",
+        ".github/scripts/prepare-release-update.sh",
+        ".github/scripts/release-assemble.sh",
+        ".github/scripts/release-build.sh",
+        ".github/scripts/release-e2e-artifact.sh",
+        ".github/scripts/release-identity.sh",
+        ".github/scripts/release-label-evidence.sh",
+        ".github/scripts/release-publish.sh",
+        ".github/scripts/release-verify-payload.sh payload",
         "cargo +nightly fuzz run cap_token -- -max_total_time=60 -rss_limit_mb=2048",
         "cargo +nightly fuzz run object_decode -- -max_total_time=60 -rss_limit_mb=2048",
         "cargo +nightly fuzz run protocol_frame -- -max_total_time=60 -rss_limit_mb=2048",
         "cargo audit --deny warnings",
+        "cargo build --locked -p forge-cli",
         "cargo check --manifest-path fuzz/Cargo.toml --bins",
         "cargo check --workspace --all-targets --locked",
         "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        "cargo deny --locked check advisories bans licenses sources",
         "cargo fmt --all -- --check",
         "cargo install cargo-audit --version 0.22.2 --locked",
+        "cargo install cargo-deny --version 0.20.2 --locked",
         "cargo install cargo-fuzz --version 0.13.2 --locked",
+        "cargo metadata --locked --format-version 1 >/dev/null",
         "cargo run --locked -p forge-cli -- bench --agents 32 --shared 16 --workers 16",
         "cargo test --workspace --all-targets --locked",
+        "git diff --exit-code -- Cargo.lock",
         "python3 .github/scripts/check-workflow-security.py",
+        "python3 .github/scripts/prepare-release-version.py",
+        "python3 .github/scripts/test-release-tooling.py",
         "python3 .github/scripts/test-workflow-security.py",
+        "scripts/cli-abi-conformance.sh target/debug/forge",
+        "scripts/release-gate.sh target/debug/forge",
     }
 )
 
@@ -252,6 +294,60 @@ def mapping(line: str) -> tuple[int, str, str] | None:
     )
 
 
+def parent_mapping_key(lines: list[str], index: int, child_indent: int) -> str | None:
+    """Return the nearest enclosing mapping key for a source line."""
+    for candidate in range(index - 1, -1, -1):
+        item = mapping(lines[candidate])
+        if item is not None and item[0] < child_indent:
+            return item[1]
+    return None
+
+
+def check_runner_list(
+    lines: list[str],
+    start: int,
+    parent_indent: int,
+    errors: list[str],
+    path: Path,
+) -> int:
+    """Validate a block-style matrix `os` list and return its value count."""
+    count = 0
+    list_indent: int | None = None
+    for candidate in range(start + 1, len(lines)):
+        line = lines[candidate]
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= parent_indent:
+            break
+        listed = LIST_SCALAR.match(line)
+        if listed is None:
+            error(
+                errors,
+                path,
+                candidate + 1,
+                "matrix os must be a flat block list of fixed runners",
+            )
+            continue
+        if list_indent is None:
+            list_indent = indent
+        if indent != list_indent:
+            error(
+                errors,
+                path,
+                candidate + 1,
+                "matrix os runner has unexpected nesting",
+            )
+            continue
+        runner = scalar(listed.group("value"))
+        if runner not in ALLOWED_RUNNERS:
+            error(errors, path, candidate + 1, "runner label is not allowlisted")
+        count += 1
+    if count == 0:
+        error(errors, path, start + 1, "matrix os must declare fixed runners")
+    return count
+
+
 def checkout_step(lines: list[str], index: int, uses_indent: int) -> tuple[list[str], int]:
     start = index
     step_indent = uses_indent
@@ -324,6 +420,8 @@ def check_workflow(path: Path, errors: list[str]) -> None:
     top_level_permissions = False
     block_scalar_indent: int | None = None
     block_scalar_key: str | None = None
+    matrix_runner_lines: list[int] = []
+    matrix_os_values = 0
 
     for index, line in enumerate(lines, 1):
         stripped = line.strip()
@@ -381,6 +479,7 @@ def check_workflow(path: Path, errors: list[str]) -> None:
             continue
 
         item_indent, key, value = item
+        parent_key = parent_mapping_key(lines, index - 1, item_indent)
         if not is_complete_quoted_scalar(value):
             error(
                 errors,
@@ -417,6 +516,49 @@ def check_workflow(path: Path, errors: list[str]) -> None:
             error(errors, path, index, "write-all permissions are forbidden")
         if key == "persist-credentials" and yaml_bool(value) is not False:
             error(errors, path, index, "checkout credentials must not persist")
+        if key in FORBIDDEN_STRUCTURE_KEYS:
+            error(
+                errors,
+                path,
+                index,
+                f"{key} is forbidden by the restricted execution grammar",
+            )
+        if parent_key == "env" and key in FORBIDDEN_ENV_KEYS:
+            error(
+                errors,
+                path,
+                index,
+                f"environment key {key} can alter command execution",
+            )
+        if key == "matrix" and value:
+            error(
+                errors,
+                path,
+                index,
+                "dynamic or scalar matrices are forbidden; declare a block matrix",
+            )
+        if key == "include" and parent_key == "matrix" and value:
+            error(
+                errors,
+                path,
+                index,
+                "dynamic matrix include values are forbidden",
+            )
+        if key == "runs-on":
+            runner = scalar(value)
+            if runner == MATRIX_RUNNER:
+                matrix_runner_lines.append(index)
+            elif runner not in ALLOWED_RUNNERS:
+                error(errors, path, index, "runner label is not allowlisted")
+        if key == "os" and parent_key in {"include", "matrix"}:
+            if value:
+                if scalar(value) not in ALLOWED_RUNNERS:
+                    error(errors, path, index, "matrix runner label is not allowlisted")
+                matrix_os_values += 1
+            else:
+                matrix_os_values += check_runner_list(
+                    lines, index - 1, item_indent, errors, path
+                )
 
         if key != "uses":
             continue
@@ -445,6 +587,14 @@ def check_workflow(path: Path, errors: list[str]) -> None:
 
     if not top_level_permissions:
         error(errors, path, 1, "declare least-privilege top-level permissions")
+    if matrix_runner_lines and matrix_os_values == 0:
+        for line in matrix_runner_lines:
+            error(
+                errors,
+                path,
+                line,
+                "matrix.os runner requires an explicit fixed os matrix",
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

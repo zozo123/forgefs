@@ -20,12 +20,149 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Stable names for durability transitions exercised by the debug-only fault
+/// injector. The enum is present in release builds so the real barrier calls
+/// stay identical, but injection state and branches are compiled out.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityBarrier {
+    ObjectFile,
+    ObjectFileAfter,
+    ObjectExistingFile,
+    ObjectLinkAfter,
+    ObjectPathDirectory,
+    ObjectPublicationDirectory,
+    ObjectPublicationDirectoryAfter,
+    ObjectTemporaryDirectory,
+    InitFile,
+    InitKeyDirectory,
+    InitCleanupDirectory,
+    InitStagingDirectory,
+    InitPublicationDirectory,
+    InitParentDirectory,
+    OpenPublicationDirectory,
+    MetadataRefCommitAfter,
+    MetadataCheckpointBefore,
+    MetadataCheckpointAfter,
+    OtherFile,
+    OtherDirectory,
+}
+
+/// Deterministic, current-thread barrier failures for debug/test builds.
+///
+/// This is deliberately an explicitly armed in-process seam: it reads no
+/// environment variables, has no process-exit path, and is absent from release
+/// builds. Keeping plans thread-local also prevents concurrently executing
+/// tests from perturbing one another.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod barrier_fault {
+    use super::DurabilityBarrier;
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Plan {
+        point: DurabilityBarrier,
+        occurrence: usize,
+        matches: usize,
+        fired: bool,
+    }
+
+    thread_local! {
+        static ACTIVE: Cell<Option<Plan>> = const { Cell::new(None) };
+    }
+
+    /// An RAII fault scope. Dropping it removes the current thread's plan even
+    /// when the operation under test panics.
+    pub struct Guard {
+        // A plan belongs to the thread that armed it. Make moving its guard to
+        // another thread a compile-time error.
+        _thread_local: PhantomData<Rc<()>>,
+    }
+
+    impl Guard {
+        pub fn fired(&self) -> bool {
+            ACTIVE.with(|active| active.get().is_some_and(|plan| plan.fired))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(None));
+        }
+    }
+
+    /// Fail the selected one-based occurrence of `point` on this thread.
+    pub fn fail_at(point: DurabilityBarrier, occurrence: usize) -> Guard {
+        assert!(occurrence > 0, "barrier occurrence is one-based");
+        ACTIVE.with(|active| {
+            assert!(
+                active.get().is_none(),
+                "a barrier fault plan is already armed"
+            );
+            active.set(Some(Plan {
+                point,
+                occurrence,
+                matches: 0,
+                fired: false,
+            }));
+        });
+        Guard {
+            _thread_local: PhantomData,
+        }
+    }
+
+    pub(super) fn hit(point: DurabilityBarrier) -> bool {
+        ACTIVE.with(|active| {
+            let Some(mut plan) = active.get() else {
+                return false;
+            };
+            if point != plan.point || plan.fired {
+                return false;
+            }
+            plan.matches += 1;
+            let should_fail = plan.matches == plan.occurrence;
+            if should_fail {
+                plan.fired = true;
+            }
+            active.set(Some(plan));
+            should_fail
+        })
+    }
+}
+
+#[inline]
+fn inject_barrier_failure(point: DurabilityBarrier) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if barrier_fault::hit(point) {
+        return Err(Error::Io(format!(
+            "injected durability barrier failure at {point:?}"
+        )));
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
+    Ok(())
+}
+
 /// Complete the strongest durability barrier supported by the platform.
 /// macOS `fsync(2)` does not flush device caches, so match SQLite's
 /// `fullfsync=ON` policy with `F_FULLFSYNC` for immutable objects and bootstrap
 /// files too. Failure is fatal: a weaker object plane could violate I4 after a
 /// power loss even while the SQLite ref survives.
 pub fn durable_sync_file(file: &std::fs::File) -> Result<()> {
+    durable_sync_file_at(file, DurabilityBarrier::OtherFile)
+}
+
+#[doc(hidden)]
+pub fn durable_sync_file_at(file: &std::fs::File, point: DurabilityBarrier) -> Result<()> {
+    inject_barrier_failure(point)?;
+    durable_sync_file_inner(file)
+}
+
+fn durable_sync_file_inner(file: &std::fs::File) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
@@ -40,8 +177,14 @@ pub fn durable_sync_file(file: &std::fs::File) -> Result<()> {
 }
 
 pub fn durable_sync_dir(path: &Path) -> Result<()> {
+    durable_sync_dir_at(path, DurabilityBarrier::OtherDirectory)
+}
+
+#[doc(hidden)]
+pub fn durable_sync_dir_at(path: &Path, point: DurabilityBarrier) -> Result<()> {
+    inject_barrier_failure(point)?;
     #[cfg(unix)]
-    durable_sync_file(&std::fs::File::open(path)?)?;
+    durable_sync_file_inner(&std::fs::File::open(path)?)?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
@@ -104,6 +247,24 @@ impl Store {
             trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
             blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
         })
+    }
+
+    /// Open both halves of the store without writing to either. Object and
+    /// metadata writes are then refused at their own boundaries, so a
+    /// read-only handle cannot touch read-only media.
+    pub fn open_read_only(root: &Path) -> Result<Self> {
+        let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
+        let meta = Meta::open_read_only(&root.join("meta.sqlite"))?;
+        Ok(Self {
+            blobs,
+            meta,
+            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
+            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        })
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.meta.read_only()
     }
 
     pub fn put_raw(&self, bytes: &[u8]) -> Result<ObjectId> {
