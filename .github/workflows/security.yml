@@ -8,7 +8,8 @@ on:
       - 'crates/**/Cargo.toml'
       - '.github/workflows/security.yml'
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - Cargo.toml
       - Cargo.lock
@@ -27,7 +28,7 @@ concurrency:
 
 jobs:
   rustsec:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -38,6 +39,6 @@ jobs:
         with:
           toolchain: 1.97.0
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit committed lockfile
         run: cargo audit --deny warnings

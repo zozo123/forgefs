@@ -1,0 +1,39 @@
+name: workflow-security
+
+# Defense-in-depth candidate lint. This PR-controlled job is not the merge
+# trust root; issue #51 tracks binding policy from a protected ruleset/app.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Test policy against YAML bypasses
+        run: python3 .github/scripts/test-workflow-security.py
+      - name: Test release tooling contracts
+        run: python3 .github/scripts/test-release-tooling.py
+      - name: Enforce immutable workflow dependencies
+        run: python3 .github/scripts/check-workflow-security.py

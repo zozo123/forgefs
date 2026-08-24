@@ -9,11 +9,12 @@ The model is intentionally small:
 3. A release-preparation workflow opens the version-bump PR.
 4. The release tag must exactly equal `v<workspace version>` and its commit must already be reachable from `origin/main`.
 5. Four target artifacts are built from that exact commit.
-6. Three native target artifacts run the end-to-end ForgeFS release gate from the packaged binary, not from a rebuild.
-7. All binaries, BUILD-INFO files and gate evidence are assembled into one `release-payload` artifact.
-8. `SHA256SUMS` covers every file in that payload.
-9. The exact checksum manifest is attested.
-10. The publish job downloads only that immutable payload, re-verifies it, and hands exactly those files to `gh release create`.
+6. All four target artifacts run the end-to-end ForgeFS release gate on their native hosted architecture, from the packaged binary rather than a rebuild.
+7. Release build, gate and audit jobs start without a shared compilation cache.
+8. All binaries, BUILD-INFO files and gate evidence are assembled into one `release-payload` artifact.
+9. `SHA256SUMS` covers every file in that payload.
+10. The exact checksum manifest is attested.
+11. The publish job downloads only that immutable payload, re-verifies it, and hands exactly those files to `gh release create`.
 
 No other workflow may create ForgeFS releases.
 
@@ -23,13 +24,15 @@ Use **Actions -> prepare release -> Run workflow** and choose `patch`, `minor`, 
 
 The workflow:
 
+- performs all version mutation, compilation, tests and release gating in a read-only job;
 - reads the current workspace version;
 - computes the next stable SemVer;
 - edits the single workspace version field;
 - runs Cargo once without `--locked` so the existing lockfile is minimally refreshed for the local workspace-version change; it deliberately does not run `cargo update` and therefore does not opt into unrelated dependency upgrades;
 - proves `scripts/verify-tag-version.sh vX.Y.Z`;
 - runs fmt, locked check, clippy, tests, the CLI ABI table and the end-to-end release gate;
-- pushes `release/vX.Y.Z` and opens a release-preparation PR.
+- packages exactly the gated `Cargo.toml`/`Cargo.lock` patch as an immutable workflow artifact;
+- gives write permission only to a fresh job that revalidates and applies that exact patch, pushes `release/vX.Y.Z`, and opens the release-preparation PR.
 
 The generated PR contains only the version/lockfile transition. Review and merge it normally.
 
@@ -56,10 +59,11 @@ The workflow refuses publication unless all of the following are true:
 - Rust 1.89 MSRV check/tests pass;
 - `cargo audit` and `cargo deny` pass against the committed lockfile;
 - all four release targets build;
+- no release gate, audit or artifact build restores a shared Cargo/target cache;
 - every natively runnable packaged binary reports the expected version;
-- the three native target packages pass `scripts/release-gate.sh`;
-- the assembled payload contains four tarballs and the expected gate/fsck evidence;
-- every payload file verifies against `SHA256SUMS`;
+- all four native target packages pass `scripts/release-gate.sh`;
+- the 36 non-manifest payload files exactly match the audited asset/evidence catalog, with no extra or non-regular entries;
+- `SHA256SUMS` covers that exact catalog and every payload file verifies against it;
 - provenance attestation succeeds;
 - the `release` GitHub Environment approves the publishing jobs.
 
@@ -87,7 +91,7 @@ The payload contains:
 
 - `forge-<version>-<target>.tar.gz` for all four supported targets;
 - one `BUILD-INFO` per target;
-- native release-gate evidence such as gate summary, full fsck, CLI ABI, seal attestation and environment line;
+- release-gate evidence for every target: gate summary, full fsck, CLI ABI, seal attestation, conflict object and environment lines;
 - `SHA256SUMS` covering every regular payload file except itself.
 
 Intermediate checksum sidecars are not published. `SHA256SUMS` is the single checksum manifest.
@@ -98,10 +102,10 @@ Intermediate checksum sidecars are not published. `SHA256SUMS` is the single che
 |---|---|---|
 | `x86_64-unknown-linux-gnu` | native Ubuntu | yes |
 | `aarch64-unknown-linux-gnu` | native Ubuntu arm64 | yes |
-| `x86_64-apple-darwin` | cross-build on macOS arm64 | no Rosetta assumption |
+| `x86_64-apple-darwin` | native macOS Intel | yes |
 | `aarch64-apple-darwin` | native macOS | yes |
 
-The x86_64 macOS binary is still architecture-checked during build and included in the attested checksum manifest. It is not executed because hosted arm64 macOS runners are not guaranteed to provide Rosetta.
+The workflow uses the fixed `macos-15-intel` and `macos-15` labels, so neither macOS artifact depends on cross-execution or Rosetta. Linux likewise uses fixed x86_64 and arm64 Ubuntu 24.04 runners.
 
 ## Repository settings that are part of the release contract
 
