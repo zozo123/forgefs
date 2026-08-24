@@ -44,8 +44,6 @@ impl Fixture {
     }
 
     pub fn session(&self, cap: &Cap, from: &str) -> String {
-        self.forge
-            .session_open(cap, from)
-            .expect("fixture session")
+        self.forge.session_open(cap, from).expect("fixture session")
     }
 }

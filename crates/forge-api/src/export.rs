@@ -2,7 +2,7 @@ use crate::Forge;
 use forge_cap::Cap;
 use forge_core::Tree;
 use forge_store::Store;
-use forge_types::{EntryKind, Error, ObjectId, Result};
+use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use std::fs::File;
 use std::path::Path;
 use tar::{Builder, Header};

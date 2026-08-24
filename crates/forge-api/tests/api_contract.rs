@@ -14,10 +14,22 @@ type ContractCase = (&'static str, fn());
 #[test]
 fn invariant_contract_matrix() {
     let cases: &[ContractCase] = &[
-        ("I5 protected refs fail closed", i5_protected_refs_fail_closed),
-        ("I8 sessions read their pinned base", i8_sessions_read_their_pinned_base),
-        ("I9 stale observations block checkin", i9_stale_observations_block_checkin),
-        ("I11 overlapping writes are loud", i11_overlapping_writes_are_loud),
+        (
+            "I5 protected refs fail closed",
+            i5_protected_refs_fail_closed,
+        ),
+        (
+            "I8 sessions read their pinned base",
+            i8_sessions_read_their_pinned_base,
+        ),
+        (
+            "I9 stale observations block checkin",
+            i9_stale_observations_block_checkin,
+        ),
+        (
+            "I11 overlapping writes are loud",
+            i11_overlapping_writes_are_loud,
+        ),
         (
             "I13/I14 roles and namespaces carry no ambient authority",
             i13_i14_roles_and_namespaces_have_no_ambient_authority,
@@ -26,7 +38,10 @@ fn invariant_contract_matrix() {
             "I15 sealed releases verify after a durable reopen",
             i15_sealed_releases_verify_after_reopen,
         ),
-        ("I17 future repository versions fail closed", i17_future_versions_fail_closed),
+        (
+            "I17 future repository versions fail closed",
+            i17_future_versions_fail_closed,
+        ),
     ];
 
     for (name, case) in cases {
@@ -134,12 +149,7 @@ fn i9_stale_observations_block_checkin() {
         .forge
         .write(&alice, &alice_v1, "/shared.txt", b"v1", false)
         .unwrap();
-    let alice_ref = updated_ref(
-        fixture
-            .forge
-            .checkin(&alice, &alice_v1, "/", "v1")
-            .unwrap(),
-    );
+    let alice_ref = updated_ref(fixture.forge.checkin(&alice, &alice_v1, "/", "v1").unwrap());
     fixture
         .forge
         .merge(&fixture.integrator, "main", &alice_ref, None)
@@ -159,12 +169,7 @@ fn i9_stale_observations_block_checkin() {
         .forge
         .write(&alice, &alice_v2, "/shared.txt", b"v2", false)
         .unwrap();
-    let alice_ref = updated_ref(
-        fixture
-            .forge
-            .checkin(&alice, &alice_v2, "/", "v2")
-            .unwrap(),
-    );
+    let alice_ref = updated_ref(fixture.forge.checkin(&alice, &alice_v2, "/", "v2").unwrap());
     fixture
         .forge
         .merge(&fixture.integrator, "main", &alice_ref, None)
@@ -234,10 +239,7 @@ fn i13_i14_roles_and_namespaces_have_no_ambient_authority() {
         matches!(namespace_error, Error::Denied(_)),
         "{namespace_error}"
     );
-    let role_error = fixture
-        .forge
-        .seal(&alice, "main", "forbidden")
-        .unwrap_err();
+    let role_error = fixture.forge.seal(&alice, "main", "forbidden").unwrap_err();
     assert!(matches!(role_error, Error::Denied(_)), "{role_error}");
 }
 
