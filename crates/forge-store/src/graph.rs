@@ -3,7 +3,7 @@
 use crate::Store;
 use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 pub const MAX_GRAPH_OBJECTS: usize = 1_000_000;
 const MAX_GRAPH_EDGES: usize = MAX_GRAPH_OBJECTS * 8;
@@ -198,7 +198,7 @@ impl Store {
             GraphExpectation::Exact(expected),
             format!("root:{root}"),
         )]);
-        let mut verified = BTreeMap::new();
+        let mut verified = HashMap::new();
         let mut edge_count = 0usize;
 
         while let Some((id, expectation, resource)) = queue.pop_front() {
@@ -232,9 +232,11 @@ impl Store {
             );
         }
 
-        Ok(verified
+        let mut objects = verified
             .into_iter()
             .map(|(id, object_type)| VerifiedGraphObject { id, object_type })
-            .collect())
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|object| object.id);
+        Ok(objects)
     }
 }
