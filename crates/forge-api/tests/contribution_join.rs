@@ -54,9 +54,8 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
     forge
         .write(&alice, &alice_ns, "/alice.txt", b"alice", false)
         .unwrap();
-    let (alice_ref, alice_commit) = updated(
-        forge.checkin(&alice, &alice_ns, "/", "alice").unwrap(),
-    );
+    let (alice_ref, alice_commit) =
+        updated(forge.checkin(&alice, &alice_ns, "/", "alice").unwrap());
 
     let bob_ns = forge.session_open(&bob, "main").unwrap();
     forge
@@ -81,12 +80,8 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
     );
     let expected = BTreeSet::from([alice_contribution, bob_contribution]);
 
-    forge
-        .branch(&root, "main", "joins/alice-bob")
-        .unwrap();
-    forge
-        .branch(&root, "main", "joins/bob-alice")
-        .unwrap();
+    forge.branch(&root, "main", "joins/alice-bob").unwrap();
+    forge.branch(&root, "main", "joins/bob-alice").unwrap();
 
     let (_, ab_first) = updated(
         forge
