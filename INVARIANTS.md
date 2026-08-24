@@ -52,7 +52,7 @@ not diluted into a mock:
 | I18 | `forge-api/workspace.rs`, `forge-store/meta.rs` | `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs` |
 | I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs` |
-| I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/meta.rs` | `api_contract.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `fsck_catalog.rs`, `cli_recovery_and_corruption.rs` |
+| I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/meta.rs` | `api_contract.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs` |
 | I16 | `forge-core/tree.rs`, `forge-api/export.rs` | `path_identity.rs`, `export_long_names.rs` |
 
 Tests are named after these IDs or state the invariant in a one-line rationale.

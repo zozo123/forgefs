@@ -6,8 +6,8 @@ mod metrics;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use meta::{
-    sanitize_agent, CatalogObjectExpectation, CheckpointResult, DurabilityPolicy, Meta, MetaStats,
-    MountRow, NsRow, OverlayRow, CURRENT_SCHEMA_VERSION,
+    sanitize_agent, CatalogAudit, CatalogObjectExpectation, CheckpointResult, DurabilityPolicy,
+    Meta, MetaStats, MountRow, NsRow, OverlayRow, CURRENT_SCHEMA_VERSION,
 };
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};

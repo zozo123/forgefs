@@ -2,7 +2,7 @@ use crate::Forge;
 use forge_cap::{Cap, Op};
 use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use forge_ns::{parse_spec, Spec};
-use forge_store::CatalogObjectExpectation;
+use forge_store::{CatalogAudit, CatalogObjectExpectation};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -65,9 +65,6 @@ impl FsckReport {
 }
 
 impl Forge {
-    /// Verify the repository from durable bytes. `full=false` verifies all
-    /// metadata roots and reachable objects; `full=true` additionally scans
-    /// every object file, including unreachable/orphan objects.
     /// Re-resolve a ref that was absent from fsck's `refs` snapshot.
     ///
     /// fsck reads refs, then namespaces, then each namespace's mounts, as
@@ -89,37 +86,19 @@ impl Forge {
         Some((row.oid, ty))
     }
 
-    pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
-        self.check(cap, Op::Read, None)?;
-        if !cap.has_unrestricted_ref_scope() {
-            return Err(Error::Denied(
-                "fsck requires unrestricted read authority".into(),
-            ));
-        }
-
-        // `refs` below is a point-in-time snapshot, read before namespaces and
-        // mounts. A checkin that loses a CAS atomically inserts a `forks/...`
-        // ref and repoints the losing session's mount at it, so a mount or live
-        // ref naming something absent from that snapshot may simply have been
-        // created mid-scan on a repository whose bytes are entirely intact.
-        // `late_ref` re-resolves those before they are reported as corruption.
-        let mut report = FsckReport::new(full);
-        let catalog = if full {
-            Some(self.store.meta.audit_catalog()?)
-        } else {
-            None
-        };
-        for path in crate::repository::init_staging_siblings(self.root())? {
-            report.finding(
-                "INIT_STAGING",
-                format!("path:{}", path.display()),
-                "orphaned repository-initialization staging path; rerun `forge init` to reclaim it",
-            );
-        }
+    fn collect_reachable_roots(
+        &self,
+        cap: &Cap,
+        report: &mut FsckReport,
+        roots: &mut Vec<(ObjectId, ObjectExpectation, String)>,
+    ) -> Result<()> {
+        // These production readers intentionally remain strict. Reachable fsck
+        // uses the normal compatible-schema open and may overlap writers, so
+        // `late_ref` handles the one valid cross-query transition: a newly
+        // created fork ref and the atomically retargeted mount/live ref.
         let refs = self.store.meta.list_refs()?;
         report.checked_refs = refs.len();
         let mut ref_types = HashMap::new();
-        let mut roots = Vec::new();
 
         for row in &refs {
             let expected = match object_type_for_kind(&row.kind) {
@@ -137,9 +116,6 @@ impl Forge {
             ));
 
             if let Some(tag) = row.name.strip_prefix("tags/") {
-                if full {
-                    continue;
-                }
                 if !row.protected || !row.sealed || row.kind != "snapshot" {
                     report.finding(
                         "TAG_FLAGS",
@@ -257,37 +233,116 @@ impl Forge {
                 ));
             }
         }
+        Ok(())
+    }
 
-        if let Some(catalog) = catalog {
-            for seal in &catalog.seals {
-                if let Err(error) = self.verify_seal_payload(
-                    &seal.tag,
-                    seal.snap_oid,
-                    seal.commit_oid,
-                    seal.tree_oid,
-                ) {
-                    report.finding(
-                        "SEAL_PAYLOAD",
-                        format!("catalog:seal:{}", seal.tag),
-                        error.to_string(),
-                    );
+    fn collect_full_catalog(
+        &self,
+        catalog: CatalogAudit,
+        report: &mut FsckReport,
+        roots: &mut Vec<(ObjectId, ObjectExpectation, String)>,
+    ) {
+        report.checked_refs = catalog.refs.len();
+        report.checked_namespaces = catalog.namespaces.len();
+
+        // `None` means the row exists but its kind is invalid. The catalog
+        // auditor already reports REF_KIND; do not turn a mount to that row
+        // into a second, false MOUNT_REF finding.
+        let mut ref_types = HashMap::new();
+        for row in &catalog.refs {
+            ref_types.insert(
+                row.name.clone(),
+                object_type_for_kind(&row.kind)
+                    .ok()
+                    .map(|expected| (row.oid, expected)),
+            );
+        }
+
+        for mount in &catalog.mounts {
+            let mount_resource = format!("namespace:{}:mount:{}", mount.ns_id, mount.path);
+            match parse_spec(&mount.spec) {
+                Ok(Spec::Ref(name)) => match ref_types.get(&name) {
+                    Some(Some((oid, expected))) => roots.push((
+                        *oid,
+                        ObjectExpectation::Exact(*expected),
+                        format!("{mount_resource}:ref:{name}"),
+                    )),
+                    Some(None) => {}
+                    None => report.finding(
+                        "MOUNT_REF",
+                        &mount_resource,
+                        format!("missing ref {name}"),
+                    ),
+                },
+                Ok(Spec::Oid(id)) => {
+                    if mount.mode == "rw" {
+                        report.finding(
+                            "MOUNT_RW_OID",
+                            &mount_resource,
+                            "read-write mount cannot target immutable raw OID",
+                        );
+                    }
+                    roots.push((id, ObjectExpectation::Any, format!("{mount_resource}:oid")));
                 }
-            }
-            for finding in catalog.findings {
-                report.finding(&finding.code, finding.resource, finding.detail);
-            }
-            for root in catalog.roots {
-                let expected = match root.expected {
-                    CatalogObjectExpectation::Any => ObjectExpectation::Any,
-                    CatalogObjectExpectation::Exact(expected) => ObjectExpectation::Exact(expected),
-                    CatalogObjectExpectation::TreeEntry => ObjectExpectation::TreeEntry,
-                };
-                roots.push((root.oid, expected, root.resource));
+                Err(error) => report.finding("MOUNT_SPEC", &mount_resource, error.to_string()),
             }
         }
 
+        for seal in &catalog.seals {
+            if let Err(error) = self.verify_seal_payload(
+                &seal.tag,
+                seal.snap_oid,
+                seal.commit_oid,
+                seal.tree_oid,
+            ) {
+                report.finding(
+                    "SEAL_PAYLOAD",
+                    format!("catalog:seal:{}", seal.tag),
+                    error.to_string(),
+                );
+            }
+        }
+        for finding in catalog.findings {
+            report.finding(&finding.code, finding.resource, finding.detail);
+        }
+        for root in catalog.roots {
+            let expected = match root.expected {
+                CatalogObjectExpectation::Any => ObjectExpectation::Any,
+                CatalogObjectExpectation::Exact(expected) => ObjectExpectation::Exact(expected),
+                CatalogObjectExpectation::TreeEntry => ObjectExpectation::TreeEntry,
+            };
+            roots.push((root.oid, expected, root.resource));
+        }
+    }
+
+    /// Verify the repository from durable bytes. `full=false` verifies all
+    /// metadata roots and reachable objects; `full=true` additionally proves
+    /// one defensive catalog snapshot and scans every object file, including
+    /// unreachable/orphan objects.
+    pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
+        self.check(cap, Op::Read, None)?;
+        if !cap.has_unrestricted_ref_scope() {
+            return Err(Error::Denied(
+                "fsck requires unrestricted read authority".into(),
+            ));
+        }
+
+        let mut report = FsckReport::new(full);
+        for path in crate::repository::init_staging_siblings(self.root())? {
+            report.finding(
+                "INIT_STAGING",
+                format!("path:{}", path.display()),
+                "orphaned repository-initialization staging path; rerun `forge init` to reclaim it",
+            );
+        }
+        let mut roots = Vec::new();
+
         if full {
+            let catalog = self.store.meta.audit_catalog()?;
+            self.collect_full_catalog(catalog, &mut report, &mut roots);
             scan_all_object_paths(&self.store.root(), &mut roots, &mut report)?;
+        } else {
+            self.collect_reachable_roots(cap, &mut report, &mut roots)?;
         }
 
         verify_graph(&self.store, roots, &mut report);
