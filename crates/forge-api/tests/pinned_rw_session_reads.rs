@@ -1,9 +1,10 @@
 //! I8: a session pinned to a base OID must read from that base, not from a
-//! live ref another agent can move. Test authored in #245; the fix in
-//! Forge::session_mount_tree is what makes it pass.
+//! live ref another agent can move. I18: a refused checkin must leave staged
+//! work readable, while a lost CAS must preserve it in a durable fork. The I8
+//! regression was authored in #245; Forge::session_mount_tree owns that fix.
 //!
 use forge_api::Forge;
-use forge_types::CasResult;
+use forge_types::{CasResult, Error};
 use tempfile::tempdir;
 
 #[test]
@@ -49,4 +50,26 @@ fn rw_mount_reads_pinned_base_then_lost_race_forks() {
     // wedged by an observation that can never match its pinned base.
     assert_eq!(f.read(&root, &a, "/a.txt").unwrap(), b"v0");
     assert_eq!(f.read(&root, &a, "/b.txt").unwrap(), b"mine");
+}
+
+#[test]
+fn refused_checkin_keeps_staged_work() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+
+    let session = f.session_open(&root, "main").unwrap();
+    f.mount(&root, &session, "/", "ref:main", true).unwrap();
+    f.write(&root, &session, "/kept.txt", b"still staged", false)
+        .unwrap();
+
+    let error = f
+        .checkin(&root, &session, "/", "protected ref must refuse")
+        .unwrap_err();
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert_eq!(
+        f.read(&root, &session, "/kept.txt").unwrap(),
+        b"still staged",
+        "a refused checkin discarded the overlay"
+    );
 }
