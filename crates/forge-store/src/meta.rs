@@ -137,8 +137,7 @@ const CAP_ROOT_COLUMNS: &[&str] = &["id", "hmac_key", "seal_pub"];
 const CAP_ROOT_VALUES: &str = "typeof(id)='integer' AND id=1 AND typeof(hmac_key)='blob' \
     AND length(hmac_key)=0 AND typeof(seal_pub)='blob'";
 const MIGRATION_COLUMNS: &[&str] = &["version", "applied_ms"];
-const MIGRATION_VALUES: &str =
-    "typeof(version)='integer' AND typeof(applied_ms)='integer'";
+const MIGRATION_VALUES: &str = "typeof(version)='integer' AND typeof(applied_ms)='integer'";
 
 #[derive(Clone, Debug)]
 pub struct MountRow {
@@ -801,9 +800,7 @@ fn audit_table_shape(
     }
     drop(stmt);
 
-    let sql = format!(
-        "SELECT rowid FROM \"{table}\" WHERE NOT ({valid_values}) ORDER BY rowid"
-    );
+    let sql = format!("SELECT rowid FROM \"{table}\" WHERE NOT ({valid_values}) ORDER BY rowid");
     let mut stmt = match tx.prepare(&sql) {
         Ok(stmt) => stmt,
         Err(error) => {
@@ -1048,11 +1045,7 @@ impl Meta {
                 let expected = match catalog_ref_type(&kind) {
                     Some(expected) => CatalogObjectExpectation::Exact(expected),
                     None => {
-                        audit.finding(
-                            "REF_KIND",
-                            &resource,
-                            format!("unknown ref kind {kind}"),
-                        );
+                        audit.finding("REF_KIND", &resource, format!("unknown ref kind {kind}"));
                         CatalogObjectExpectation::Any
                     }
                 };
@@ -1265,7 +1258,9 @@ impl Meta {
 
         if observations_clean {
             let mut stmt = tx
-                .prepare("SELECT ns_id, mount, path, oid FROM observations ORDER BY ns_id, mount, path")
+                .prepare(
+                    "SELECT ns_id, mount, path, oid FROM observations ORDER BY ns_id, mount, path",
+                )
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1305,7 +1300,9 @@ impl Meta {
 
         if overlay_clean {
             let mut stmt = tx
-                .prepare("SELECT ns_id, mount, path, blob_oid FROM overlay ORDER BY ns_id, mount, path")
+                .prepare(
+                    "SELECT ns_id, mount, path, blob_oid FROM overlay ORDER BY ns_id, mount, path",
+                )
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1401,7 +1398,10 @@ impl Meta {
                             format!("missing sealed ref {tag_ref}"),
                         ),
                         Some((oid, kind, protected, sealed))
-                            if *oid != snap_oid || kind != "snapshot" || !*protected || !*sealed =>
+                            if *oid != snap_oid
+                                || kind != "snapshot"
+                                || !*protected
+                                || !*sealed =>
                         {
                             audit.finding(
                                 "SEAL_TAG_REF",
