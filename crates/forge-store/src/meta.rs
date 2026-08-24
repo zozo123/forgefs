@@ -43,8 +43,11 @@ CREATE TABLE IF NOT EXISTS observations (
   ns_id TEXT NOT NULL,
   mount TEXT NOT NULL,
   path  TEXT NOT NULL,
-  oid   BLOB NOT NULL CHECK(length(oid)=32),
-  PRIMARY KEY (ns_id, mount, path)
+  kind  TEXT NOT NULL,
+  oid   BLOB,
+  PRIMARY KEY (ns_id, mount, path),
+  CHECK((kind='absent' AND oid IS NULL)
+        OR (kind IN ('blob','tree') AND length(oid)=32))
 );
 
 CREATE TABLE IF NOT EXISTS mounts (
@@ -98,7 +101,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 const REFS_COLUMNS: &[&str] = &["name", "oid", "kind", "protected", "sealed", "updated_ms"];
 const REFS_VALUES: &str = "typeof(name)='text' AND typeof(oid)='blob' \
@@ -114,9 +117,11 @@ const NAMESPACE_COLUMNS: &[&str] = &["id", "agent_id", "created_ms", "pinned_oid
 const NAMESPACE_VALUES: &str = "typeof(id)='text' AND typeof(agent_id)='text' \
     AND typeof(created_ms)='integer' AND typeof(pinned_oid) IN ('null','blob') \
     AND typeof(live_ref) IN ('null','text')";
-const OBSERVATION_COLUMNS: &[&str] = &["ns_id", "mount", "path", "oid"];
+const OBSERVATION_COLUMNS: &[&str] = &["ns_id", "mount", "path", "kind", "oid"];
 const OBSERVATION_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' \
-    AND typeof(path)='text' AND typeof(oid)='blob'";
+    AND typeof(path)='text' \
+    AND ((kind='absent' AND oid IS NULL) \
+         OR (kind IN ('blob','tree') AND typeof(oid)='blob'))";
 const MOUNT_COLUMNS: &[&str] = &["ns_id", "path", "spec", "mode"];
 const MOUNT_VALUES: &str = "typeof(ns_id)='text' AND typeof(path)='text' \
     AND typeof(spec)='text' AND typeof(mode)='text' AND mode IN ('ro','rw')";
@@ -179,11 +184,61 @@ pub struct NsRow {
     pub live_ref: Option<String>,
 }
 
+/// What a session actually saw at one path. I9 says reads record what was
+/// read; the two cases that used to record nothing -- a directory listing and a
+/// lookup that resolved to nothing -- are first-class variants here so that
+/// checkin can detect write skew against them.
+///
+/// `Tree` stores the canonical tree object id rather than a separate digest of
+/// the listing: a forge tree *is* the canonical encoding of exactly the
+/// (name, kind, oid, exec) tuples a directory read returns, so its id is a
+/// faithful, already-content-addressed digest of what the caller saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observed {
+    /// A file with this content id.
+    Blob(ObjectId),
+    /// A directory whose canonical tree object had this id.
+    Tree(ObjectId),
+    /// Nothing resolved at this path.
+    Absent,
+}
+
+impl Observed {
+    /// The stored discriminant. Unknown strings fail closed on read.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Observed::Blob(_) => "blob",
+            Observed::Tree(_) => "tree",
+            Observed::Absent => "absent",
+        }
+    }
+
+    /// The object this observation names, if it names one at all.
+    #[must_use]
+    pub fn oid(&self) -> Option<ObjectId> {
+        match self {
+            Observed::Blob(id) | Observed::Tree(id) => Some(*id),
+            Observed::Absent => None,
+        }
+    }
+
+    /// How the observation is rendered in a `StaleObservation` error.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Observed::Blob(id) => id.hex(),
+            Observed::Tree(id) => format!("tree {}", id.hex()),
+            Observed::Absent => "absent".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ObservationRow {
     pub mount: String,
     pub path: String,
-    pub oid: ObjectId,
+    pub seen: Observed,
 }
 
 /// One deterministic defect in the mutable SQLite catalog. The API layer maps
@@ -599,6 +654,26 @@ fn schema_version(conn: &Connection) -> Result<i64> {
     .map_err(map_sql)
 }
 
+/// Rebuilds `observations` with the v2 shape, carrying every existing row
+/// forward as the blob observation it was. Observations are session-scoped
+/// mutable catalog rows and name no immutable bytes, so this rewrites metadata
+/// only.
+const MIGRATE_1_TO_2: &str = "\
+CREATE TABLE observations_v2 (
+  ns_id TEXT NOT NULL,
+  mount TEXT NOT NULL,
+  path  TEXT NOT NULL,
+  kind  TEXT NOT NULL,
+  oid   BLOB,
+  PRIMARY KEY (ns_id, mount, path),
+  CHECK((kind='absent' AND oid IS NULL)
+        OR (kind IN ('blob','tree') AND length(oid)=32))
+);
+INSERT INTO observations_v2 (ns_id, mount, path, kind, oid)
+  SELECT ns_id, mount, path, 'blob', oid FROM observations;
+DROP TABLE observations;
+ALTER TABLE observations_v2 RENAME TO observations;";
+
 fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     if from > CURRENT_SCHEMA_VERSION {
         return Err(Error::Invalid(format!(
@@ -608,16 +683,28 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     if from == CURRENT_SCHEMA_VERSION {
         return Ok(());
     }
-    if from != 0 {
-        return Err(Error::Invalid(format!(
-            "unsupported metadata schema migration {from} -> {CURRENT_SCHEMA_VERSION}"
-        )));
-    }
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sql)?;
-    tx.execute_batch(SCHEMA).map_err(map_sql)?;
+    if from == 0 {
+        // A fresh catalog is created directly at the current shape, but the
+        // ledger still records every version so it stays contiguous and fsck
+        // can tell a fresh v2 catalog from a half-applied one.
+        tx.execute_batch(SCHEMA).map_err(map_sql)?;
+    } else {
+        for step in from..CURRENT_SCHEMA_VERSION {
+            match step {
+                1 => tx.execute_batch(MIGRATE_1_TO_2).map_err(map_sql)?,
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "unsupported metadata schema migration {step} -> {}",
+                        step + 1
+                    )))
+                }
+            }
+        }
+    }
     // `CREATE TABLE IF NOT EXISTS` is a no-op against a relation that already
     // exists with an older column list, so applying the current schema to a
     // pre-versioning catalog does not by itself prove the catalog reached it.
@@ -627,11 +714,14 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     // error instead of a migration diagnostic. Checking inside the transaction
     // rolls the whole attempt back, so nothing is repaired and nothing is lost.
     verify_migrated_shape(&tx, from)?;
-    tx.execute(
-        "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, ?2)",
-        params![CURRENT_SCHEMA_VERSION, now_ms() as i64],
-    )
-    .map_err(map_sql)?;
+    let applied = now_ms() as i64;
+    for version in (from + 1)..=CURRENT_SCHEMA_VERSION {
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, ?2)",
+            params![version, applied],
+        )
+        .map_err(map_sql)?;
+    }
     tx.commit().map_err(map_sql)
 }
 
@@ -1325,7 +1415,8 @@ impl Meta {
         if observations_clean {
             let mut stmt = tx
                 .prepare(
-                    "SELECT ns_id, mount, path, oid FROM observations ORDER BY ns_id, mount, path",
+                    "SELECT ns_id, mount, path, kind, oid FROM observations \
+                     ORDER BY ns_id, mount, path",
                 )
                 .map_err(map_sql)?;
             let rows = stmt
@@ -1334,12 +1425,13 @@ impl Meta {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 })
                 .map_err(map_sql)?;
             for row in rows {
-                let (ns_id, mount, path, oid) = row.map_err(map_sql)?;
+                let (ns_id, mount, path, kind, oid) = row.map_err(map_sql)?;
                 let resource = format!("catalog:observation:{ns_id}:{mount}:{path}");
                 if namespaces_clean && !namespace_ids.contains(&ns_id) {
                     audit.finding(
@@ -1354,12 +1446,21 @@ impl Meta {
                         "observation refers to a missing mount",
                     );
                 }
-                if let Some(oid) = audit.oid(oid, &resource, "oid") {
-                    audit.root(
-                        oid,
-                        CatalogObjectExpectation::Exact(ObjectType::Blob),
-                        format!("namespace:{ns_id}:observation:{mount}:{path}"),
-                    );
+                // An absent observation names no bytes, so it contributes no
+                // reachability root. A directory observation names a tree.
+                let expected = match kind.as_str() {
+                    "blob" => Some(ObjectType::Blob),
+                    "tree" => Some(ObjectType::Tree),
+                    _ => None,
+                };
+                if let (Some(expected), Some(oid)) = (expected, oid) {
+                    if let Some(oid) = audit.oid(oid, &resource, "oid") {
+                        audit.root(
+                            oid,
+                            CatalogObjectExpectation::Exact(expected),
+                            format!("namespace:{ns_id}:observation:{mount}:{path}"),
+                        );
+                    }
                 }
             }
         }
@@ -2608,11 +2709,18 @@ impl Meta {
         Ok(())
     }
 
-    pub fn observe(&self, ns_id: &str, mount: &str, path: &str, oid: ObjectId) -> Result<()> {
+    pub fn observe(&self, ns_id: &str, mount: &str, path: &str, seen: Observed) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO observations (ns_id, mount, path, oid) VALUES (?1,?2,?3,?4)",
-            params![ns_id, mount, path, oid.as_bytes().as_slice()],
+            "INSERT OR REPLACE INTO observations (ns_id, mount, path, kind, oid) \
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                ns_id,
+                mount,
+                path,
+                seen.kind(),
+                seen.oid().map(|id| id.as_bytes().to_vec())
+            ],
         )
         .map_err(map_sql)?;
         Ok(())
@@ -2621,25 +2729,34 @@ impl Meta {
     pub fn observations(&self, ns_id: &str) -> Result<Vec<ObservationRow>> {
         let conn = self.write.lock();
         let mut stmt = conn
-            .prepare("SELECT mount, path, oid FROM observations WHERE ns_id=?1")
+            .prepare("SELECT mount, path, kind, oid FROM observations WHERE ns_id=?1")
             .map_err(map_sql)?;
         let rows = stmt
             .query_map([ns_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             })
             .map_err(map_sql)?;
         let mut out = Vec::new();
         for row in rows {
-            let (mount, path, oid) = row.map_err(map_sql)?;
-            out.push(ObservationRow {
-                mount,
-                path,
-                oid: oid_from_blob(oid)?,
-            });
+            let (mount, path, kind, oid) = row.map_err(map_sql)?;
+            // Fail closed on an unknown discriminant rather than silently
+            // downgrading the observation to "nothing was read".
+            let seen = match (kind.as_str(), oid) {
+                ("blob", Some(oid)) => Observed::Blob(oid_from_blob(oid)?),
+                ("tree", Some(oid)) => Observed::Tree(oid_from_blob(oid)?),
+                ("absent", None) => Observed::Absent,
+                (other, _) => {
+                    return Err(Error::Invalid(format!(
+                        "observation {mount}:{path} has unusable kind {other}"
+                    )))
+                }
+            };
+            out.push(ObservationRow { mount, path, seen });
         }
         Ok(out)
     }

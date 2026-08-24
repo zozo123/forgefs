@@ -12,7 +12,7 @@ pub use graph::{
 };
 pub use meta::{
     sanitize_agent, validate_ref_kind, validate_ref_name, CatalogAudit, CatalogObjectExpectation,
-    CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow, OverlayRow,
+    CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow, Observed, OverlayRow,
     CURRENT_SCHEMA_VERSION,
 };
 

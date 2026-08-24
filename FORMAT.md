@@ -137,11 +137,12 @@ fields fail closed.
 migration may change SQLite state but may never rewrite immutable object files
 or change their hashes.
 
-The current metadata schema is version 1. The existing `0 -> 1` path creates
-the v1 schema and ledger atomically; it is bootstrap, not evidence that a real
-forward migration is safe. Before schema version 2 lands, fresh creation and
-upgrade must be separate paths, a checked-in historical SQLite fixture must be
-upgraded by ordered transactions with pre/post version checks, interruption
-must leave either the old or new schema complete, and future schema versions
-must remain a read-only fail-closed error. None of that alone requires changing
-the repository VERSION.
+The current metadata schema is version 2. Creation and upgrade are separate
+paths: `0 -> 2` creates the current schema and stamps the whole ledger
+atomically, while an existing catalog is stepped forward one version at a time
+in a single immediate transaction, so an interruption leaves either the old or
+the new schema complete. Version 2 widens `observations` so a recorded read can
+say it saw a directory or saw nothing, and carries every v1 row forward as the
+blob read it was. A version above `CURRENT_SCHEMA_VERSION` stays a fail-closed
+error, and a read-only open still refuses to migrate. None of this requires
+changing the repository VERSION: no immutable object file or ObjectId moves.

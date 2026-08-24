@@ -23,7 +23,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I6 | Ref + reflog (+ seal) commit together. |
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Reads through a session resolve against that base and its overlay, never a live ref another agent can move. Checkin CASes that oid, never a moving head. |
-| I9 | Reads record path→oid. Stale observations fail checkin even on disjoint writes. |
+| I9 | Every read records what it saw at a path: a blob id, a directory's tree id, or its absence. Silence is not a recorded read. Stale observations fail checkin even on disjoint writes. |
 | I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. Every current-version seal manifest includes each Contribution reachable from its commit and binds the entry to the receipt's immutable agent. |
 | I11 | Overlap is a Conflict object. |
 | I12 | Merge order comes only from the commit parent DAG and real merge-bases. `Commit.ts` and `Contribution.ts` are advisory metadata, never causal order. |

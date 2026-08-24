@@ -8,7 +8,7 @@ use forge_ns::{
     longest_mount, ls as ns_ls, normalize_abs, overlay_map, parse_spec, rel_of, resolve, Mode,
     Mount, Resolved, Spec,
 };
-use forge_store::{sanitize_agent, Store};
+use forge_store::{sanitize_agent, Observed, Store};
 use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, Result};
 use std::sync::atomic::Ordering;
 
@@ -116,6 +116,12 @@ impl Forge {
         let rel = rel_of(&m.path, path)?;
         let tree = self.session_mount_tree(&nsrow, m)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
+        // I9: a directory read is a read. Record what was listed before
+        // returning it, including the case where nothing is there, so that
+        // "this directory held exactly these entries" and "this path does not
+        // exist" are checkable at checkin instead of silently unrecorded.
+        let seen = observed_at(&self.store, &overlay_map(&ov), tree, &rel)?;
+        self.store.meta.observe(ns, &m.path, &rel, seen)?;
         let ents = ns_ls(&self.store, &ov, tree, &rel)?;
         Ok(ents
             .into_iter()
@@ -140,12 +146,14 @@ impl Forge {
         self.check_spec_read(cap, &m.spec)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
         let tree = self.session_mount_tree(&nsrow, m)?;
+        let rel = rel_of(&m.path, path)?;
+        // I9: record the outcome of the lookup before acting on it. A miss used
+        // to record nothing, which made "this path did not exist" invisible to
+        // checkin and let another agent create it under the reader.
+        let seen = observed_at(&self.store, &overlay_map(&ov), tree, &rel)?;
+        self.store.meta.observe(ns, &m.path, &rel, seen)?;
         match resolve(&self.store, &mounts, &ov, tree, path)? {
-            Resolved::Blob { id, .. } => {
-                let rel = rel_of(&m.path, path)?;
-                self.store.meta.observe(ns, &m.path, &rel, id)?;
-                self.store.get_blob_data(id)
-            }
+            Resolved::Blob { id, .. } => self.store.get_blob_data(id),
             Resolved::Tree(_) => Err(Error::Invalid("read of directory".into())),
         }
     }
@@ -239,11 +247,19 @@ impl Forge {
                 oid: row.oid,
             });
         }
+        // The frozen VERSION 1 Contribution receipt names blob reads only, and
+        // the typed graph enforces that every read edge is a blob. Directory
+        // and absent observations therefore stay in the mutable catalog, where
+        // `check_observations` above already enforced them; widening the
+        // receipt would be an object-format change with its own gate.
         let mut reads = observations
             .into_iter()
-            .map(|obs| ContributionRead {
-                path: contribution_path(&obs.mount, &obs.path),
-                id: obs.oid,
+            .filter_map(|obs| match obs.seen {
+                Observed::Blob(id) => Some(ContributionRead {
+                    path: contribution_path(&obs.mount, &obs.path),
+                    id,
+                }),
+                Observed::Tree(_) | Observed::Absent => None,
             })
             .collect::<Vec<_>>();
         reads.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
@@ -313,7 +329,7 @@ impl Forge {
     ) -> Result<()> {
         let pin_tree = self.store.get_commit(pin)?.tree;
         for obs in self.store.meta.observations(ns)? {
-            if obs.mount == checkin_mount && ov.contains_key(&obs.path) {
+            if obs.mount == checkin_mount && overlay_shadows(ov, &obs.path) {
                 continue;
             }
             let tree = if obs.mount == checkin_mount {
@@ -323,13 +339,13 @@ impl Forge {
             } else {
                 continue;
             };
-            let now = blob_at(&self.store, tree, &obs.path)?;
-            if now != Some(obs.oid) {
+            let now = current_at(&self.store, tree, &obs.path)?;
+            if now != obs.seen {
                 self.stats.stale_observation.fetch_add(1, Ordering::Relaxed);
                 return Err(Error::StaleObservation {
                     path: format!("{}:/{}", obs.mount, obs.path),
-                    expected: obs.oid.hex(),
-                    found: now.map(|id| id.hex()).unwrap_or_else(|| "missing".into()),
+                    expected: obs.seen.describe(),
+                    found: now.describe(),
                 });
             }
         }
@@ -348,10 +364,25 @@ fn contribution_path(mount: &str, rel: &str) -> String {
     }
 }
 
-fn blob_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<ObjectId>> {
-    if rel.is_empty() {
-        return Ok(None);
+/// True when the session's own staged overlay decides `rel`, either directly or
+/// through an ancestor it replaced or deleted. Such a path is the session's own
+/// write, validated against its pin by `apply_overlay`, not a foreign read.
+fn overlay_shadows(ov: &forge_core::Overlay, rel: &str) -> bool {
+    if ov.contains_key(rel) {
+        return true;
     }
+    let mut prefix = rel;
+    while let Some(cut) = prefix.rfind('/') {
+        prefix = &prefix[..cut];
+        if ov.contains_key(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The entry `rel` names inside `tree`, or `None` when nothing is there.
+fn entry_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<(EntryKind, ObjectId)>> {
     let parts = split_path(rel)?;
     let mut cur = tree;
     for (i, part) in parts.iter().enumerate() {
@@ -360,11 +391,7 @@ fn blob_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<ObjectId>>
             return Ok(None);
         };
         if i + 1 == parts.len() {
-            return Ok(if ent.kind == EntryKind::Blob {
-                Some(ent.id)
-            } else {
-                None
-            });
+            return Ok(Some((ent.kind, ent.id)));
         }
         if ent.kind != EntryKind::Tree {
             return Ok(None);
@@ -372,4 +399,37 @@ fn blob_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<ObjectId>>
         cur = ent.id;
     }
     Ok(None)
+}
+
+/// What `tree` holds at `rel` right now, in the same three-way vocabulary an
+/// observation is recorded in. This is the checkin-side mirror of
+/// `observed_at`; both must classify a path identically or every read would
+/// look stale.
+fn current_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Observed> {
+    if rel.is_empty() {
+        return Ok(Observed::Tree(tree));
+    }
+    Ok(match entry_at(store, tree, rel)? {
+        Some((EntryKind::Blob, id)) => Observed::Blob(id),
+        Some((EntryKind::Tree, id)) => Observed::Tree(id),
+        None => Observed::Absent,
+    })
+}
+
+/// What a session read at `rel` through one mount, with its own overlay applied.
+fn observed_at(
+    store: &Store,
+    ov: &forge_core::Overlay,
+    tree: ObjectId,
+    rel: &str,
+) -> Result<Observed> {
+    if !rel.is_empty() && overlay_shadows(ov, rel) {
+        return Ok(match ov.get(rel) {
+            Some(Some((id, _))) => Observed::Blob(*id),
+            // A tombstone, or an ancestor the session replaced with a file or
+            // deleted outright: nothing resolves here.
+            Some(None) | None => Observed::Absent,
+        });
+    }
+    current_at(store, tree, rel)
 }
