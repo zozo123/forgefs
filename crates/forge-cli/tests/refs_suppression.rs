@@ -1,3 +1,4 @@
+// Ref filtering preserves confidentiality, but the fact that filtering happened is public.
 use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::tempdir;
