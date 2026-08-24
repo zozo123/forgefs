@@ -1,3 +1,4 @@
+// Regression coverage for #273: one staged overlay must map to one representable tree.
 use forge_api::Forge;
 use forge_types::Error;
 use tempfile::tempdir;
