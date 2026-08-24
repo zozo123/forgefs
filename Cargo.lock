@@ -393,6 +393,7 @@ dependencies = [
  "forge-api",
  "forge-cap",
  "forge-types",
+ "libc",
  "serde_json",
  "tempfile",
 ]

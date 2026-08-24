@@ -26,7 +26,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Init {
-        dir: Option<PathBuf>,
+        /// Where to create the forge. Not named `dir` for the same reason as
+        /// `import`: it would collide with the global `--dir` arg id.
+        path: Option<PathBuf>,
     },
     Serve {
         #[arg(long)]
@@ -70,7 +72,11 @@ enum Cmd {
         message: String,
     },
     Import {
-        dir: PathBuf,
+        /// Directory to import. Deliberately NOT named `dir`: the global
+        /// `--dir` (env FORGE_DIR) owns that clap arg id, and a subcommand
+        /// field of the same name silently overwrites it, so the repository
+        /// would be chosen by this path instead of by --dir.
+        source: PathBuf,
         #[arg(long)]
         r#ref: String,
     },
@@ -94,6 +100,10 @@ enum Cmd {
         r#ref: Option<String>,
         #[arg(long)]
         agent: Option<String>,
+    },
+    Inbox {
+        #[command(subcommand)]
+        cmd: InboxCmd,
     },
     Landmark {
         oid: String,
@@ -131,6 +141,10 @@ enum Cmd {
     },
     /// Timed concurrent checkin / shared-ref stampede / merge+seal+verify.
     Bench {
+        /// New, dedicated benchmark workspace to preserve after the run.
+        /// Must not already exist. Omit to use an owned temporary directory.
+        #[arg(long)]
+        scratch: Option<PathBuf>,
         #[arg(long, default_value_t = 32)]
         agents: usize,
         #[arg(long, default_value_t = 16)]
@@ -149,8 +163,39 @@ enum SessionCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum InboxCmd {
+    /// Publish a sealed snapshot to a recipient-owned inbox ref.
+    Push {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// List inbox refs owned by the calling capability's agent.
+    List,
+}
+
 fn main() -> ExitCode {
-    match run() {
+    restore_default_sigpipe();
+
+    // clap exits the process itself on a usage error, with its own default code
+    // 2 -- which CLI_ABI.md reserves for "corruption or sealed-state violation".
+    // Parse explicitly so a typo is reported as the input error it is, and only
+    // an explicit --help/--version succeeds.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+                _ => 1,
+            };
+            let _ = error.print();
+            return ExitCode::from(code);
+        }
+    };
+
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("forge: {e}");
@@ -174,19 +219,50 @@ fn error_exit_code(error: &Error) -> u8 {
     }
 }
 
-fn run() -> forge_types::Result<()> {
-    let cli = Cli::parse();
+/// Rust sets SIGPIPE to SIG_IGN, so a closed reader (`forge ... | head`) makes
+/// the next `eprintln!` fail and panic, exiting 101 -- a code that appears
+/// nowhere in CLI_ABI.md. Restore the default so the shell contract holds.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+fn run(cli: Cli) -> forge_types::Result<()> {
     match cli.cmd {
         Cmd::Bench {
+            scratch,
             agents,
             shared,
             workers,
         } => {
-            let dir = cli.dir.clone().unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("forge-bench-{}", std::process::id()))
-            });
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir)?;
+            if cli.dir.is_some() {
+                return Err(Error::Invalid(
+                    "bench does not accept --dir/FORGE_DIR; use --scratch <new-path> or omit it"
+                        .into(),
+                ));
+            }
+            let (_scratch_guard, dir) = match scratch {
+                Some(dir) => {
+                    match std::fs::symlink_metadata(&dir) {
+                        Ok(_) => {
+                            return Err(Error::Invalid(format!(
+                                "benchmark scratch path already exists: {}",
+                                dir.display()
+                            )))
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    (None, dir)
+                }
+                None => {
+                    let guard = tempfile::Builder::new().prefix("forge-bench-").tempdir()?;
+                    let dir = guard.path().to_path_buf();
+                    (Some(guard), dir)
+                }
+            };
             eprintln!(
                 "forge bench dir={} agents={agents} shared={shared} workers={workers}",
                 dir.display()
@@ -195,8 +271,8 @@ fn run() -> forge_types::Result<()> {
             print!("{}", report.render());
             Ok(())
         }
-        Cmd::Init { dir } => {
-            let dir = dir
+        Cmd::Init { path } => {
+            let dir = path
                 .or(cli.dir.clone())
                 .unwrap_or_else(|| PathBuf::from("."));
             let f = Forge::init(&dir)?;
@@ -218,15 +294,28 @@ fn run() -> forge_types::Result<()> {
     }
 }
 
+/// `fsck` and `verify` are documented as read-only, so they take the read-only
+/// open path unconditionally -- not only when the media happens to be
+/// read-only. That makes the documented guarantee structural (SQLite itself
+/// refuses writes on the connection) instead of something a reviewer has to
+/// re-derive, and it is the only open that works on read-only media. Every
+/// other command opens for writing exactly as before.
 fn open(cli: &Cli) -> forge_types::Result<Forge> {
     let dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    if matches!(cli.cmd, Cmd::Fsck { .. } | Cmd::Verify { .. }) {
+        return Forge::open_read_only(&dir);
+    }
     Forge::open(&dir)
 }
 
 fn load_cap(f: &Forge, cli: &Cli) -> forge_types::Result<Cap> {
     if let Some(c) = &cli.cap {
         let tok = if Path::new(c).is_file() {
-            std::fs::read_to_string(c)?
+            // Not read_to_string: its InvalidData becomes Error::Io -> exit 5,
+            // while forge-cap maps the same failure to Error::Cap -> exit 1.
+            let bytes = std::fs::read(c)?;
+            String::from_utf8(bytes)
+                .map_err(|_| Error::Cap(format!("capability file {c} is not valid UTF-8")))?
         } else {
             c.clone()
         };
@@ -266,6 +355,12 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             text,
         } => {
             let data = if let Some(p) = file {
+                if !p.is_file() {
+                    return Err(Error::Invalid(format!(
+                        "--file {} is not a readable file",
+                        p.display()
+                    )));
+                }
                 std::fs::read(p)?
             } else if let Some(t) = text {
                 t.into_bytes()
@@ -285,9 +380,23 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
             CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
         },
-        Cmd::Import { dir, r#ref } => {
-            let id = f.import_dir(cap, &dir, &r#ref)?;
-            println!("imported {id} -> {ref_name}", ref_name = r#ref);
+        Cmd::Import { source, r#ref } => {
+            if !source.is_dir() {
+                return Err(Error::Invalid(format!(
+                    "import source {} is not a directory",
+                    source.display()
+                )));
+            }
+            match f.import_dir(cap, &source, &r#ref)? {
+                CasResult::Updated { name, oid } => println!("imported {oid} -> {name}"),
+                CasResult::Forked {
+                    requested,
+                    fork,
+                    ours,
+                    theirs,
+                } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
+                CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
+            }
         }
         Cmd::Branch { from, name } => {
             let id = f.branch(cap, &from, &name)?;
@@ -321,6 +430,25 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             let c = f.grant(cap, extra)?;
             println!("{}", c.to_token());
         }
+        Cmd::Inbox {
+            cmd: InboxCmd::Push { to, snapshot },
+        } => match f.inbox_push(cap, &to, &snapshot)? {
+            CasResult::Updated { name, oid } => println!("pushed {name} {oid}"),
+            CasResult::Forked {
+                requested,
+                fork,
+                ours,
+                theirs,
+            } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
+            CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
+        },
+        Cmd::Inbox {
+            cmd: InboxCmd::List,
+        } => {
+            for row in f.inbox_list(cap)? {
+                println!("{} {}", row.name, row.oid);
+            }
+        }
         Cmd::Landmark { oid } => {
             f.landmark(cap, ObjectId::from_hex(&oid)?)?;
             println!("landmark {oid}");
@@ -342,13 +470,17 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             println!("ok {oid}");
         }
         Cmd::Refs => {
-            for r in f.refs(cap)? {
+            let (refs, suppressed) = f.refs_with_suppressed(cap)?;
+            for r in refs {
                 let flags = format!(
                     "{}{}",
                     if r.protected { "P" } else { "-" },
                     if r.sealed { "S" } else { "-" }
                 );
                 println!("{flags} {:<32} {} {}", r.kind, r.name, r.oid);
+            }
+            if suppressed > 0 {
+                eprintln!("{suppressed} ref(s) suppressed by authority");
             }
         }
         Cmd::Log { r#ref } => {

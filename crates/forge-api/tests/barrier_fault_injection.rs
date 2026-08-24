@@ -5,8 +5,8 @@
 
 use forge_api::Forge;
 use forge_core::{hash_bytes, Blob, Tree, TreeEntry};
-use forge_store::{barrier_fault, DurabilityBarrier, Meta};
-use forge_types::{EntryKind, RefRow};
+use forge_store::{barrier_fault, sanitize_agent, DurabilityBarrier, Meta};
+use forge_types::{CasResult, EntryKind, RefRow};
 use std::collections::HashSet;
 use std::path::Path;
 use tempfile::tempdir;
@@ -78,6 +78,38 @@ fn failed_object_barrier_never_acknowledges_a_ref() {
         let result = forge.checkin(&root, &ns, "/", "must fail before CAS");
         assert!(fault.fired(), "barrier was not reached: {point:?}");
         assert!(result.is_err(), "injected {point:?} was acknowledged");
+        assert_eq!(refs(&forge), before, "{point:?} advanced a durable ref");
+        drop(fault);
+
+        drop(forge);
+        assert_reopens_clean(dir.path(), &before);
+    }
+}
+
+#[test]
+fn interrupted_completed_object_transitions_never_acknowledge_a_ref() {
+    // These failpoints run after the named operation succeeds, modeling loss
+    // of control between durable state transitions rather than an I/O error
+    // returned by the transition itself.
+    for point in [
+        DurabilityBarrier::ObjectFileAfter,
+        DurabilityBarrier::ObjectLinkAfter,
+        DurabilityBarrier::ObjectPublicationDirectoryAfter,
+    ] {
+        let dir = tempdir().unwrap();
+        let forge = Forge::init(dir.path()).unwrap();
+        let root = forge.root_cap().unwrap();
+        let ns = forge.session_open(&root, "main").unwrap();
+        let payload = payload_whose_tree_needs_a_new_shard(&forge);
+        forge
+            .write(&root, &ns, "/barrier.txt", &payload, false)
+            .unwrap();
+        let before = refs(&forge);
+
+        let fault = barrier_fault::fail_at(point, 1);
+        let result = forge.checkin(&root, &ns, "/", "interrupt after transition");
+        assert!(fault.fired(), "transition was not reached: {point:?}");
+        assert!(result.is_err(), "interrupted {point:?} was acknowledged");
         assert_eq!(refs(&forge), before, "{point:?} advanced a durable ref");
         drop(fault);
 
@@ -171,6 +203,29 @@ fn failed_init_parent_barrier_is_retryable() {
 }
 
 #[test]
+fn failed_staging_cleanup_barrier_is_retryable() {
+    let dir = tempdir().unwrap();
+    let stale = dir
+        .path()
+        .join(format!(".forge.init-999-{}", ulid::Ulid::new()));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("debris"), b"incomplete init").unwrap();
+
+    let fault = barrier_fault::fail_at(DurabilityBarrier::InitCleanupDirectory, 1);
+    let result = Forge::init(dir.path());
+    assert!(fault.fired());
+    assert!(result.is_err());
+    assert!(!dir.path().join(".forge").exists());
+    assert!(!stale.exists(), "cleanup failure left reclaimed debris visible");
+    drop(fault);
+
+    let initialized = Forge::init(dir.path()).unwrap();
+    let expected = refs(&initialized);
+    drop(initialized);
+    assert_reopens_clean(dir.path(), &expected);
+}
+
+#[test]
 fn failed_init_publication_barrier_exposes_only_a_complete_repository() {
     let dir = tempdir().unwrap();
     let fault = barrier_fault::fail_at(DurabilityBarrier::InitPublicationDirectory, 1);
@@ -195,6 +250,58 @@ fn failed_init_publication_barrier_exposes_only_a_complete_repository() {
     assert!(report.ok, "{:#?}", report.findings);
     drop(reopened);
     assert_reopens_clean(dir.path(), &expected);
+}
+
+#[test]
+fn failed_cold_open_publication_join_never_exposes_a_handle() {
+    let dir = tempdir().unwrap();
+    let initialized = Forge::init(dir.path()).unwrap();
+    let expected = refs(&initialized);
+    drop(initialized);
+
+    let fault = barrier_fault::fail_at(DurabilityBarrier::OpenPublicationDirectory, 1);
+    let result = Forge::open(dir.path());
+    assert!(fault.fired());
+    assert!(result.is_err(), "failed open barrier returned a live handle");
+    drop(fault);
+
+    assert_reopens_clean(dir.path(), &expected);
+}
+
+#[test]
+fn interrupted_post_commit_acknowledgement_is_durable_and_retryable() {
+    let dir = tempdir().unwrap();
+    let forge = Forge::init(dir.path()).unwrap();
+    let root = forge.root_cap().unwrap();
+    let ns = forge.session_open(&root, "main").unwrap();
+    let live = format!("heads/agents/{}/{}", sanitize_agent(root.agent_id()), ns);
+    forge
+        .write(&root, &ns, "/committed.txt", b"durable outcome", false)
+        .unwrap();
+    let before = refs(&forge);
+    let before_live = before.iter().find(|row| row.name == live).unwrap().oid;
+
+    let fault = barrier_fault::fail_at(DurabilityBarrier::MetadataRefCommitAfter, 1);
+    let result = forge.checkin(&root, &ns, "/", "commit then lose acknowledgement");
+    assert!(fault.fired());
+    assert!(result.is_err(), "post-commit interruption was acknowledged");
+    let after = refs(&forge);
+    let after_live = after.iter().find(|row| row.name == live).unwrap().oid;
+    assert_ne!(after_live, before_live, "SQL commit did not become visible");
+    drop(fault);
+
+    let retry = forge.checkin(&root, &ns, "/", "recover outcome").unwrap();
+    assert_eq!(
+        retry,
+        CasResult::Noop {
+            name: live,
+            oid: after_live,
+        },
+        "retry must recover the already committed outcome without republishing"
+    );
+    drop(forge);
+
+    assert_reopens_clean(dir.path(), &after);
 }
 
 #[test]

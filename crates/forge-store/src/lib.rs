@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod meta;
+mod metrics;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use meta::{
@@ -27,16 +28,21 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurabilityBarrier {
     ObjectFile,
+    ObjectFileAfter,
     ObjectExistingFile,
+    ObjectLinkAfter,
     ObjectPathDirectory,
     ObjectPublicationDirectory,
+    ObjectPublicationDirectoryAfter,
     ObjectTemporaryDirectory,
     InitFile,
     InitKeyDirectory,
+    InitCleanupDirectory,
     InitStagingDirectory,
     InitPublicationDirectory,
     InitParentDirectory,
     OpenPublicationDirectory,
+    MetadataRefCommitAfter,
     MetadataCheckpointBefore,
     MetadataCheckpointAfter,
     OtherFile,
@@ -241,6 +247,24 @@ impl Store {
             trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
             blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
         })
+    }
+
+    /// Open both halves of the store without writing to either. Object and
+    /// metadata writes are then refused at their own boundaries, so a
+    /// read-only handle cannot touch read-only media.
+    pub fn open_read_only(root: &Path) -> Result<Self> {
+        let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
+        let meta = Meta::open_read_only(&root.join("meta.sqlite"))?;
+        Ok(Self {
+            blobs,
+            meta,
+            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
+            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        })
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.meta.read_only()
     }
 
     pub fn put_raw(&self, bytes: &[u8]) -> Result<ObjectId> {
