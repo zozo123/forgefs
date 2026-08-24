@@ -19,9 +19,7 @@ fn contribution_set(store: &Store, commit: ObjectId) -> BTreeSet<ObjectId> {
         .reachable_graph_verified(commit, ObjectType::Commit)
         .unwrap()
         .into_iter()
-        .filter_map(|object| {
-            (object.object_type == ObjectType::Contribution).then_some(object.id)
-        })
+        .filter_map(|object| (object.object_type == ObjectType::Contribution).then_some(object.id))
         .collect()
 }
 
@@ -48,12 +46,7 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
         .forge
         .write(&bob, &bob_ns, "/bob.txt", b"bob", false)
         .unwrap();
-    let (bob_ref, bob_commit) = updated(
-        fixture
-            .forge
-            .checkin(&bob, &bob_ns, "/", "bob")
-            .unwrap(),
-    );
+    let (bob_ref, bob_commit) = updated(fixture.forge.checkin(&bob, &bob_ns, "/", "bob").unwrap());
 
     let store = Store::open(&fixture.path().join(".forge")).unwrap();
     let alice_contribution = store.get_commit(alice_commit).unwrap().contrib.unwrap();
