@@ -136,4 +136,5 @@ fn staging_prefix_lookalikes_are_never_claimed_or_deleted() {
             .arg("--full"),
     );
     assert!(!checked.contains("INIT_STAGING"), "{checked}");
+    assert_eq!(fs::read(lookalike.join("keep")).unwrap(), b"user-data");
 }
