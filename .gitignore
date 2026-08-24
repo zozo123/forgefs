@@ -9,3 +9,8 @@ demo/
 *.sqlite-shm
 .forge/
 /tmp-forge*
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock

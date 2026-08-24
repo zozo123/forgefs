@@ -669,7 +669,10 @@ fn ref_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
     Ok(found != 0)
 }
 
-fn validate_ref_name(name: &str) -> Result<()> {
+/// The ref-name grammar. Ref names are the one mutable surface a peer can
+/// address by name, so the grammar is a trust boundary and is public in
+/// order to be fuzzed directly rather than only through a whole repository.
+pub fn validate_ref_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 512 || name.starts_with('/') || name.ends_with('/') {
         return Err(Error::Invalid(format!("invalid ref name {name:?}")));
     }
@@ -688,7 +691,8 @@ fn validate_ref_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
+/// The ref-name grammar plus the object type each ref namespace mandates.
+pub fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
     validate_ref_name(name)?;
     if let Some(rest) = name.strip_prefix("inbox/") {
         let mut parts = rest.split('/');
