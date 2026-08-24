@@ -178,6 +178,33 @@ pub fn shared_stampede_bounded(
     ))
 }
 
+/// The benchmark is also an executable concurrency contract: performance is
+/// informational, but outcome counts are correctness. CI already runs this
+/// path, so reject any silent noop/lost writer instead of merely printing a bad
+/// split that a human might miss in logs.
+fn validate_bounded_outcomes(
+    agents: usize,
+    private_updated: usize,
+    shared: usize,
+    shared_updated: usize,
+    shared_forked: usize,
+) -> Result<()> {
+    if private_updated != agents {
+        return Err(Error::Internal(format!(
+            "private benchmark violated the all-updated contract: agents={agents} updated={private_updated}"
+        )));
+    }
+
+    let expected_updated = if shared == 0 { 0 } else { 1 };
+    let expected_forked = shared.saturating_sub(1);
+    if shared_updated != expected_updated || shared_forked != expected_forked {
+        return Err(Error::Internal(format!(
+            "shared stampede violated I5/I8 split: shared={shared} updated={shared_updated} forked={shared_forked}; expected updated={expected_updated} forked={expected_forked}"
+        )));
+    }
+    Ok(())
+}
+
 /// CLI benchmark runner with logical-agent count separated from OS worker count.
 pub fn run_bench_with_workers(
     dir: &std::path::Path,
@@ -191,6 +218,7 @@ pub fn run_bench_with_workers(
     let serial = serial_checkins(&forge, &root, 8.min(agents))?;
     let private = private_checkins_bounded(forge.clone(), &root, agents, workers)?;
     let shared_result = shared_stampede_bounded(forge.clone(), &root, shared, workers)?;
+    validate_bounded_outcomes(agents, private.2, shared, shared_result.2, shared_result.3)?;
     let merge_seal = merge_all_and_seal(&forge, &root, &integ, "bench")?;
     let t0 = Instant::now();
     forge.verify_tag(&root, "bench")?;
@@ -214,4 +242,28 @@ pub fn run_bench_with_workers(
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_outcome_gate_accepts_the_exact_concurrency_contract() {
+        validate_bounded_outcomes(32, 32, 16, 1, 15).unwrap();
+        validate_bounded_outcomes(0, 0, 0, 0, 0).unwrap();
+        validate_bounded_outcomes(1, 1, 1, 1, 0).unwrap();
+    }
+
+    #[test]
+    fn bounded_outcome_gate_rejects_lost_private_or_shared_writers() {
+        for result in [
+            validate_bounded_outcomes(32, 31, 16, 1, 15),
+            validate_bounded_outcomes(32, 32, 16, 0, 15),
+            validate_bounded_outcomes(32, 32, 16, 1, 14),
+            validate_bounded_outcomes(32, 32, 16, 2, 14),
+        ] {
+            assert!(matches!(result, Err(Error::Internal(_))));
+        }
+    }
 }
