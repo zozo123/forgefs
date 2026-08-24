@@ -92,6 +92,7 @@ state. Put implementation in the invariant-aligned module:
 | `fsck.rs` | Durable typed-graph verification; never repair |
 | `serve.rs` | Bounded daemon admission and protocol dispatch |
 | `bench.rs` / `soak.rs` | Evidence, never correctness policy |
+| `stats.rs` | Machine-readable process-lifetime counter document; evidence only |
 
 Avoid sibling-module reach-through. Shared helpers should have one semantic
 owner and the narrowest crate visibility required.

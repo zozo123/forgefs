@@ -254,6 +254,9 @@ pub struct MetaStats {
     pub cas_updated: u64,
     pub cas_forked: u64,
     pub cas_denied: u64,
+    /// Checkins whose overlay reproduced the pinned tree on an unmoved ref, so
+    /// no commit was published and no ref CAS was attempted.
+    pub cas_noop: u64,
 }
 
 impl MetaStats {
@@ -295,6 +298,7 @@ struct MetaCounters {
     cas_updated: AtomicU64,
     cas_forked: AtomicU64,
     cas_denied: AtomicU64,
+    cas_noop: AtomicU64,
 }
 
 struct TxnTimer<'a> {
@@ -869,6 +873,7 @@ impl Meta {
             cas_updated: self.stats.cas_updated.load(Ordering::Relaxed),
             cas_forked: self.stats.cas_forked.load(Ordering::Relaxed),
             cas_denied: self.stats.cas_denied.load(Ordering::Relaxed),
+            cas_noop: self.stats.cas_noop.load(Ordering::Relaxed),
         }
     }
 
@@ -2375,6 +2380,11 @@ impl Meta {
             .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
         txn_timer.finish();
+        // The only path that completes a checkin without publishing a commit,
+        // so it is the only place a no-op outcome can be counted. It is
+        // deliberately not folded into `cas_updated`/`cas_forked`: no ref CAS
+        // was attempted here.
+        self.stats.cas_noop.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

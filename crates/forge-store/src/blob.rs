@@ -23,6 +23,10 @@ const DURABLE_OID_CACHE_CAPACITY: usize = 65_536;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlobStoreStats {
     pub puts: u64,
+    /// Publications satisfied by an object that was already present. These
+    /// perform no new file barrier, so they are excluded from `puts` and from
+    /// every `fsync_*` total.
+    pub dedup_hits: u64,
     /// Successful file durability barriers.
     pub fsync_file: u64,
     /// Cumulative elapsed time for successful file durability barriers.
@@ -44,6 +48,7 @@ impl BlobStoreStats {
 #[derive(Debug, Default)]
 struct BlobStoreCounters {
     puts: AtomicU64,
+    dedup_hits: AtomicU64,
     fsync_file: TimingCounter,
     fsync_dir: TimingCounter,
 }
@@ -72,6 +77,7 @@ pub struct PublishBatch<'a> {
     dirs: BTreeSet<PathBuf>,
     oids: BTreeSet<ObjectId>,
     new_puts: u64,
+    new_dedup: u64,
 }
 
 impl LocalBlobStore {
@@ -140,6 +146,7 @@ impl LocalBlobStore {
             dirs: BTreeSet::new(),
             oids: BTreeSet::new(),
             new_puts: 0,
+            new_dedup: 0,
         }
     }
 
@@ -205,6 +212,7 @@ impl LocalBlobStore {
         let fsync_dir = self.stats.fsync_dir.snapshot();
         BlobStoreStats {
             puts: self.stats.puts.load(Ordering::Relaxed),
+            dedup_hits: self.stats.dedup_hits.load(Ordering::Relaxed),
             fsync_file: fsync_file.count,
             fsync_file_us: fsync_file.total_us,
             fsync_dir: fsync_dir.count,
@@ -250,6 +258,7 @@ impl PublishBatch<'_> {
                 // Rehash at every trust boundary even when a process-local
                 // durability proof lets us avoid another physical barrier.
                 self.store.verify_existing(id, &dest)?;
+                self.new_dedup += 1;
                 return Ok(id);
             }
             self.store.verify_and_sync_existing(id, &dest)?;
@@ -259,6 +268,7 @@ impl PublishBatch<'_> {
             // before allowing our caller to publish metadata that names it.
             self.dirs.insert(shard_b);
             self.oids.insert(id);
+            self.new_dedup += 1;
             return Ok(id);
         }
 
@@ -289,6 +299,7 @@ impl PublishBatch<'_> {
                 } else {
                     self.store.verify_existing(id, &dest)?;
                 }
+                self.new_dedup += 1;
                 // Another publisher won after our existence check. Its file
                 // and directory barriers may still be pending, so this batch
                 // joins the proof unless another completed batch cached it.
@@ -324,6 +335,10 @@ impl PublishBatch<'_> {
             .stats
             .puts
             .fetch_add(self.new_puts, Ordering::Relaxed);
+        self.store
+            .stats
+            .dedup_hits
+            .fetch_add(self.new_dedup, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -517,7 +532,15 @@ mod tests {
         assert!(after.fsync_dir > before.fsync_dir);
         s.put(b"measured").unwrap();
         let after_dedup = s.stats();
-        assert_eq!(after_dedup, after);
+        // A dedup hit republishes nothing and performs no new barrier, so the
+        // dedup counter is the only field allowed to move.
+        assert_eq!(
+            after_dedup,
+            BlobStoreStats {
+                dedup_hits: after.dedup_hits + 1,
+                ..after
+            }
+        );
         assert_eq!(s.get(id).unwrap(), b"measured");
     }
 

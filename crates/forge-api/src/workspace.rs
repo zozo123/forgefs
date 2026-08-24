@@ -24,6 +24,9 @@ impl Forge {
         self.store
             .meta
             .create_session(&ns_id, cap.agent_id(), cid, &live, mount_main)?;
+        // Counted only after the pin is durable metadata, so a denied or
+        // failed open never inflates the session count.
+        self.stats.sessions_opened.fetch_add(1, Ordering::Relaxed);
         Ok(ns_id)
     }
 
