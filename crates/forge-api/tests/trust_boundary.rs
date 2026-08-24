@@ -1,8 +1,6 @@
 use ed25519_dalek::{Signer, SigningKey};
 use forge_api::Forge;
-use forge_core::{
-    hash_bytes, Blob, Commit, ProvenanceManifest, Snapshot, Tree, TreeEntry,
-};
+use forge_core::{hash_bytes, Blob, Commit, ProvenanceManifest, Snapshot, Tree, TreeEntry};
 use forge_store::Store;
 use forge_types::{CasResult, EntryKind, Error};
 use tempfile::tempdir;
@@ -170,12 +168,7 @@ fn verify_and_full_fsck_reject_inexact_or_forged_provenance_manifest() {
     let original_oid = f.seal(&root, "main", "complete-manifest").unwrap();
 
     let store = root_store(d.path());
-    let contribution_commit = store
-        .meta
-        .get_ref(&contribution_ref)
-        .unwrap()
-        .unwrap()
-        .oid;
+    let contribution_commit = store.meta.get_ref(&contribution_ref).unwrap().unwrap().oid;
     let contribution_oid = store
         .get_commit(contribution_commit)
         .unwrap()
@@ -211,7 +204,9 @@ fn verify_and_full_fsck_reject_inexact_or_forged_provenance_manifest() {
     misattributed.insert(contribution_oid, "forged-agent".into());
     publish("misattributed-contribution", misattributed);
 
-    let unreachable = store.put_blob_data(b"unreachable provenance entry").unwrap();
+    let unreachable = store
+        .put_blob_data(b"unreachable provenance entry")
+        .unwrap();
     let mut extra = entries;
     extra.insert(unreachable, "forged-agent".into());
     publish("extra-provenance", extra);
@@ -241,8 +236,7 @@ fn verify_and_full_fsck_reject_inexact_or_forged_provenance_manifest() {
         "extra-provenance",
     ] {
         assert!(report.findings.iter().any(|finding| {
-            finding.code == "SEAL_PAYLOAD"
-                && finding.resource == format!("catalog:seal:{tag}")
+            finding.code == "SEAL_PAYLOAD" && finding.resource == format!("catalog:seal:{tag}")
         }));
     }
 }

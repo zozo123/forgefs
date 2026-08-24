@@ -264,8 +264,7 @@ impl Forge {
             if object.object_type != ObjectType::Contribution {
                 continue;
             }
-            let contribution =
-                Contribution::decode(&self.store.get_raw_verified(object.id)?)?;
+            let contribution = Contribution::decode(&self.store.get_raw_verified(object.id)?)?;
             contributions.insert(object.id, contribution.agent);
         }
         Ok((content, contributions))

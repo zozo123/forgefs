@@ -266,12 +266,7 @@ fn i15_sealed_releases_verify_after_reopen() {
             .unwrap(),
     );
     let store = Store::open(&fixture.path().join(".forge")).unwrap();
-    let contribution_commit = store
-        .meta
-        .get_ref(&contribution_ref)
-        .unwrap()
-        .unwrap()
-        .oid;
+    let contribution_commit = store.meta.get_ref(&contribution_ref).unwrap().unwrap().oid;
     let contribution_oid = store
         .get_commit(contribution_commit)
         .unwrap()

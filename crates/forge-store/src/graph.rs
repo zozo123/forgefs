@@ -1,9 +1,7 @@
 //! Durable, type-aware immutable object-graph traversal.
 
 use crate::Store;
-use forge_core::{
-    decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree,
-};
+use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -114,11 +112,7 @@ pub fn decode_graph_object(id: ObjectId, bytes: &[u8]) -> Result<DecodedGraphObj
         ObjectType::Conflict => {
             let conflict = Conflict::decode(bytes)?;
             for base in conflict.bases {
-                edges.push(exact(
-                    base,
-                    ObjectType::Tree,
-                    format!("conflict:{id}:base"),
-                ));
+                edges.push(exact(base, ObjectType::Tree, format!("conflict:{id}:base")));
             }
             edges.push(exact(
                 conflict.ours,
