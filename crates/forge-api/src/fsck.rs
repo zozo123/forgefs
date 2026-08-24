@@ -316,6 +316,11 @@ impl Forge {
     /// one defensive catalog snapshot and scans every object file, including
     /// unreachable/orphan objects.
     pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
+        if self.fsck_catalog && !full {
+            return Err(Error::Invalid(
+                "a ledger-deferred fsck handle requires full=true".into(),
+            ));
+        }
         self.check(cap, Op::Read, None)?;
         if !cap.has_unrestricted_ref_scope() {
             return Err(Error::Denied(
