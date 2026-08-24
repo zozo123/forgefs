@@ -1,8 +1,10 @@
 use ed25519_dalek::{Signer, SigningKey};
 use forge_api::Forge;
-use forge_core::{hash_bytes, Commit, Snapshot, Tree, TreeEntry};
+use forge_core::{
+    hash_bytes, Blob, Commit, ProvenanceManifest, Snapshot, Tree, TreeEntry,
+};
 use forge_store::Store;
-use forge_types::{EntryKind, Error};
+use forge_types::{CasResult, EntryKind, Error};
 use tempfile::tempdir;
 
 fn root_store(dir: &std::path::Path) -> Store {
@@ -150,6 +152,99 @@ fn verify_rejects_metadata_commit_tag_and_provenance_mismatch() {
         f.verify_tag(&root, "bad-prov"),
         Err(Error::Corrupt(_))
     ));
+}
+
+#[test]
+fn verify_and_full_fsck_reject_inexact_or_forged_provenance_manifest() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+    let ns = f.session_open(&root, "main").unwrap();
+    f.write(&root, &ns, "/receipt.txt", b"causal", false)
+        .unwrap();
+    let contribution_ref = match f.checkin(&root, &ns, "/", "receipt").unwrap() {
+        CasResult::Updated { name, .. } => name,
+        other => panic!("material checkin did not update its private ref: {other:?}"),
+    };
+    f.merge(&root, "main", &contribution_ref, None).unwrap();
+    let original_oid = f.seal(&root, "main", "complete-manifest").unwrap();
+
+    let store = root_store(d.path());
+    let contribution_commit = store
+        .meta
+        .get_ref(&contribution_ref)
+        .unwrap()
+        .unwrap()
+        .oid;
+    let contribution_oid = store
+        .get_commit(contribution_commit)
+        .unwrap()
+        .contrib
+        .unwrap();
+    let original = store.get_snapshot(original_oid).unwrap();
+    let provenance = Blob::decode(&store.get_raw_verified(original.prov).unwrap()).unwrap();
+    let entries = ProvenanceManifest::decode(&provenance.data)
+        .unwrap()
+        .entries()
+        .clone();
+    let sk = signing_key(d.path());
+    let publish = |tag: &str, entries| {
+        let mut altered = original.clone();
+        altered.tag = tag.into();
+        altered.ts += tag.len() as u64;
+        altered.prov = store
+            .put_blob_data(&ProvenanceManifest::new(entries).unwrap().encode())
+            .unwrap();
+        sign_snapshot(&sk, &mut altered);
+        let oid = store.put_snapshot(&altered).unwrap();
+        store
+            .meta
+            .commit_seal(tag, oid, altered.commit, altered.tree, "test")
+            .unwrap();
+    };
+
+    let mut missing = entries.clone();
+    assert!(missing.remove(&contribution_oid).is_some());
+    publish("missing-contribution", missing);
+
+    let mut misattributed = entries.clone();
+    misattributed.insert(contribution_oid, "forged-agent".into());
+    publish("misattributed-contribution", misattributed);
+
+    let unreachable = store.put_blob_data(b"unreachable provenance entry").unwrap();
+    let mut extra = entries;
+    extra.insert(unreachable, "forged-agent".into());
+    publish("extra-provenance", extra);
+
+    let error = f.verify_tag(&root, "missing-contribution").unwrap_err();
+    assert!(
+        matches!(&error, Error::Corrupt(detail) if detail.contains("provenance missing reachable object") && detail.contains(&contribution_oid.hex())),
+        "{error:?}"
+    );
+    let error = f
+        .verify_tag(&root, "misattributed-contribution")
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Corrupt(detail) if detail.contains("provenance contribution attribution mismatch") && detail.contains(&contribution_oid.hex())),
+        "{error:?}"
+    );
+    let error = f.verify_tag(&root, "extra-provenance").unwrap_err();
+    assert!(
+        matches!(&error, Error::Corrupt(detail) if detail.contains("provenance contains unreachable object") && detail.contains(&unreachable.hex())),
+        "{error:?}"
+    );
+    let report = f.fsck(&root, true).unwrap();
+    assert!(!report.ok);
+    for tag in [
+        "missing-contribution",
+        "misattributed-contribution",
+        "extra-provenance",
+    ] {
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "SEAL_PAYLOAD"
+                && finding.resource == format!("catalog:seal:{tag}")
+        }));
+    }
 }
 
 #[test]

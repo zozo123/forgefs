@@ -3,10 +3,12 @@
 use crate::{Forge, RAW_MERGE_RESOLUTION_DISABLED};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use forge_cap::{Cap, Op};
-use forge_core::cbor::{encode_map_sorted, encode_text};
-use forge_core::{hash_bytes, now_ms, Blob, Commit, Conflict, Snapshot};
+use forge_core::{
+    hash_bytes, now_ms, Blob, Commit, Conflict, Contribution, ProvenanceManifest, Snapshot,
+};
 use forge_merge::{merge_bases, three_way, MergeOutcome};
-use forge_types::{CasResult, Error, ObjectId, Result};
+use forge_types::{CasResult, Error, ObjectId, ObjectType, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 
 impl Forge {
@@ -126,23 +128,19 @@ impl Forge {
             .get_ref(r#ref)?
             .ok_or_else(|| Error::NotFound(r#ref.into()))?;
         let commit = self.store.get_commit(row.oid)?;
-        let oids = self.store.reachable_oids(commit.tree)?;
-        let mut pairs = Vec::new();
-        for id in &oids {
+        let (content, contributions) = self.verified_provenance_scope(row.oid, commit.tree)?;
+        let mut entries = BTreeMap::new();
+        for id in content {
             let agent = self
                 .store
                 .meta
-                .intro_get(*id)?
+                .intro_get(id)?
                 .unwrap_or_else(|| "unknown".into());
-            let mut k = Vec::new();
-            encode_text(&mut k, &id.hex());
-            let mut v = Vec::new();
-            encode_text(&mut v, &agent);
-            pairs.push((k, v));
+            entries.insert(id, agent);
         }
-        let mut map = Vec::new();
-        encode_map_sorted(&mut map, pairs);
-        let prov = self.store.put_blob_data(&map)?;
+        entries.extend(contributions);
+        let manifest = ProvenanceManifest::new(entries)?;
+        let prov = self.store.put_blob_data(&manifest.encode())?;
         let sk = SigningKey::from_bytes(&self.seal_seed);
         let mut snap = Snapshot {
             tree: commit.tree,
@@ -211,17 +209,65 @@ impl Forge {
         if commit.tree != tree_oid {
             return Err(Error::Corrupt("sealed commit tree mismatch".into()));
         }
-        Blob::decode(&self.store.get_raw_verified(snap.prov)?)?;
-
         let h = hash_bytes(&snap.encode_unsigned());
         let pk =
             VerifyingKey::from_bytes(&self.seal_pk).map_err(|e| Error::Corrupt(e.to_string()))?;
         pk.verify(h.as_bytes(), &Signature::from_bytes(&snap.sig))
             .map_err(|_| Error::Corrupt("snapshot signature".into()))?;
-        let walked = self.store.reachable_oids_verified(tree_oid)?;
-        if !walked.contains(&tree_oid) {
-            return Err(Error::Corrupt("tree walk".into()));
+
+        let provenance = Blob::decode(&self.store.get_raw_verified(snap.prov)?)?;
+        let manifest = ProvenanceManifest::decode(&provenance.data)?;
+        let (content, contributions) = self.verified_provenance_scope(commit_oid, tree_oid)?;
+        let expected = content
+            .iter()
+            .copied()
+            .chain(contributions.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let actual = manifest.entries().keys().copied().collect::<BTreeSet<_>>();
+        if let Some(missing) = expected.difference(&actual).next() {
+            return Err(Error::Corrupt(format!(
+                "provenance missing reachable object {missing}"
+            )));
+        }
+        if let Some(extra) = actual.difference(&expected).next() {
+            return Err(Error::Corrupt(format!(
+                "provenance contains unreachable object {extra}"
+            )));
+        }
+        for (id, agent) in contributions {
+            if manifest.entries().get(&id) != Some(&agent) {
+                return Err(Error::Corrupt(format!(
+                    "provenance contribution attribution mismatch at {id}"
+                )));
+            }
         }
         Ok(snap_oid)
+    }
+
+    /// Rehash the sealed content tree and the complete causal commit graph,
+    /// returning the exact manifest scope plus immutable Contribution agents.
+    fn verified_provenance_scope(
+        &self,
+        commit_oid: ObjectId,
+        tree_oid: ObjectId,
+    ) -> Result<(BTreeSet<ObjectId>, BTreeMap<ObjectId, String>)> {
+        let content = self
+            .store
+            .reachable_oids_verified(tree_oid)?
+            .into_iter()
+            .collect();
+        let graph = self
+            .store
+            .reachable_graph_verified(commit_oid, ObjectType::Commit)?;
+        let mut contributions = BTreeMap::new();
+        for object in graph {
+            if object.object_type != ObjectType::Contribution {
+                continue;
+            }
+            let contribution =
+                Contribution::decode(&self.store.get_raw_verified(object.id)?)?;
+            contributions.insert(object.id, contribution.agent);
+        }
+        Ok((content, contributions))
     }
 }

@@ -1,15 +1,18 @@
 use crate::Forge;
 use forge_cap::{Cap, Op};
-use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
+use forge_core::decode_object_type;
 use forge_ns::{parse_spec, Spec};
-use forge_store::{CatalogAudit, CatalogObjectExpectation};
-use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
+use forge_store::{
+    decode_graph_object, CatalogAudit, CatalogObjectExpectation, GraphExpectation,
+    MAX_GRAPH_OBJECTS,
+};
+use forge_types::{Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 
-const MAX_OBJECTS: usize = 1_000_000;
+const MAX_OBJECTS: usize = MAX_GRAPH_OBJECTS;
 
 #[derive(Clone, Copy, Debug)]
 enum ObjectExpectation {
@@ -394,7 +397,6 @@ fn verify_graph(
 ) {
     let mut queue: VecDeque<_> = roots.into();
     let mut verified: HashMap<ObjectId, ObjectType> = HashMap::new();
-    let mut expanded = HashSet::new();
     let mut edges = 0usize;
 
     while let Some((id, expected, resource)) = queue.pop_front() {
@@ -432,128 +434,19 @@ fn verify_graph(
 
         check_object_expectation(report, id, actual, expected, &resource);
 
-        if !expanded.insert(id) {
-            continue;
-        }
-
-        let decode_result: Result<()> = match actual {
-            ObjectType::Blob => Blob::decode(&bytes).map(|_| ()),
-            ObjectType::Tree => Tree::decode(&bytes).map(|tree| {
-                for entry in tree.entries {
-                    let expected = match entry.kind {
-                        EntryKind::Blob => ObjectType::Blob,
-                        EntryKind::Tree => ObjectType::Tree,
-                    };
-                    queue.push_back((
-                        entry.id,
-                        ObjectExpectation::Exact(expected),
-                        format!("tree:{id}:{}", entry.name),
-                    ));
-                }
-            }),
-            ObjectType::Commit => Commit::decode(&bytes).map(|commit| {
-                queue.push_back((
-                    commit.tree,
-                    ObjectExpectation::Exact(ObjectType::Tree),
-                    format!("commit:{id}:tree"),
-                ));
-                for parent in commit.parents {
-                    queue.push_back((
-                        parent,
-                        ObjectExpectation::Exact(ObjectType::Commit),
-                        format!("commit:{id}:parent"),
-                    ));
-                }
-                if let Some(contrib) = commit.contrib {
-                    queue.push_back((
-                        contrib,
-                        ObjectExpectation::Exact(ObjectType::Contribution),
-                        format!("commit:{id}:contribution"),
-                    ));
-                }
-            }),
-            ObjectType::Snapshot => Snapshot::decode(&bytes).map(|snapshot| {
-                queue.push_back((
-                    snapshot.tree,
-                    ObjectExpectation::Exact(ObjectType::Tree),
-                    format!("snapshot:{id}:tree"),
-                ));
-                queue.push_back((
-                    snapshot.commit,
-                    ObjectExpectation::Exact(ObjectType::Commit),
-                    format!("snapshot:{id}:commit"),
-                ));
-                queue.push_back((
-                    snapshot.prov,
-                    ObjectExpectation::Exact(ObjectType::Blob),
-                    format!("snapshot:{id}:provenance"),
-                ));
-            }),
-            ObjectType::Contribution => Contribution::decode(&bytes).map(|contribution| {
-                queue.push_back((
-                    contribution.base,
-                    ObjectExpectation::Exact(ObjectType::Commit),
-                    format!("contribution:{id}:base"),
-                ));
-                queue.push_back((
-                    contribution.tree,
-                    ObjectExpectation::Exact(ObjectType::Tree),
-                    format!("contribution:{id}:tree"),
-                ));
-                for parent in contribution.parents {
-                    queue.push_back((
-                        parent,
-                        ObjectExpectation::Exact(ObjectType::Commit),
-                        format!("contribution:{id}:parent"),
-                    ));
-                }
-                for read in contribution.reads {
-                    queue.push_back((
-                        read.id,
-                        ObjectExpectation::Exact(ObjectType::Blob),
-                        format!("contribution:{id}:read:{}", read.path),
-                    ));
-                }
-            }),
-            ObjectType::Conflict => Conflict::decode(&bytes).map(|conflict| {
-                for base in conflict.bases {
-                    queue.push_back((
-                        base,
-                        ObjectExpectation::Exact(ObjectType::Tree),
-                        format!("conflict:{id}:base"),
-                    ));
-                }
-                queue.push_back((
-                    conflict.ours,
-                    ObjectExpectation::Exact(ObjectType::Tree),
-                    format!("conflict:{id}:ours"),
-                ));
-                queue.push_back((
-                    conflict.theirs,
-                    ObjectExpectation::Exact(ObjectType::Tree),
-                    format!("conflict:{id}:theirs"),
-                ));
-                for causal in conflict.causal {
-                    queue.push_back((
-                        causal,
-                        ObjectExpectation::Exact(ObjectType::Commit),
-                        format!("conflict:{id}:causal"),
-                    ));
-                }
-                for path in conflict.paths {
-                    for edge in [path.a, path.b, path.base].into_iter().flatten() {
-                        queue.push_back((
-                            edge,
-                            ObjectExpectation::Any,
-                            format!("conflict:{id}:path:{}", path.path),
-                        ));
-                    }
-                }
-            }),
+        let decoded = match decode_graph_object(id, &bytes) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                report.finding("DECODE", resource, format!("{id}: {err}"));
+                continue;
+            }
         };
-
-        if let Err(err) = decode_result {
-            report.finding("DECODE", resource, format!("{id}: {err}"));
+        for edge in decoded.edges {
+            let expected = match edge.expected {
+                GraphExpectation::Any => ObjectExpectation::Any,
+                GraphExpectation::Exact(expected) => ObjectExpectation::Exact(expected),
+            };
+            queue.push_back((edge.id, expected, edge.resource));
         }
     }
 }

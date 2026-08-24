@@ -5,6 +5,8 @@
 mod support;
 
 use forge_api::{Forge, FsckReport};
+use forge_core::{Blob, ProvenanceManifest, Snapshot};
+use forge_store::Store;
 use forge_types::{CasResult, Error};
 use rusqlite::Connection;
 use std::fs;
@@ -38,7 +40,7 @@ fn invariant_contract_matrix() {
             i13_i14_roles_and_namespaces_have_no_ambient_authority,
         ),
         (
-            "I15 sealed releases verify after a durable reopen",
+            "I10/I15 sealed releases attest contributions after a durable reopen",
             i15_sealed_releases_verify_after_reopen,
         ),
         (
@@ -257,26 +259,50 @@ fn i15_sealed_releases_verify_after_reopen() {
         .forge
         .write(&fixture.root, &session, "/release.txt", b"final", false)
         .unwrap();
-    let contribution = updated_ref(
+    let contribution_ref = updated_ref(
         fixture
             .forge
             .checkin(&fixture.root, &session, "/", "release")
             .unwrap(),
     );
+    let store = Store::open(&fixture.path().join(".forge")).unwrap();
+    let contribution_commit = store
+        .meta
+        .get_ref(&contribution_ref)
+        .unwrap()
+        .unwrap()
+        .oid;
+    let contribution_oid = store
+        .get_commit(contribution_commit)
+        .unwrap()
+        .contrib
+        .unwrap();
+    let contribution_agent = store.get_contribution(contribution_oid).unwrap().agent;
     fixture
         .forge
-        .merge(&fixture.integrator, "main", &contribution, None)
+        .merge(&fixture.integrator, "main", &contribution_ref, None)
         .unwrap();
-    fixture
+    let snapshot_oid = fixture
         .forge
         .seal(&fixture.integrator, "main", "contract-v1")
         .unwrap();
+    let snapshot = Snapshot::decode(&store.get_raw_verified(snapshot_oid).unwrap()).unwrap();
+    let provenance = Blob::decode(&store.get_raw_verified(snapshot.prov).unwrap()).unwrap();
+    let manifest = ProvenanceManifest::decode(&provenance.data).unwrap();
+    assert_eq!(
+        manifest.entries().get(&contribution_oid),
+        Some(&contribution_agent),
+        "the signed provenance manifest must name the immutable contribution"
+    );
+    drop(store);
 
     let path = fixture.path().to_path_buf();
     let root = fixture.root.clone();
     drop(fixture.forge);
     let reopened = Forge::open_read_only(&path).unwrap();
     reopened.verify_tag(&root, "contract-v1").unwrap();
+    let report = reopened.fsck(&root, true).unwrap();
+    assert!(report.ok, "{:#?}", report.findings);
 }
 
 fn i17_future_versions_fail_closed() {

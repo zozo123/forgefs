@@ -102,6 +102,24 @@ A Contribution (`0x06`) has an empty payload and the required header map:
 are strictly increasing and unique by raw UTF-8 bytes. Limits are 1024 parents,
 100,000 reads, 100,000 writes, 1024 agent bytes, and an 8 MiB encoded header.
 
+## Snapshot provenance manifest
+
+`Snapshot.prov` names a Blob whose payload is a canonical CBOR text map from
+lowercase 64-character ObjectId hex to a UTF-8 attribution label. The map has
+at most 1,000,000 entries. Its exact key set is the union of:
+
+- every Tree and Blob reachable from `Snapshot.tree`; and
+- every Contribution reachable from `Snapshot.commit` through the typed
+  immutable graph.
+
+Tree/Blob labels preserve the v1 first-introducer hint (or `unknown`). A
+Contribution label must equal that receipt's immutable `agent` field. Missing
+or additional keys, a mismatched Contribution agent, malformed/non-canonical
+CBOR, and a wrongly typed graph edge are corruption. The snapshot signature
+binds the manifest because `prov` is the Blob's ObjectId. This payload rule
+formalizes the existing VERSION 1 Snapshot field; it does not change any
+object framing or type encoding.
+
 ## Metadata schema is a separate contract
 
 `meta.sqlite` is mutable and is not part of an ObjectId. Its
