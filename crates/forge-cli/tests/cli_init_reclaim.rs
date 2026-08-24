@@ -76,10 +76,13 @@ fn retry_after_each_prepublication_crash_reclaims_secret_staging() {
 }
 
 #[test]
-fn fsck_reports_reserved_init_staging_debris() {
+fn fsck_reports_owned_init_staging_debris_and_init_reclaims_it() {
     let d = tempdir().unwrap();
     run(forge().arg("init").current_dir(d.path()));
-    let debris = d.path().join(".forge.init-dead-test");
+    // Exact ForgeFS staging grammar: .forge.init-<pid>-<ULID>.
+    let debris = d
+        .path()
+        .join(".forge.init-999999-01ARZ3NDEKTSV4RRFFQ69G5FAV");
     fs::create_dir_all(debris.join("keys")).unwrap();
     fs::write(debris.join("keys/root.secret"), b"stale-secret").unwrap();
 
@@ -96,7 +99,10 @@ fn fsck_reports_reserved_init_staging_debris() {
     assert!(!checked.status.success());
     let stdout = String::from_utf8_lossy(&checked.stdout);
     assert!(stdout.contains("[INIT_STAGING]"), "{stdout}");
-    assert!(stdout.contains(".forge.init-dead-test"), "{stdout}");
+    assert!(
+        stdout.contains(".forge.init-999999-01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        "{stdout}"
+    );
 
     // Re-running init against an already-published cell still performs the
     // reserved-prefix cleanup before reporting "already a forge".
@@ -106,4 +112,27 @@ fn fsck_reports_reserved_init_staging_debris() {
         !debris.exists(),
         "existing-cell init did not reclaim debris"
     );
+}
+
+#[test]
+fn staging_prefix_lookalikes_are_never_claimed_or_deleted() {
+    let d = tempdir().unwrap();
+    let lookalike = d.path().join(".forge.init-dead-worker");
+    fs::create_dir(&lookalike).unwrap();
+    fs::write(lookalike.join("keep"), b"user-data").unwrap();
+
+    run(forge().arg("init").current_dir(d.path()));
+    assert_eq!(fs::read(lookalike.join("keep")).unwrap(), b"user-data");
+
+    let root = d.path().join(".forge/keys/root.cap");
+    let checked = run(
+        forge()
+            .arg("--dir")
+            .arg(d.path())
+            .arg("--cap")
+            .arg(&root)
+            .arg("fsck")
+            .arg("--full"),
+    );
+    assert!(!checked.contains("INIT_STAGING"), "{checked}");
 }
