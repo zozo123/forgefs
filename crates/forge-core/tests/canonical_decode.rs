@@ -100,3 +100,95 @@ fn huge_declared_length_returns_error_without_panicking() {
         "decoder panicked or accepted impossible length"
     );
 }
+
+/// I1: a uint written in a longer-than-shortest form is Corrupt at every width.
+/// Accepting one would give a single logical value two distinct encodings, and
+/// therefore two distinct ObjectIds for one object.
+#[test]
+fn i1_non_minimal_uints_are_corrupt_at_every_width() {
+    // (bytes, decoded value) pairs that are the shortest form for their value.
+    let canonical: [(&[u8], u64); 4] = [
+        (&[0x18, 0x18], 24),
+        (&[0x19, 0x01, 0x00], 256),
+        (&[0x1a, 0x00, 0x01, 0x00, 0x00], 65_536),
+        (
+            &[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            4_294_967_296,
+        ),
+    ];
+    for (bytes, want) in canonical {
+        let mut r = Reader::new(bytes);
+        assert_eq!(
+            r.u64().expect("shortest form must decode"),
+            want,
+            "canonical uint rejected"
+        );
+    }
+
+    // The same values one width too wide, plus each width boundary.
+    let non_minimal: [&[u8]; 8] = [
+        &[0x18, 0x00],
+        &[0x18, 0x17],
+        &[0x19, 0x00, 0x01],
+        &[0x19, 0x00, 0xff],
+        &[0x1a, 0x00, 0x00, 0x00, 0x01],
+        &[0x1a, 0x00, 0x00, 0xff, 0xff],
+        &[0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+        &[0x1b, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+    ];
+    for bytes in non_minimal {
+        let mut r = Reader::new(bytes);
+        assert!(
+            r.u64().is_err(),
+            "decoder accepted non-minimal uint {bytes:02x?}"
+        );
+    }
+}
+
+/// I1 at the object layer: a commit whose `ts` is padded to eight bytes must be
+/// Corrupt, not silently re-encoded to a different identity.
+#[test]
+fn i1_commit_rejects_non_minimal_ts_width() {
+    fn commit_bytes(ts: &[u8]) -> Vec<u8> {
+        let mut header = Vec::new();
+        encode_map_header(&mut header, 6);
+
+        let mut lm = Vec::new();
+        encode_bool(&mut lm, false);
+        let mut msg = Vec::new();
+        encode_text(&mut msg, "m");
+        let mut tree = Vec::new();
+        encode_bytes(&mut tree, ObjectId([1; 32]).as_bytes());
+        let mut agent = Vec::new();
+        encode_text(&mut agent, "a");
+        let mut parents = Vec::new();
+        encode_array_header(&mut parents, 0);
+
+        // Canonical encoded-key order: lm, ts, msg, tree, agent, parents.
+        append_kv(&mut header, "lm", &lm);
+        append_kv(&mut header, "ts", ts);
+        append_kv(&mut header, "msg", &msg);
+        append_kv(&mut header, "tree", &tree);
+        append_kv(&mut header, "agent", &agent);
+        append_kv(&mut header, "parents", &parents);
+
+        encode_file(ObjectType::Commit, &header, &[])
+    }
+
+    let mut canonical_ts = Vec::new();
+    encode_u64(&mut canonical_ts, 1);
+    let good = commit_bytes(&canonical_ts);
+    let decoded = Commit::decode(&good).expect("canonical commit must decode");
+    assert_eq!(decoded.ts, 1);
+    assert_eq!(
+        decoded.encode(),
+        good,
+        "canonical commit did not round-trip"
+    );
+
+    let padded = commit_bytes(&[0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    assert!(
+        Commit::decode(&padded).is_err(),
+        "commit decoder accepted a non-minimal ts encoding"
+    );
+}
