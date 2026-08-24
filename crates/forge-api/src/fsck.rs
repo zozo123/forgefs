@@ -261,6 +261,7 @@ impl Forge {
         for mount in &catalog.mounts {
             let mount_resource = format!("namespace:{}:mount:{}", mount.ns_id, mount.path);
             match parse_spec(&mount.spec) {
+                Ok(Spec::Ref(_)) if !catalog.refs_complete => {}
                 Ok(Spec::Ref(name)) => match ref_types.get(&name) {
                     Some(Some((oid, expected))) => roots.push((
                         *oid,
