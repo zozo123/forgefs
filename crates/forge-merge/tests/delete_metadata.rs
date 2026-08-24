@@ -1,3 +1,4 @@
+// Deletion-side resolution must compare the whole TreeEntry, not only blob bytes.
 use forge_core::{Tree, TreeEntry};
 use forge_merge::{three_way, MergeOutcome};
 use forge_store::Store;
