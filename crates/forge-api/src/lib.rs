@@ -645,6 +645,9 @@ impl Forge {
             self.check(cap, Op::Write, None)?;
         }
         let rel = rel_of(&m.path, path)?;
+        if rel.is_empty() {
+            return Err(Error::Invalid("cannot delete mount root".into()));
+        }
         self.store
             .meta
             .overlay_upsert(ns, &m.path, &rel, None, false)?;
