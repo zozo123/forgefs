@@ -1,11 +1,10 @@
 //! I10: Contribution reachability is a monotonic set-union join.
 
-mod support;
-
+use forge_api::Forge;
 use forge_store::Store;
 use forge_types::{CasResult, ObjectId, ObjectType};
 use std::collections::BTreeSet;
-use support::Fixture;
+use tempfile::tempdir;
 
 fn updated(result: CasResult) -> (String, ObjectId) {
     match result {
@@ -25,30 +24,45 @@ fn contribution_set(store: &Store, commit: ObjectId) -> BTreeSet<ObjectId> {
 
 #[test]
 fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
-    let fixture = Fixture::new();
-    let alice = fixture.agent("alice");
-    let bob = fixture.agent("bob");
-    let store = Store::open(&fixture.path().join(".forge")).unwrap();
+    let dir = tempdir().unwrap();
+    let forge = Forge::init(dir.path()).unwrap();
+    let root = forge.root_cap().unwrap();
+    let alice = forge
+        .grant(
+            &root,
+            vec![
+                "ops=read,write,branch".into(),
+                "agent=alice".into(),
+                "ref=main,heads/agents/alice/*".into(),
+            ],
+        )
+        .unwrap();
+    let bob = forge
+        .grant(
+            &root,
+            vec![
+                "ops=read,write,branch".into(),
+                "agent=bob".into(),
+                "ref=main,heads/agents/bob/*".into(),
+            ],
+        )
+        .unwrap();
+    let store = Store::open(&dir.path().join(".forge")).unwrap();
     let shared_base = store.meta.get_ref("main").unwrap().unwrap().oid;
 
-    let alice_ns = fixture.session(&alice, "main");
-    fixture
-        .forge
+    let alice_ns = forge.session_open(&alice, "main").unwrap();
+    forge
         .write(&alice, &alice_ns, "/alice.txt", b"alice", false)
         .unwrap();
     let (alice_ref, alice_commit) = updated(
-        fixture
-            .forge
-            .checkin(&alice, &alice_ns, "/", "alice")
-            .unwrap(),
+        forge.checkin(&alice, &alice_ns, "/", "alice").unwrap(),
     );
 
-    let bob_ns = fixture.session(&bob, "main");
-    fixture
-        .forge
+    let bob_ns = forge.session_open(&bob, "main").unwrap();
+    forge
         .write(&bob, &bob_ns, "/bob.txt", b"bob", false)
         .unwrap();
-    let (bob_ref, bob_commit) = updated(fixture.forge.checkin(&bob, &bob_ns, "/", "bob").unwrap());
+    let (bob_ref, bob_commit) = updated(forge.checkin(&bob, &bob_ns, "/", "bob").unwrap());
 
     let alice_contribution = store.get_commit(alice_commit).unwrap().contrib.unwrap();
     let bob_contribution = store.get_commit(bob_commit).unwrap().contrib.unwrap();
@@ -67,19 +81,16 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
     );
     let expected = BTreeSet::from([alice_contribution, bob_contribution]);
 
-    fixture
-        .forge
-        .branch(&fixture.root, "main", "joins/alice-bob")
+    forge
+        .branch(&root, "main", "joins/alice-bob")
         .unwrap();
-    fixture
-        .forge
-        .branch(&fixture.root, "main", "joins/bob-alice")
+    forge
+        .branch(&root, "main", "joins/bob-alice")
         .unwrap();
 
     let (_, ab_first) = updated(
-        fixture
-            .forge
-            .merge(&fixture.root, "joins/alice-bob", &alice_ref, None)
+        forge
+            .merge(&root, "joins/alice-bob", &alice_ref, None)
             .unwrap(),
     );
     assert_eq!(
@@ -87,16 +98,14 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
         BTreeSet::from([alice_contribution])
     );
     let (_, ab) = updated(
-        fixture
-            .forge
-            .merge(&fixture.root, "joins/alice-bob", &bob_ref, None)
+        forge
+            .merge(&root, "joins/alice-bob", &bob_ref, None)
             .unwrap(),
     );
 
     let (_, ba_first) = updated(
-        fixture
-            .forge
-            .merge(&fixture.root, "joins/bob-alice", &bob_ref, None)
+        forge
+            .merge(&root, "joins/bob-alice", &bob_ref, None)
             .unwrap(),
     );
     assert_eq!(
@@ -104,9 +113,8 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
         BTreeSet::from([bob_contribution])
     );
     let (_, ba) = updated(
-        fixture
-            .forge
-            .merge(&fixture.root, "joins/bob-alice", &alice_ref, None)
+        forge
+            .merge(&root, "joins/bob-alice", &alice_ref, None)
             .unwrap(),
     );
 
@@ -119,9 +127,8 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
     );
 
     let (_, repeated) = updated(
-        fixture
-            .forge
-            .merge(&fixture.root, "joins/alice-bob", &alice_ref, None)
+        forge
+            .merge(&root, "joins/alice-bob", &alice_ref, None)
             .unwrap(),
     );
     assert_eq!(
