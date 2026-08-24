@@ -138,3 +138,48 @@ fn verified_commit_graph_follows_and_type_checks_contributions() {
         "{error:?}"
     );
 }
+
+/// I10: a present `Commit.contrib` edge must verify as a Contribution
+/// (`0x06`); a loose object of any other type is corruption, not a receipt.
+#[test]
+fn i10_commit_contribution_edge_rejects_non_contribution_object() {
+    let d = tempdir().unwrap();
+    let store = Store::open(d.path()).unwrap();
+    let tree = store.put_tree(&Tree::new(vec![]).unwrap()).unwrap();
+    let base = store
+        .put_commit(&Commit {
+            tree,
+            parents: vec![],
+            agent: "init".into(),
+            msg: "base".into(),
+            ts: 1,
+            landmark: false,
+            contrib: None,
+        })
+        .unwrap();
+    let blob = store.put_blob_data(b"not a receipt").unwrap();
+
+    for (impostor, found) in [(tree, "tree"), (blob, "blob"), (base, "commit")] {
+        let commit = store
+            .put_commit(&Commit {
+                tree,
+                parents: vec![base],
+                agent: "agent".into(),
+                msg: "forged receipt".into(),
+                ts: 2,
+                landmark: false,
+                contrib: Some(impostor),
+            })
+            .unwrap();
+        let error = store
+            .reachable_graph_verified(commit, ObjectType::Commit)
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Corrupt(detail)
+                if detail.contains("contribution")
+                    && detail.contains("expected contribution")
+                    && detail.contains(&format!("found {found}"))),
+            "{error:?}"
+        );
+    }
+}
