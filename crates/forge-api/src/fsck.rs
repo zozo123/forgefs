@@ -3,23 +3,14 @@ use forge_cap::{Cap, Op};
 use forge_core::decode_object_type;
 use forge_ns::{parse_spec, Spec};
 use forge_store::{
-    decode_graph_object, CatalogAudit, CatalogObjectExpectation, GraphExpectation,
-    MAX_GRAPH_OBJECTS,
+    decode_graph_object, CatalogAudit, CatalogObjectExpectation, GraphEdge, GraphExpectation,
+    GraphWorkQueue,
 };
 use forge_types::{Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-
-const MAX_OBJECTS: usize = MAX_GRAPH_OBJECTS;
-
-#[derive(Clone, Copy, Debug)]
-enum ObjectExpectation {
-    Any,
-    Exact(ObjectType),
-    TreeEntry,
-}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct FsckFinding {
@@ -93,7 +84,7 @@ impl Forge {
         &self,
         cap: &Cap,
         report: &mut FsckReport,
-        roots: &mut Vec<(ObjectId, ObjectExpectation, String)>,
+        roots: &mut Vec<(ObjectId, GraphExpectation, String)>,
     ) -> Result<()> {
         // These production readers intentionally remain strict. Reachable fsck
         // uses the normal compatible-schema open and may overlap writers, so
@@ -114,7 +105,7 @@ impl Forge {
             ref_types.insert(row.name.clone(), (row.oid, expected));
             roots.push((
                 row.oid,
-                ObjectExpectation::Exact(expected),
+                GraphExpectation::Exact(expected),
                 format!("ref:{}", row.name),
             ));
 
@@ -139,7 +130,7 @@ impl Forge {
             if let Some(pin) = ns.pinned_oid {
                 roots.push((
                     pin,
-                    ObjectExpectation::Exact(ObjectType::Commit),
+                    GraphExpectation::Exact(ObjectType::Commit),
                     format!("{ns_resource}:pin"),
                 ));
             } else {
@@ -150,7 +141,7 @@ impl Forge {
                 match ref_types.get(live) {
                     Some((oid, ty)) if *ty == ObjectType::Commit => roots.push((
                         *oid,
-                        ObjectExpectation::Exact(ObjectType::Commit),
+                        GraphExpectation::Exact(ObjectType::Commit),
                         format!("{ns_resource}:live_ref:{live}"),
                     )),
                     Some((_oid, ty)) => report.finding(
@@ -161,7 +152,7 @@ impl Forge {
                     None => match self.late_ref(live) {
                         Some((oid, ObjectType::Commit)) => roots.push((
                             oid,
-                            ObjectExpectation::Exact(ObjectType::Commit),
+                            GraphExpectation::Exact(ObjectType::Commit),
                             format!("{ns_resource}:live_ref:{live}"),
                         )),
                         Some((_oid, ty)) => report.finding(
@@ -185,13 +176,13 @@ impl Forge {
                     Ok(Spec::Ref(name)) => match ref_types.get(&name) {
                         Some((oid, ty)) => roots.push((
                             *oid,
-                            ObjectExpectation::Exact(*ty),
+                            GraphExpectation::Exact(*ty),
                             format!("{mount_resource}:ref:{name}"),
                         )),
                         None => match self.late_ref(&name) {
                             Some((oid, ty)) => roots.push((
                                 oid,
-                                ObjectExpectation::Exact(ty),
+                                GraphExpectation::Exact(ty),
                                 format!("{mount_resource}:ref:{name}"),
                             )),
                             None => report.finding(
@@ -209,7 +200,7 @@ impl Forge {
                                 "read-write mount cannot target immutable raw OID",
                             );
                         }
-                        roots.push((id, ObjectExpectation::Any, format!("{mount_resource}:oid")));
+                        roots.push((id, GraphExpectation::Any, format!("{mount_resource}:oid")));
                     }
                     Err(err) => report.finding("MOUNT_SPEC", &mount_resource, err.to_string()),
                 }
@@ -218,7 +209,7 @@ impl Forge {
                     if let Some(id) = row.blob_oid {
                         roots.push((
                             id,
-                            ObjectExpectation::Exact(ObjectType::Blob),
+                            GraphExpectation::Exact(ObjectType::Blob),
                             format!("{mount_resource}:overlay:{}", row.path),
                         ));
                     }
@@ -228,7 +219,7 @@ impl Forge {
             for observation in self.store.meta.observations(&ns.id)? {
                 roots.push((
                     observation.oid,
-                    ObjectExpectation::Exact(ObjectType::Blob),
+                    GraphExpectation::Exact(ObjectType::Blob),
                     format!(
                         "{ns_resource}:observation:{}:{}",
                         observation.mount, observation.path
@@ -243,7 +234,7 @@ impl Forge {
         &self,
         catalog: CatalogAudit,
         report: &mut FsckReport,
-        roots: &mut Vec<(ObjectId, ObjectExpectation, String)>,
+        roots: &mut Vec<(ObjectId, GraphExpectation, String)>,
     ) {
         report.checked_refs = catalog.refs.len();
         report.checked_namespaces = catalog.namespaces.len();
@@ -268,7 +259,7 @@ impl Forge {
                 Ok(Spec::Ref(name)) => match ref_types.get(&name) {
                     Some(Some((oid, expected))) => roots.push((
                         *oid,
-                        ObjectExpectation::Exact(*expected),
+                        GraphExpectation::Exact(*expected),
                         format!("{mount_resource}:ref:{name}"),
                     )),
                     Some(None) => {}
@@ -284,7 +275,7 @@ impl Forge {
                             "read-write mount cannot target immutable raw OID",
                         );
                     }
-                    roots.push((id, ObjectExpectation::Any, format!("{mount_resource}:oid")));
+                    roots.push((id, GraphExpectation::Any, format!("{mount_resource}:oid")));
                 }
                 Err(error) => report.finding("MOUNT_SPEC", &mount_resource, error.to_string()),
             }
@@ -306,9 +297,9 @@ impl Forge {
         }
         for root in catalog.roots {
             let expected = match root.expected {
-                CatalogObjectExpectation::Any => ObjectExpectation::Any,
-                CatalogObjectExpectation::Exact(expected) => ObjectExpectation::Exact(expected),
-                CatalogObjectExpectation::TreeEntry => ObjectExpectation::TreeEntry,
+                CatalogObjectExpectation::Any => GraphExpectation::Any,
+                CatalogObjectExpectation::Exact(expected) => GraphExpectation::Exact(expected),
+                CatalogObjectExpectation::TreeEntry => GraphExpectation::TreeEntry,
             };
             roots.push((root.oid, expected, root.resource));
         }
@@ -370,45 +361,46 @@ fn check_object_expectation(
     report: &mut FsckReport,
     id: ObjectId,
     actual: ObjectType,
-    expected: ObjectExpectation,
+    expected: GraphExpectation,
     resource: &str,
 ) {
-    let expected_name = match expected {
-        ObjectExpectation::Any => None,
-        ObjectExpectation::Exact(expected) if actual != expected => Some(expected.as_str()),
-        ObjectExpectation::TreeEntry if !matches!(actual, ObjectType::Blob | ObjectType::Tree) => {
-            Some("blob or tree")
-        }
-        _ => None,
-    };
-    if let Some(expected_name) = expected_name {
+    if !expected.accepts(actual) {
         report.finding(
             "TYPE_MISMATCH",
             resource,
-            format!("{id} is {}, expected {expected_name}", actual.as_str()),
+            format!(
+                "{id} is {}, expected {}",
+                actual.as_str(),
+                expected.description()
+            ),
         );
     }
 }
 
 fn verify_graph(
     store: &forge_store::Store,
-    roots: Vec<(ObjectId, ObjectExpectation, String)>,
+    roots: Vec<(ObjectId, GraphExpectation, String)>,
     report: &mut FsckReport,
 ) {
-    let mut queue: VecDeque<_> = roots.into();
-    let mut verified: HashMap<ObjectId, ObjectType> = HashMap::new();
-    let mut edges = 0usize;
-
-    while let Some((id, expected, resource)) = queue.pop_front() {
-        edges += 1;
-        if edges > MAX_OBJECTS.saturating_mul(8) || verified.len() > MAX_OBJECTS {
-            report.finding(
-                "GRAPH_LIMIT",
-                "object-graph",
-                format!("verification exceeded {MAX_OBJECTS} objects"),
-            );
-            break;
+    let mut queue = GraphWorkQueue::default();
+    for (id, expected, resource) in roots {
+        if let Err(error) = queue.schedule(GraphEdge {
+            id,
+            expected,
+            resource,
+        }) {
+            report.finding("GRAPH_LIMIT", "object-graph", error.to_string());
+            return;
         }
+    }
+    let mut verified: HashMap<ObjectId, ObjectType> = HashMap::new();
+
+    while let Some(edge) = queue.pop_front() {
+        let GraphEdge {
+            id,
+            expected,
+            resource,
+        } = edge;
 
         if let Some(actual) = verified.get(&id).copied() {
             check_object_expectation(report, id, actual, expected, &resource);
@@ -442,18 +434,17 @@ fn verify_graph(
             }
         };
         for edge in decoded.edges {
-            let expected = match edge.expected {
-                GraphExpectation::Any => ObjectExpectation::Any,
-                GraphExpectation::Exact(expected) => ObjectExpectation::Exact(expected),
-            };
-            queue.push_back((edge.id, expected, edge.resource));
+            if let Err(error) = queue.schedule(edge) {
+                report.finding("GRAPH_LIMIT", "object-graph", error.to_string());
+                return;
+            }
         }
     }
 }
 
 fn scan_all_object_paths(
     root: &Path,
-    roots: &mut Vec<(ObjectId, ObjectExpectation, String)>,
+    roots: &mut Vec<(ObjectId, GraphExpectation, String)>,
     report: &mut FsckReport,
 ) -> Result<()> {
     let objects = root.join("objects");
@@ -511,7 +502,7 @@ fn scan_all_object_paths(
                         ),
                     );
                 }
-                roots.push((id, ObjectExpectation::Any, format!("object:{id}")));
+                roots.push((id, GraphExpectation::Any, format!("object:{id}")));
             }
         }
     }

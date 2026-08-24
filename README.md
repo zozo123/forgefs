@@ -64,7 +64,7 @@ cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full --json
 - **Typed refs:** heads/forks, conflicts, and sealed tags cannot be type-confused.
 - **Crash consistency:** objects become durable before one atomic metadata publication/session transition.
 - **Fail-closed corruption:** malformed graph edges are corruption, never ordinary merge conflicts.
-- **Trusted releases:** verification bypasses caches and validates tag → snapshot → commit → typed content/Contribution graph, including the exact signed provenance manifest, against this forge's trusted seal key.
+- **Trusted releases:** verification bypasses caches and validates tag → snapshot → commit → typed content/Contribution graph, including the exact versioned signed provenance manifest, against this forge's trusted seal key. Earlier content-only direct-map manifests remain verifiable without skipping the typed graph walk.
 - **Small trusted core:** CAS + canonical objects + metadata transactions + capabilities + deterministic integration.
 
 ## Speed model — evidence over slogans

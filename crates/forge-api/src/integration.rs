@@ -218,11 +218,10 @@ impl Forge {
         let provenance = Blob::decode(&self.store.get_raw_verified(snap.prov)?)?;
         let manifest = ProvenanceManifest::decode(&provenance.data)?;
         let (content, contributions) = self.verified_provenance_scope(commit_oid, tree_oid)?;
-        let expected = content
-            .iter()
-            .copied()
-            .chain(contributions.keys().copied())
-            .collect::<BTreeSet<_>>();
+        let mut expected = content;
+        if !manifest.is_legacy() {
+            expected.extend(contributions.keys().copied());
+        }
         let actual = manifest.entries().keys().copied().collect::<BTreeSet<_>>();
         if let Some(missing) = expected.difference(&actual).next() {
             return Err(Error::Corrupt(format!(
@@ -234,11 +233,13 @@ impl Forge {
                 "provenance contains unreachable object {extra}"
             )));
         }
-        for (id, agent) in contributions {
-            if manifest.entries().get(&id) != Some(&agent) {
-                return Err(Error::Corrupt(format!(
-                    "provenance contribution attribution mismatch at {id}"
-                )));
+        if !manifest.is_legacy() {
+            for (id, agent) in contributions {
+                if manifest.entries().get(&id) != Some(&agent) {
+                    return Err(Error::Corrupt(format!(
+                        "provenance contribution attribution mismatch at {id}"
+                    )));
+                }
             }
         }
         Ok(snap_oid)

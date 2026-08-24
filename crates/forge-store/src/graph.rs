@@ -3,26 +3,43 @@
 use crate::Store;
 use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub const MAX_GRAPH_OBJECTS: usize = 1_000_000;
-const MAX_GRAPH_EDGES: usize = MAX_GRAPH_OBJECTS * 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphExpectation {
     Any,
     Exact(ObjectType),
+    TreeEntry,
 }
 
 impl GraphExpectation {
-    fn verify(self, actual: ObjectType, id: ObjectId, resource: &str) -> Result<()> {
+    pub fn accepts(self, actual: ObjectType) -> bool {
         match self {
-            Self::Exact(expected) if actual != expected => Err(Error::Corrupt(format!(
+            Self::Any => true,
+            Self::Exact(expected) => actual == expected,
+            Self::TreeEntry => matches!(actual, ObjectType::Blob | ObjectType::Tree),
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Any => "any object",
+            Self::Exact(expected) => expected.as_str(),
+            Self::TreeEntry => "blob or tree",
+        }
+    }
+
+    fn verify(self, actual: ObjectType, id: ObjectId, resource: &str) -> Result<()> {
+        if self.accepts(actual) {
+            Ok(())
+        } else {
+            Err(Error::Corrupt(format!(
                 "typed edge {resource} expected {}, found {} at {id}",
-                expected.as_str(),
+                self.description(),
                 actual.as_str()
-            ))),
-            _ => Ok(()),
+            )))
         }
     }
 }
@@ -59,6 +76,49 @@ fn any(id: ObjectId, resource: String) -> GraphEdge {
         id,
         expected: GraphExpectation::Any,
         resource,
+    }
+}
+
+fn expectation_key(expectation: GraphExpectation) -> u8 {
+    match expectation {
+        GraphExpectation::Any => 0,
+        GraphExpectation::Exact(object_type) => object_type as u8,
+        GraphExpectation::TreeEntry => u8::MAX,
+    }
+}
+
+/// Bounded queue of distinct `(ObjectId, expected type)` graph constraints.
+///
+/// Repeated edges do not consume work, while incompatible expectations for
+/// one ObjectId remain independent constraints and are all verified.
+#[derive(Debug, Default)]
+pub struct GraphWorkQueue {
+    queue: VecDeque<GraphEdge>,
+    scheduled: HashSet<(ObjectId, u8)>,
+    scheduled_ids: HashSet<ObjectId>,
+}
+
+impl GraphWorkQueue {
+    pub fn schedule(&mut self, edge: GraphEdge) -> Result<bool> {
+        let constraint = (edge.id, expectation_key(edge.expected));
+        if self.scheduled.contains(&constraint) {
+            return Ok(false);
+        }
+        if !self.scheduled_ids.contains(&edge.id)
+            && self.scheduled_ids.len() >= MAX_GRAPH_OBJECTS
+        {
+            return Err(Error::Corrupt(format!(
+                "object graph exceeded {MAX_GRAPH_OBJECTS} objects"
+            )));
+        }
+        self.scheduled.insert(constraint);
+        self.scheduled_ids.insert(edge.id);
+        self.queue.push_back(edge);
+        Ok(true)
+    }
+
+    pub fn pop_front(&mut self) -> Option<GraphEdge> {
+        self.queue.pop_front()
     }
 }
 
@@ -193,25 +253,22 @@ impl Store {
         root: ObjectId,
         expected: ObjectType,
     ) -> Result<Vec<VerifiedGraphObject>> {
-        let mut queue = VecDeque::from([(
+        let mut queue = GraphWorkQueue::default();
+        queue.schedule(exact(
             root,
-            GraphExpectation::Exact(expected),
+            expected,
             format!("root:{root}"),
-        )]);
+        ))?;
         let mut verified = HashMap::new();
-        let mut edge_count = 0usize;
 
-        while let Some((id, expectation, resource)) = queue.pop_front() {
-            edge_count = edge_count
-                .checked_add(1)
-                .ok_or_else(|| Error::Corrupt("object graph edge count overflow".into()))?;
-            if edge_count > MAX_GRAPH_EDGES {
-                return Err(Error::Corrupt(format!(
-                    "object graph exceeded {MAX_GRAPH_EDGES} edges"
-                )));
-            }
+        while let Some(edge) = queue.pop_front() {
+            let GraphEdge {
+                id,
+                expected,
+                resource,
+            } = edge;
             if let Some(actual) = verified.get(&id).copied() {
-                expectation.verify(actual, id, &resource)?;
+                expected.verify(actual, id, &resource)?;
                 continue;
             }
             if verified.len() >= MAX_GRAPH_OBJECTS {
@@ -222,14 +279,11 @@ impl Store {
 
             let bytes = self.get_raw_verified(id)?;
             let decoded = decode_graph_object(id, &bytes)?;
-            expectation.verify(decoded.object_type, id, &resource)?;
+            expected.verify(decoded.object_type, id, &resource)?;
             verified.insert(id, decoded.object_type);
-            queue.extend(
-                decoded
-                    .edges
-                    .into_iter()
-                    .map(|edge| (edge.id, edge.expected, edge.resource)),
-            );
+            for edge in decoded.edges {
+                queue.schedule(edge)?;
+            }
         }
 
         let mut objects = verified
@@ -238,5 +292,28 @@ impl Store {
             .collect::<Vec<_>>();
         objects.sort_by_key(|object| object.id);
         Ok(objects)
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_edges_cost_one_constraint_but_conflicting_types_are_preserved() {
+        let id = ObjectId([7; 32]);
+        let mut queue = GraphWorkQueue::default();
+        for n in 0..100_000 {
+            queue
+                .schedule(exact(id, ObjectType::Blob, format!("read:{n}")))
+                .unwrap();
+        }
+        queue
+            .schedule(exact(id, ObjectType::Tree, "conflicting-edge".into()))
+            .unwrap();
+
+        assert_eq!(queue.scheduled_ids.len(), 1);
+        assert_eq!(queue.scheduled.len(), 2);
+        assert_eq!(queue.queue.len(), 2);
     }
 }

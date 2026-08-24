@@ -7,8 +7,8 @@ mod metrics;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use graph::{
-    decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, VerifiedGraphObject,
-    MAX_GRAPH_OBJECTS,
+    decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, GraphWorkQueue,
+    VerifiedGraphObject, MAX_GRAPH_OBJECTS,
 };
 pub use meta::{
     sanitize_agent, CatalogAudit, CatalogObjectExpectation, CheckpointResult, DurabilityPolicy,

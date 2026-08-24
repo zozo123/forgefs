@@ -24,12 +24,12 @@ cap         (operation, resource); attenuation ⊆ parent
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Reads through a session resolve against that base and its overlay, never a live ref another agent can move. Checkin CASes that oid, never a moving head. |
 | I9 | Reads record path→oid. Stale observations fail checkin even on disjoint writes. |
-| I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. A seal's signed provenance manifest includes every Contribution reachable from its commit and binds the entry to the receipt's immutable agent. |
+| I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. Every current-version seal manifest includes each Contribution reachable from its commit and binds the entry to the receipt's immutable agent. |
 | I11 | Overlap is a Conflict object. |
 | I12 | Merge order comes only from the commit parent DAG and real merge-bases. `Commit.ts` and `Contribution.ts` are advisory metadata, never causal order. |
 | I13 | Authority(c+d) ⊆ Authority(c). Holder attenuates without the root secret. |
 | I14 | No ambient root. Namespace ID is not a capability. |
-| I15 | verify/fsck reread durable bytes and this forge's seal key. Seal verification proves the exact content-and-Contribution provenance scope; missing, extra, malformed, or wrongly typed edges fail closed. |
+| I15 | verify/fsck reread durable bytes and this forge's seal key. Seal verification proves the exact provenance scope for its manifest version; the legacy content-only shape remains readable but still triggers a complete typed Contribution-graph walk. Missing, extra, malformed, or wrongly typed edges fail closed. |
 | I16 | Tree names are exact UTF-8 bytes: no Unicode normalization or case folding occurs in core identity. |
 | I17 | Repository VERSION gates immutable decoding and is independent of SQLite schema version. Unknown future values fail closed; metadata migrations never rewrite objects or ObjectIds. |
 | I18 | A refused checkin never destroys staged work. A losing CAS forks the completed contribution and retargets the session to it; no failure path silently discards work. |

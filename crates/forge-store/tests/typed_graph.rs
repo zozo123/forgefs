@@ -62,15 +62,18 @@ fn verified_commit_graph_follows_and_type_checks_contributions() {
         })
         .unwrap();
     let read = store.put_blob_data(b"observed").unwrap();
+    let repeated_reads = (0..128)
+        .map(|n| ContributionRead {
+            path: format!("/observed/{n:03}"),
+            id: read,
+        })
+        .collect();
     let contribution = store
         .put_contribution(&Contribution {
             base,
             tree,
             parents: vec![base],
-            reads: vec![ContributionRead {
-                path: "/observed".into(),
-                id: read,
-            }],
+            reads: repeated_reads,
             writes: vec!["/result".into()],
             agent: "agent".into(),
             ts: 2,
@@ -94,9 +97,13 @@ fn verified_commit_graph_follows_and_type_checks_contributions() {
     assert!(graph.iter().any(|object| {
         object.id == contribution && object.object_type == ObjectType::Contribution
     }));
-    assert!(graph
-        .iter()
-        .any(|object| object.id == read && object.object_type == ObjectType::Blob));
+    assert_eq!(
+        graph
+            .iter()
+            .filter(|object| object.id == read && object.object_type == ObjectType::Blob)
+            .count(),
+        1
+    );
 
     let malformed = store
         .put_contribution(&Contribution {
