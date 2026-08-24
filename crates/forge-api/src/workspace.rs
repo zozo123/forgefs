@@ -286,6 +286,7 @@ impl Forge {
         let intro_oids = self
             .store
             .collect_intros(Some(base_commit.tree), new_tree)?;
+        crate::test_hooks::process_barrier("FORGEFS_TEST_CHECKIN_CAS_BARRIER", 2, "checkin CAS")?;
         let result = self.store.meta.cas_ref_session(
             &ref_name,
             pin,

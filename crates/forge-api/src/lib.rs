@@ -10,6 +10,7 @@ mod refs;
 mod repository;
 mod serve;
 mod soak;
+mod test_hooks;
 mod workspace;
 
 pub use bench::{
