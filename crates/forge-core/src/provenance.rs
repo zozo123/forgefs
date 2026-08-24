@@ -106,8 +106,7 @@ fn decode_entries(reader: &mut Reader<'_>) -> Result<BTreeMap<ObjectId, String>>
     let mut entries = BTreeMap::new();
     let mut last = None;
     for _ in 0..count {
-        let encoded_id =
-            reader.text_map_key_bounded(&mut last, 64, "provenance object id")?;
+        let encoded_id = reader.text_map_key_bounded(&mut last, 64, "provenance object id")?;
         if encoded_id.len() != 64 {
             return Err(Error::Corrupt("provenance object id length".into()));
         }
@@ -118,8 +117,7 @@ fn decode_entries(reader: &mut Reader<'_>) -> Result<BTreeMap<ObjectId, String>>
                 "provenance object ids must be lowercase hex".into(),
             ));
         }
-        let agent =
-            reader.text_bounded(MAX_LABEL_BYTES, "provenance attribution label")?;
+        let agent = reader.text_bounded(MAX_LABEL_BYTES, "provenance attribution label")?;
         if entries.insert(id, agent).is_some() {
             return Err(Error::Corrupt("duplicate provenance object id".into()));
         }
@@ -156,11 +154,7 @@ pub struct ProvenanceManifest {
 
 impl ProvenanceManifest {
     pub fn new(entries: BTreeMap<ObjectId, String>) -> Result<Self> {
-        validate_manifest(
-            &entries,
-            ProvenanceEncoding::Version1,
-            MAX_SERIALIZED_BYTES,
-        )?;
+        validate_manifest(&entries, ProvenanceEncoding::Version1, MAX_SERIALIZED_BYTES)?;
         Ok(Self {
             entries,
             encoding: ProvenanceEncoding::Version1,
@@ -221,11 +215,7 @@ impl ProvenanceManifest {
             let mut version = None;
             let mut last = None;
             for _ in 0..fields {
-                let key = reader.text_map_key_bounded(
-                    &mut last,
-                    32,
-                    "provenance envelope key",
-                )?;
+                let key = reader.text_map_key_bounded(&mut last, 32, "provenance envelope key")?;
                 match key.as_str() {
                     "entries" => entries = Some(decode_entries(&mut reader)?),
                     "version" => version = Some(reader.u64()?),

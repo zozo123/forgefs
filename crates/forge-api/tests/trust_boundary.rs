@@ -299,13 +299,7 @@ fn legacy_content_only_seal_with_contribution_history_remains_verifiable() {
     let legacy_oid = store.put_snapshot(&legacy).unwrap();
     store
         .meta
-        .commit_seal(
-            &legacy.tag,
-            legacy_oid,
-            legacy.commit,
-            legacy.tree,
-            "test",
-        )
+        .commit_seal(&legacy.tag, legacy_oid, legacy.commit, legacy.tree, "test")
         .unwrap();
 
     assert_eq!(f.verify_tag(&root, &legacy.tag).unwrap(), legacy_oid);

@@ -83,5 +83,7 @@ fn provenance_manifest_rejects_unknown_envelope_versions() {
     );
 
     let error = ProvenanceManifest::decode(&encoded).unwrap_err();
-    assert!(error.to_string().contains("unsupported provenance version 2"));
+    assert!(error
+        .to_string()
+        .contains("unsupported provenance version 2"));
 }

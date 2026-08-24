@@ -104,9 +104,7 @@ impl GraphWorkQueue {
         if self.scheduled.contains(&constraint) {
             return Ok(false);
         }
-        if !self.scheduled_ids.contains(&edge.id)
-            && self.scheduled_ids.len() >= MAX_GRAPH_OBJECTS
-        {
+        if !self.scheduled_ids.contains(&edge.id) && self.scheduled_ids.len() >= MAX_GRAPH_OBJECTS {
             return Err(Error::Corrupt(format!(
                 "object graph exceeded {MAX_GRAPH_OBJECTS} objects"
             )));
@@ -254,11 +252,7 @@ impl Store {
         expected: ObjectType,
     ) -> Result<Vec<VerifiedGraphObject>> {
         let mut queue = GraphWorkQueue::default();
-        queue.schedule(exact(
-            root,
-            expected,
-            format!("root:{root}"),
-        ))?;
+        queue.schedule(exact(root, expected, format!("root:{root}")))?;
         let mut verified = HashMap::new();
 
         while let Some(edge) = queue.pop_front() {
