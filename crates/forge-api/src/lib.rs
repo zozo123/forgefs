@@ -59,6 +59,9 @@ pub struct Forge {
     _cell_lock: Option<File>,
     exclusive_cell_lock: bool,
     read_only: bool,
+    // True only when open deferred migration-ledger compatibility to full
+    // fsck. The fsck call must use matching full mode or fail closed.
+    fsck_catalog: bool,
 }
 
 impl Forge {

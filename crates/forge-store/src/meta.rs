@@ -1,8 +1,9 @@
 use crate::metrics::TimingCounter;
 use forge_core::now_ms;
-use forge_types::{CasResult, Error, ObjectId, RefRow, Result};
+use forge_types::{CasResult, Error, ObjectId, ObjectType, RefRow, Result};
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -99,6 +100,45 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 
+const REFS_COLUMNS: &[&str] = &["name", "oid", "kind", "protected", "sealed", "updated_ms"];
+const REFS_VALUES: &str = "typeof(name)='text' AND typeof(oid)='blob' \
+    AND typeof(kind)='text' AND typeof(protected)='integer' AND protected IN (0,1) \
+    AND typeof(sealed)='integer' AND sealed IN (0,1) AND typeof(updated_ms)='integer'";
+const REFLOG_COLUMNS: &[&str] = &[
+    "id", "name", "old_oid", "new_oid", "agent_id", "reason", "ts_ms",
+];
+const REFLOG_VALUES: &str = "typeof(id)='integer' AND typeof(name)='text' \
+    AND typeof(old_oid) IN ('null','blob') AND typeof(new_oid)='blob' \
+    AND typeof(agent_id)='text' AND typeof(reason)='text' AND typeof(ts_ms)='integer'";
+const NAMESPACE_COLUMNS: &[&str] = &["id", "agent_id", "created_ms", "pinned_oid", "live_ref"];
+const NAMESPACE_VALUES: &str = "typeof(id)='text' AND typeof(agent_id)='text' \
+    AND typeof(created_ms)='integer' AND typeof(pinned_oid) IN ('null','blob') \
+    AND typeof(live_ref) IN ('null','text')";
+const OBSERVATION_COLUMNS: &[&str] = &["ns_id", "mount", "path", "oid"];
+const OBSERVATION_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' \
+    AND typeof(path)='text' AND typeof(oid)='blob'";
+const MOUNT_COLUMNS: &[&str] = &["ns_id", "path", "spec", "mode"];
+const MOUNT_VALUES: &str = "typeof(ns_id)='text' AND typeof(path)='text' \
+    AND typeof(spec)='text' AND typeof(mode)='text' AND mode IN ('ro','rw')";
+const OVERLAY_COLUMNS: &[&str] = &["ns_id", "mount", "path", "blob_oid", "exec"];
+const OVERLAY_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' \
+    AND typeof(path)='text' AND typeof(blob_oid) IN ('null','blob') \
+    AND typeof(exec)='integer' AND exec IN (0,1)";
+const SEAL_COLUMNS: &[&str] = &["tag", "snap_oid", "commit_oid", "tree_oid", "ts_ms"];
+const SEAL_VALUES: &str = "typeof(tag)='text' AND typeof(snap_oid)='blob' \
+    AND typeof(commit_oid)='blob' AND typeof(tree_oid)='blob' AND typeof(ts_ms)='integer'";
+const LANDMARK_COLUMNS: &[&str] = &["oid", "kind", "reason", "ts_ms"];
+const LANDMARK_VALUES: &str = "typeof(oid)='blob' AND typeof(kind)='text' \
+    AND typeof(reason)='text' AND typeof(ts_ms)='integer'";
+const INTRO_COLUMNS: &[&str] = &["oid", "commit_oid", "agent_id", "ts_ms"];
+const INTRO_VALUES: &str = "typeof(oid)='blob' AND typeof(commit_oid)='blob' \
+    AND typeof(agent_id)='text' AND typeof(ts_ms)='integer'";
+const CAP_ROOT_COLUMNS: &[&str] = &["id", "hmac_key", "seal_pub"];
+const CAP_ROOT_VALUES: &str = "typeof(id)='integer' AND id=1 AND typeof(hmac_key)='blob' \
+    AND length(hmac_key)=0 AND typeof(seal_pub)='blob'";
+const MIGRATION_COLUMNS: &[&str] = &["version", "applied_ms"];
+const MIGRATION_VALUES: &str = "typeof(version)='integer' AND typeof(applied_ms)='integer'";
+
 #[derive(Clone, Debug)]
 pub struct MountRow {
     pub path: String,
@@ -126,6 +166,73 @@ pub struct ObservationRow {
     pub mount: String,
     pub path: String,
     pub oid: ObjectId,
+}
+
+/// One deterministic defect in the mutable SQLite catalog. The API layer maps
+/// these directly into fsck findings; keeping the checks here gives the
+/// catalog a single invariant owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogFinding {
+    pub code: String,
+    pub resource: String,
+    pub detail: String,
+}
+
+/// Type constraint for an object ID held by the mutable catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogObjectExpectation {
+    Any,
+    Exact(ObjectType),
+    /// `object_intro.oid` records values introduced by a tree transition, so
+    /// only tree and blob objects are valid there.
+    TreeEntry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogObjectRoot {
+    pub oid: ObjectId,
+    pub expected: CatalogObjectExpectation,
+    pub resource: String,
+}
+
+/// Valid rows captured by the catalog audit's single read transaction. Full
+/// fsck consumes these instead of re-reading mutable tables through strict
+/// production accessors after the snapshot has ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogNamespaceRow {
+    pub id: String,
+    pub pinned_oid: Option<ObjectId>,
+    pub live_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogMountRow {
+    pub ns_id: String,
+    pub path: String,
+    pub spec: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealRow {
+    pub tag: String,
+    pub snap_oid: ObjectId,
+    pub commit_oid: ObjectId,
+    pub tree_oid: ObjectId,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatalogAudit {
+    pub findings: Vec<CatalogFinding>,
+    pub roots: Vec<CatalogObjectRoot>,
+    pub seals: Vec<SealRow>,
+    pub refs: Vec<RefRow>,
+    /// Every refs row was decoded, including its object ID. Consumers may
+    /// diagnose absent ref targets only when this is true; otherwise absence
+    /// from `refs` means "unreadable row", not "missing relation".
+    pub refs_complete: bool,
+    pub namespaces: Vec<CatalogNamespaceRow>,
+    pub mounts: Vec<CatalogMountRow>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -322,6 +429,9 @@ fn map_sql(e: rusqlite::Error) -> Error {
         return match inner.code {
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Error::Busy(text),
             ErrorCode::ConstraintViolation => Error::Invalid(text),
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                Error::Corrupt(format!("metadata catalog: {text}"))
+            }
             // A read-only open sets `query_only`, so SQLite itself refuses every
             // write on that connection. Report the refusal as denied authority
             // (exit 1) rather than as an internal SQLite fault (exit 5): the
@@ -559,6 +669,193 @@ fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn catalog_object_type(kind: &str) -> Option<ObjectType> {
+    match kind {
+        "blob" => Some(ObjectType::Blob),
+        "tree" => Some(ObjectType::Tree),
+        "commit" => Some(ObjectType::Commit),
+        "conflict" => Some(ObjectType::Conflict),
+        "snapshot" => Some(ObjectType::Snapshot),
+        "contribution" => Some(ObjectType::Contribution),
+        _ => None,
+    }
+}
+
+fn catalog_ref_type(kind: &str) -> Option<ObjectType> {
+    match kind {
+        "tree" => Some(ObjectType::Tree),
+        "commit" => Some(ObjectType::Commit),
+        "conflict" => Some(ObjectType::Conflict),
+        "snapshot" => Some(ObjectType::Snapshot),
+        _ => None,
+    }
+}
+
+impl CatalogAudit {
+    fn finding(&mut self, code: &str, resource: impl Into<String>, detail: impl Into<String>) {
+        self.findings.push(CatalogFinding {
+            code: code.to_string(),
+            resource: resource.into(),
+            detail: detail.into(),
+        });
+    }
+
+    fn oid(&mut self, bytes: Vec<u8>, resource: &str, field: &str) -> Option<ObjectId> {
+        match oid_from_blob(bytes) {
+            Ok(oid) => Some(oid),
+            Err(error) => {
+                self.finding(
+                    "CATALOG_OID",
+                    resource,
+                    format!("{field} is not a 32-byte object ID: {error}"),
+                );
+                None
+            }
+        }
+    }
+
+    fn root(
+        &mut self,
+        oid: ObjectId,
+        expected: CatalogObjectExpectation,
+        resource: impl Into<String>,
+    ) {
+        self.roots.push(CatalogObjectRoot {
+            oid,
+            expected,
+            resource: resource.into(),
+        });
+    }
+
+    fn finish(&mut self) {
+        self.findings.sort_by(|a, b| {
+            (&a.code, &a.resource, &a.detail).cmp(&(&b.code, &b.resource, &b.detail))
+        });
+        self.findings.dedup();
+        self.roots.sort_by(|a, b| a.resource.cmp(&b.resource));
+        self.seals.sort_by(|a, b| a.tag.cmp(&b.tag));
+        self.refs.sort_by(|a, b| a.name.cmp(&b.name));
+        self.namespaces.sort_by(|a, b| a.id.cmp(&b.id));
+        self.mounts
+            .sort_by(|a, b| (&a.ns_id, &a.path).cmp(&(&b.ns_id, &b.path)));
+    }
+}
+
+/// Prove that a table still has the V1 columns and SQLite storage classes
+/// expected by ForgeFS before any typed row decoding happens. SQLite tables are
+/// intentionally not STRICT in VERSION 1, so `PRAGMA integrity_check` alone
+/// does not reject values such as `refs.protected='corrupt'`.
+fn audit_table_shape(
+    tx: &rusqlite::Transaction<'_>,
+    audit: &mut CatalogAudit,
+    table: &str,
+    expected_columns: &[&str],
+    valid_values: &str,
+    schema_code: &str,
+) -> bool {
+    let pragma = format!("PRAGMA table_info('{table}')");
+    let mut stmt = match tx.prepare(&pragma) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            audit.finding(
+                schema_code,
+                format!("catalog:{table}"),
+                format!("cannot inspect table shape: {error}"),
+            );
+            return false;
+        }
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(1)) {
+        Ok(rows) => rows,
+        Err(error) => {
+            audit.finding(
+                schema_code,
+                format!("catalog:{table}"),
+                format!("cannot read table shape: {error}"),
+            );
+            return false;
+        }
+    };
+    let mut columns = Vec::new();
+    for row in rows {
+        match row {
+            Ok(column) => columns.push(column),
+            Err(error) => {
+                audit.finding(
+                    schema_code,
+                    format!("catalog:{table}"),
+                    format!("cannot decode table shape: {error}"),
+                );
+                return false;
+            }
+        }
+    }
+    let expected = expected_columns
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    if columns != expected {
+        audit.finding(
+            schema_code,
+            format!("catalog:{table}"),
+            format!("expected columns {expected:?}, found {columns:?}"),
+        );
+        return false;
+    }
+    drop(stmt);
+
+    let sql = format!("SELECT rowid FROM \"{table}\" WHERE NOT ({valid_values}) ORDER BY rowid");
+    let mut stmt = match tx.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            audit.finding(
+                schema_code,
+                format!("catalog:{table}"),
+                format!("cannot validate table values: {error}"),
+            );
+            return false;
+        }
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
+        Ok(rows) => rows,
+        Err(error) => {
+            audit.finding(
+                schema_code,
+                format!("catalog:{table}"),
+                format!("cannot scan table values: {error}"),
+            );
+            return false;
+        }
+    };
+    let value_code = if schema_code == "SCHEMA_LEDGER" {
+        schema_code
+    } else {
+        "CATALOG_VALUE"
+    };
+    let mut clean = true;
+    for row in rows {
+        match row {
+            Ok(rowid) => {
+                clean = false;
+                audit.finding(
+                    value_code,
+                    format!("catalog:{table}:row:{rowid}"),
+                    "row violates ForgeFS storage-class or value constraints",
+                );
+            }
+            Err(error) => {
+                clean = false;
+                audit.finding(
+                    value_code,
+                    format!("catalog:{table}"),
+                    format!("cannot decode invalid row identity: {error}"),
+                );
+            }
+        }
+    }
+    clean
+}
+
 impl Meta {
     pub fn stats(&self) -> MetaStats {
         let txn = self.stats.txn.snapshot();
@@ -584,6 +881,644 @@ impl Meta {
     /// the enforcement point.
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Audit every relation that makes mutable catalog rows trustworthy.
+    ///
+    /// All queries run inside one deferred read transaction. In WAL mode this
+    /// pins a single catalog snapshot without blocking writers, so a concurrent
+    /// checkin cannot manufacture a false fsck finding between two queries.
+    /// This method is detection-only and never repairs or normalizes rows.
+    pub fn audit_catalog(&self) -> Result<CatalogAudit> {
+        let mut conn = self.write.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sql)?;
+        let mut audit = CatalogAudit::default();
+
+        {
+            let mut stmt = tx.prepare("PRAGMA integrity_check").map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sql)?;
+            for row in rows {
+                let detail = row.map_err(map_sql)?;
+                if !detail.eq_ignore_ascii_case("ok") {
+                    audit.finding("CATALOG_INTEGRITY", "catalog:meta.sqlite", detail);
+                }
+            }
+        }
+
+        let migrations_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "schema_migrations",
+            MIGRATION_COLUMNS,
+            MIGRATION_VALUES,
+            "SCHEMA_LEDGER",
+        );
+        let refs_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "refs",
+            REFS_COLUMNS,
+            REFS_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let reflog_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "reflog",
+            REFLOG_COLUMNS,
+            REFLOG_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let namespaces_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "namespaces",
+            NAMESPACE_COLUMNS,
+            NAMESPACE_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let observations_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "observations",
+            OBSERVATION_COLUMNS,
+            OBSERVATION_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let mounts_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "mounts",
+            MOUNT_COLUMNS,
+            MOUNT_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let overlay_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "overlay",
+            OVERLAY_COLUMNS,
+            OVERLAY_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let seals_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "seals",
+            SEAL_COLUMNS,
+            SEAL_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let landmarks_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "landmarks",
+            LANDMARK_COLUMNS,
+            LANDMARK_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        let intros_clean = audit_table_shape(
+            &tx,
+            &mut audit,
+            "object_intro",
+            INTRO_COLUMNS,
+            INTRO_VALUES,
+            "CATALOG_SCHEMA",
+        );
+        audit_table_shape(
+            &tx,
+            &mut audit,
+            "cap_root",
+            CAP_ROOT_COLUMNS,
+            CAP_ROOT_VALUES,
+            "CATALOG_SCHEMA",
+        );
+
+        if migrations_clean {
+            let mut stmt = tx
+                .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(map_sql)?;
+            let mut versions = Vec::new();
+            for row in rows {
+                versions.push(row.map_err(map_sql)?);
+            }
+            let expected_versions = (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>();
+            if versions != expected_versions {
+                audit.finding(
+                    "SCHEMA_LEDGER",
+                    "catalog:schema_migrations",
+                    format!(
+                        "expected contiguous supported versions {expected_versions:?}, found {versions:?}"
+                    ),
+                );
+            }
+        }
+
+        let mut refs = BTreeMap::new();
+        let mut refs_relations_clean = refs_clean;
+        if refs_clean {
+            let mut stmt = tx
+                .prepare("SELECT name, oid, kind, protected, sealed FROM refs ORDER BY name")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (name, oid, kind, protected, sealed) = row.map_err(map_sql)?;
+                let protected = protected != 0;
+                let sealed = sealed != 0;
+                let resource = format!("catalog:ref:{name}");
+                if let Err(error) = validate_ref_kind(&name, &kind) {
+                    audit.finding("REF_KIND", &resource, error.to_string());
+                }
+                let expected = match catalog_ref_type(&kind) {
+                    Some(expected) => CatalogObjectExpectation::Exact(expected),
+                    None => {
+                        audit.finding("REF_KIND", &resource, format!("unknown ref kind {kind}"));
+                        CatalogObjectExpectation::Any
+                    }
+                };
+                if name.starts_with("tags/") && (!protected || !sealed || kind != "snapshot") {
+                    audit.finding(
+                        "TAG_FLAGS",
+                        &resource,
+                        "tag refs must be protected+sealed snapshots",
+                    );
+                }
+                if let Some(oid) = audit.oid(oid, &resource, "oid") {
+                    audit.root(oid, expected, format!("ref:{name}"));
+                    audit.refs.push(RefRow {
+                        name: name.clone(),
+                        oid,
+                        kind: kind.clone(),
+                        protected,
+                        sealed,
+                    });
+                    refs.insert(name, (oid, kind, protected, sealed));
+                } else {
+                    refs_relations_clean = false;
+                }
+            }
+        }
+        audit.refs_complete = refs_relations_clean;
+
+        if refs_relations_clean && reflog_clean {
+            let mut stmt = tx
+                .prepare("SELECT id, name, old_oid, new_oid, reason FROM reflog ORDER BY name, id")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            let mut reflog_rows = Vec::new();
+            let mut reflog_oids_clean = true;
+            for row in rows {
+                let (id, name, old_oid, new_oid, reason) = row.map_err(map_sql)?;
+                let resource = format!("catalog:reflog:{name}:{id}");
+                let old_oid = match old_oid {
+                    Some(oid) => match audit.oid(oid, &resource, "old_oid") {
+                        Some(oid) => Some(oid),
+                        None => {
+                            reflog_oids_clean = false;
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let Some(new_oid) = audit.oid(new_oid, &resource, "new_oid") else {
+                    reflog_oids_clean = false;
+                    continue;
+                };
+                reflog_rows.push((id, name, old_oid, new_oid, reason));
+            }
+
+            if reflog_oids_clean {
+                let mut reflog_names = BTreeSet::new();
+                let mut terminal_reflog = BTreeMap::new();
+                let mut previous_reflog = BTreeMap::new();
+                for (id, name, old_oid, new_oid, reason) in reflog_rows {
+                    reflog_names.insert(name.clone());
+                    let resource = format!("catalog:reflog:{name}:{id}");
+                    match previous_reflog.get(&name).copied() {
+                        Some(previous) if old_oid != Some(previous) => audit.finding(
+                            "REFLOG_CHAIN",
+                            &resource,
+                            format!(
+                                "old_oid {:?} does not equal previous new_oid {previous}",
+                                old_oid.map(|oid| oid.hex())
+                            ),
+                        ),
+                        None if old_oid.is_some() && reason != "fork" => audit.finding(
+                            "REFLOG_CHAIN",
+                            &resource,
+                            "first reflog row may have old_oid only when it creates a fork",
+                        ),
+                        _ => {}
+                    }
+                    previous_reflog.insert(name.clone(), new_oid);
+                    terminal_reflog.insert(name, new_oid);
+                }
+
+                for (name, (ref_oid, _, _, _)) in &refs {
+                    match terminal_reflog.get(name) {
+                        None => audit.finding(
+                            "REFLOG_MISSING",
+                            format!("catalog:ref:{name}"),
+                            "current ref has no reflog entry",
+                        ),
+                        Some(log_oid) if log_oid != ref_oid => audit.finding(
+                            "REFLOG_TERMINAL",
+                            format!("catalog:ref:{name}"),
+                            format!(
+                                "current ref is {ref_oid}, terminal reflog new_oid is {log_oid}"
+                            ),
+                        ),
+                        Some(_) => {}
+                    }
+                }
+                for name in reflog_names {
+                    if !refs.contains_key(&name) {
+                        audit.finding(
+                            "REFLOG_ORPHAN",
+                            format!("catalog:reflog:{name}"),
+                            "reflog name has no current ref",
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut namespace_ids = BTreeSet::new();
+        if namespaces_clean {
+            let mut stmt = tx
+                .prepare("SELECT id, pinned_oid, live_ref FROM namespaces ORDER BY id")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (id, pinned_oid, live_ref) = row.map_err(map_sql)?;
+                let resource = format!("catalog:namespace:{id}");
+                let pinned_oid = match pinned_oid {
+                    Some(oid) => audit.oid(oid, &resource, "pinned_oid"),
+                    None => {
+                        audit.finding("NS_PIN", &resource, "namespace has no pinned commit");
+                        None
+                    }
+                };
+                if let Some(oid) = pinned_oid {
+                    audit.root(
+                        oid,
+                        CatalogObjectExpectation::Exact(ObjectType::Commit),
+                        format!("namespace:{id}:pin"),
+                    );
+                }
+                if refs_relations_clean {
+                    if let Some(live) = &live_ref {
+                        match refs.get(live) {
+                            Some((_, kind, _, _)) if kind == "commit" => {}
+                            Some((_, kind, _, _)) => audit.finding(
+                                "NS_LIVE_TYPE",
+                                &resource,
+                                format!("live ref {live} is {kind}, expected commit"),
+                            ),
+                            None => audit.finding(
+                                "NS_LIVE_REF",
+                                &resource,
+                                format!("missing live ref {live}"),
+                            ),
+                        }
+                    }
+                }
+                namespace_ids.insert(id.clone());
+                audit.namespaces.push(CatalogNamespaceRow {
+                    id,
+                    pinned_oid,
+                    live_ref,
+                });
+            }
+        }
+
+        let mut mount_keys = BTreeSet::new();
+        if mounts_clean {
+            let mut stmt = tx
+                .prepare("SELECT ns_id, path, spec, mode FROM mounts ORDER BY ns_id, path")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (ns_id, path, spec, mode) = row.map_err(map_sql)?;
+                if namespaces_clean && !namespace_ids.contains(&ns_id) {
+                    audit.finding(
+                        "MOUNT_NAMESPACE",
+                        format!("catalog:mount:{ns_id}:{path}"),
+                        "mount refers to a missing namespace",
+                    );
+                }
+                mount_keys.insert((ns_id.clone(), path.clone()));
+                audit.mounts.push(CatalogMountRow {
+                    ns_id,
+                    path,
+                    spec,
+                    mode,
+                });
+            }
+        }
+
+        if observations_clean {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT ns_id, mount, path, oid FROM observations ORDER BY ns_id, mount, path",
+                )
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (ns_id, mount, path, oid) = row.map_err(map_sql)?;
+                let resource = format!("catalog:observation:{ns_id}:{mount}:{path}");
+                if namespaces_clean && !namespace_ids.contains(&ns_id) {
+                    audit.finding(
+                        "OBSERVATION_NAMESPACE",
+                        &resource,
+                        "observation refers to a missing namespace",
+                    );
+                } else if mounts_clean && !mount_keys.contains(&(ns_id.clone(), mount.clone())) {
+                    audit.finding(
+                        "OBSERVATION_MOUNT",
+                        &resource,
+                        "observation refers to a missing mount",
+                    );
+                }
+                if let Some(oid) = audit.oid(oid, &resource, "oid") {
+                    audit.root(
+                        oid,
+                        CatalogObjectExpectation::Exact(ObjectType::Blob),
+                        format!("namespace:{ns_id}:observation:{mount}:{path}"),
+                    );
+                }
+            }
+        }
+
+        if overlay_clean {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT ns_id, mount, path, blob_oid FROM overlay ORDER BY ns_id, mount, path",
+                )
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (ns_id, mount, path, blob_oid) = row.map_err(map_sql)?;
+                let resource = format!("catalog:overlay:{ns_id}:{mount}:{path}");
+                if namespaces_clean && !namespace_ids.contains(&ns_id) {
+                    audit.finding(
+                        "OVERLAY_NAMESPACE",
+                        &resource,
+                        "overlay refers to a missing namespace",
+                    );
+                } else if mounts_clean && !mount_keys.contains(&(ns_id.clone(), mount.clone())) {
+                    audit.finding(
+                        "OVERLAY_MOUNT",
+                        &resource,
+                        "overlay refers to a missing mount",
+                    );
+                }
+                if let Some(oid) = blob_oid.and_then(|oid| audit.oid(oid, &resource, "blob_oid")) {
+                    audit.root(
+                        oid,
+                        CatalogObjectExpectation::Exact(ObjectType::Blob),
+                        format!("namespace:{ns_id}:mount:{mount}:overlay:{path}"),
+                    );
+                }
+            }
+        }
+
+        let mut seal_tags = BTreeSet::new();
+        if seals_clean {
+            let mut stmt = tx
+                .prepare("SELECT tag, snap_oid, commit_oid, tree_oid FROM seals ORDER BY tag")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (tag, snap_oid, commit_oid, tree_oid) = row.map_err(map_sql)?;
+                seal_tags.insert(tag.clone());
+                let resource = format!("catalog:seal:{tag}");
+                let snap_oid = audit.oid(snap_oid, &resource, "snap_oid");
+                let commit_oid = audit.oid(commit_oid, &resource, "commit_oid");
+                let tree_oid = audit.oid(tree_oid, &resource, "tree_oid");
+                let (Some(snap_oid), Some(commit_oid), Some(tree_oid)) =
+                    (snap_oid, commit_oid, tree_oid)
+                else {
+                    continue;
+                };
+                audit.root(
+                    snap_oid,
+                    CatalogObjectExpectation::Exact(ObjectType::Snapshot),
+                    format!("{resource}:snapshot"),
+                );
+                audit.root(
+                    commit_oid,
+                    CatalogObjectExpectation::Exact(ObjectType::Commit),
+                    format!("{resource}:commit"),
+                );
+                audit.root(
+                    tree_oid,
+                    CatalogObjectExpectation::Exact(ObjectType::Tree),
+                    format!("{resource}:tree"),
+                );
+                audit.seals.push(SealRow {
+                    tag: tag.clone(),
+                    snap_oid,
+                    commit_oid,
+                    tree_oid,
+                });
+
+                if refs_relations_clean {
+                    let tag_ref = format!("tags/{tag}");
+                    match refs.get(&tag_ref) {
+                        None => audit.finding(
+                            "SEAL_TAG_REF",
+                            &resource,
+                            format!("missing sealed ref {tag_ref}"),
+                        ),
+                        Some((oid, kind, protected, sealed))
+                            if *oid != snap_oid
+                                || kind != "snapshot"
+                                || !*protected
+                                || !*sealed =>
+                        {
+                            audit.finding(
+                                "SEAL_TAG_REF",
+                                &resource,
+                                format!("{tag_ref} must be protected+sealed snapshot {snap_oid}"),
+                            )
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        if refs_relations_clean && seals_clean {
+            for name in refs.keys().filter(|name| name.starts_with("tags/")) {
+                let tag = name.trim_start_matches("tags/");
+                if !seal_tags.contains(tag) {
+                    audit.finding(
+                        "SEAL_ROW",
+                        format!("catalog:ref:{name}"),
+                        "sealed tag ref has no seals row",
+                    );
+                }
+            }
+        }
+
+        let mut landmarks = BTreeMap::new();
+        if landmarks_clean {
+            let mut stmt = tx
+                .prepare("SELECT oid, lower(hex(oid)), kind FROM landmarks ORDER BY oid")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (oid, hex, kind) = row.map_err(map_sql)?;
+                let resource = format!("catalog:landmark:{hex}");
+                let Some(oid) = audit.oid(oid, &resource, "oid") else {
+                    continue;
+                };
+                let expected = match catalog_object_type(&kind) {
+                    Some(expected) => CatalogObjectExpectation::Exact(expected),
+                    None => {
+                        audit.finding(
+                            "LANDMARK_KIND",
+                            &resource,
+                            format!("unknown landmark kind {kind}"),
+                        );
+                        CatalogObjectExpectation::Any
+                    }
+                };
+                audit.root(oid, expected, &resource);
+                landmarks.insert(oid, kind);
+            }
+        }
+
+        if seals_clean && landmarks_clean {
+            for seal in audit.seals.clone() {
+                let mut missing = Vec::new();
+                if landmarks.get(&seal.snap_oid).map(String::as_str) != Some("snapshot") {
+                    missing.push(format!("snapshot landmark {}", seal.snap_oid));
+                }
+                if landmarks.get(&seal.commit_oid).map(String::as_str) != Some("commit") {
+                    missing.push(format!("commit landmark {}", seal.commit_oid));
+                }
+                if !missing.is_empty() {
+                    audit.finding(
+                        "SEAL_LANDMARK",
+                        format!("catalog:seal:{}", seal.tag),
+                        format!("missing or mistyped {}", missing.join(" and ")),
+                    );
+                }
+            }
+        }
+
+        if intros_clean {
+            let mut stmt = tx
+                .prepare("SELECT oid, lower(hex(oid)), commit_oid FROM object_intro ORDER BY oid")
+                .map_err(map_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(map_sql)?;
+            for row in rows {
+                let (oid, hex, commit_oid) = row.map_err(map_sql)?;
+                let resource = format!("catalog:object_intro:{hex}");
+                if let Some(oid) = audit.oid(oid, &resource, "oid") {
+                    audit.root(oid, CatalogObjectExpectation::TreeEntry, &resource);
+                }
+                if let Some(commit_oid) = audit.oid(commit_oid, &resource, "commit_oid") {
+                    audit.root(
+                        commit_oid,
+                        CatalogObjectExpectation::Exact(ObjectType::Commit),
+                        format!("{resource}:commit"),
+                    );
+                }
+            }
+        }
+
+        tx.commit().map_err(map_sql)?;
+        audit.finish();
+        Ok(audit)
     }
 
     /// Complete a truncating WAL checkpoint through the same connection whose
@@ -767,6 +1702,18 @@ impl Meta {
     /// The durability pragmas are read and reported exactly as found. A
     /// read-only handle establishes no contract, so it must not fake one.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_read_only_mode(path, true)
+    }
+
+    /// Fsck must be able to inspect and report a damaged migration ledger
+    /// instead of refusing before the audit starts. This keeps every physical
+    /// read-only guarantee of `open_read_only`, but defers ledger compatibility
+    /// to `audit_catalog`. No other command may use this path.
+    pub fn open_read_only_for_fsck(path: &Path) -> Result<Self> {
+        Self::open_read_only_mode(path, false)
+    }
+
+    fn open_read_only_mode(path: &Path, enforce_current_ledger: bool) -> Result<Self> {
         // The wal-index hazard is not about writing, it is about whether SQLite
         // will MAP one. A read-only open of a WAL catalog on writable media
         // still creates and maps .forge/meta.sqlite-shm, so it can fault into an
@@ -800,13 +1747,15 @@ impl Meta {
             Err(error) => return Err(map_read_only_open(path, error)),
         };
 
-        let version = Self::compatible_schema_version(&conn)?;
-        if version < CURRENT_SCHEMA_VERSION {
-            // Migration is a write. Say so, instead of failing later inside an
-            // arbitrary query against a column this schema does not have.
-            return Err(Error::Invalid(format!(
-                "metadata schema version {version} needs migration to {CURRENT_SCHEMA_VERSION}, which a read-only open cannot perform"
-            )));
+        if enforce_current_ledger {
+            let version = Self::compatible_schema_version(&conn)?;
+            if version < CURRENT_SCHEMA_VERSION {
+                // Migration is a write. Say so, instead of failing later inside an
+                // arbitrary query against a column this schema does not have.
+                return Err(Error::Invalid(format!(
+                    "metadata schema version {version} needs migration to {CURRENT_SCHEMA_VERSION}, which a read-only open cannot perform"
+                )));
+            }
         }
         let durability = Self::observe_durability(&conn, true)?;
         Ok(Self {

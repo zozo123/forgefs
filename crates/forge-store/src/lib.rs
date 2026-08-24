@@ -6,8 +6,8 @@ mod metrics;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use meta::{
-    sanitize_agent, CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow,
-    OverlayRow, CURRENT_SCHEMA_VERSION,
+    sanitize_agent, CatalogAudit, CatalogObjectExpectation, CheckpointResult, DurabilityPolicy,
+    Meta, MetaStats, MountRow, NsRow, OverlayRow, CURRENT_SCHEMA_VERSION,
 };
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};
@@ -255,6 +255,20 @@ impl Store {
     pub fn open_read_only(root: &Path) -> Result<Self> {
         let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
         let meta = Meta::open_read_only(&root.join("meta.sqlite"))?;
+        Ok(Self {
+            blobs,
+            meta,
+            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
+            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        })
+    }
+
+    /// Detection-only open used by fsck. It is byte-for-byte read-only like
+    /// `open_read_only`, but lets the catalog auditor report a damaged schema
+    /// ledger rather than rejecting it before fsck can produce a finding.
+    pub fn open_read_only_for_fsck(root: &Path) -> Result<Self> {
+        let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
+        let meta = Meta::open_read_only_for_fsck(&root.join("meta.sqlite"))?;
         Ok(Self {
             blobs,
             meta,
