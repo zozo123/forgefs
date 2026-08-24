@@ -55,7 +55,9 @@ fn unchanged_vs_delete_still_resolves_to_the_same_deletion() {
     ] {
         match outcome {
             MergeOutcome::Tree(tree) => assert_eq!(tree, deleted),
-            MergeOutcome::Conflict(conflict) => panic!("unchanged-vs-delete must be clean: {conflict:?}"),
+            MergeOutcome::Conflict(conflict) => {
+                panic!("unchanged-vs-delete must be clean: {conflict:?}")
+            }
         }
     }
 }

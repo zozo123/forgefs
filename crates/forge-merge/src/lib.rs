@@ -179,7 +179,7 @@ fn merge_trees(
         match (pa, pb, pg) {
             (None, None, _) => {}
             (Some(x), None, g) => {
-                if g.map(|g| g.id) == Some(x.id) {
+                if g.is_some_and(|g| same_entry(g, x)) {
                     // deleted on theirs, unchanged ours → take delete
                 } else if g.is_none() {
                     out.push(x.clone());
@@ -193,7 +193,7 @@ fn merge_trees(
                 }
             }
             (None, Some(x), g) => {
-                if g.map(|g| g.id) == Some(x.id) {
+                if g.is_some_and(|g| same_entry(g, x)) {
                     // deleted on ours
                 } else if g.is_none() {
                     out.push(x.clone());
