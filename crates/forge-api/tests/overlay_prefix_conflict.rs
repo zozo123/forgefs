@@ -27,7 +27,9 @@ fn staged_descendant_then_file_is_rejected_and_descendant_survives() {
     let root = forge.root_cap().unwrap();
     let ns = forge.session_open(&root, "main").unwrap();
 
-    forge.write(&root, &ns, "/node/child", b"child", false).unwrap();
+    forge
+        .write(&root, &ns, "/node/child", b"child", false)
+        .unwrap();
     assert_invalid(forge.write(&root, &ns, "/node", b"parent", false));
     forge.checkin(&root, &ns, "/", "child only").unwrap();
 
