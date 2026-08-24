@@ -67,3 +67,9 @@ jobs:
         run: cargo +nightly fuzz run cap_token -- -max_total_time=60 -rss_limit_mb=2048
       - name: Protocol dispatch fuzz smoke
         run: cargo +nightly fuzz run protocol_frame -- -max_total_time=60 -rss_limit_mb=2048
+      - name: Tree name grammar fuzz smoke
+        run: cargo +nightly fuzz run tree_name -- -max_total_time=60 -rss_limit_mb=2048
+      - name: Ref name grammar fuzz smoke
+        run: cargo +nightly fuzz run ref_name -- -max_total_time=60 -rss_limit_mb=2048
+      - name: Tar export/import round trip fuzz smoke
+        run: cargo +nightly fuzz run tar_roundtrip -- -max_total_time=60 -rss_limit_mb=2048

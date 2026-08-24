@@ -11,8 +11,9 @@ pub use graph::{
     VerifiedGraphObject, MAX_GRAPH_OBJECTS,
 };
 pub use meta::{
-    sanitize_agent, CatalogAudit, CatalogObjectExpectation, CheckpointResult, DurabilityPolicy,
-    Meta, MetaStats, MountRow, NsRow, OverlayRow, CURRENT_SCHEMA_VERSION,
+    sanitize_agent, validate_ref_kind, validate_ref_name, CatalogAudit, CatalogObjectExpectation,
+    CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow, OverlayRow,
+    CURRENT_SCHEMA_VERSION,
 };
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};

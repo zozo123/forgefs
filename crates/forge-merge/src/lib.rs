@@ -226,8 +226,16 @@ fn merge_trees(
                     continue;
                 }
                 if x.kind == EntryKind::Tree && y.kind == EntryKind::Tree {
+                    // The base entry is a merge base for this subtree only if it
+                    // IS a subtree. When the base held a regular file here and
+                    // both sides replaced it with a directory, there is no
+                    // common subtree: merge from an empty base. Passing the blob
+                    // id down made the recursion read a blob as a tree and fail
+                    // the whole merge with Corrupt("not a tree") -- exit code 2,
+                    // "corrupt" -- on a healthy repository.
+                    let base_subtree = g.filter(|g| g.kind == EntryKind::Tree).map(|g| g.id);
                     let merged =
-                        merge_trees(store, &child_path, g.map(|g| g.id), x.id, y.id, conflicts)?;
+                        merge_trees(store, &child_path, base_subtree, x.id, y.id, conflicts)?;
                     let mut e = x.clone();
                     e.id = merged;
                     out.push(e);

@@ -14,7 +14,12 @@ forge-core = { path = "../crates/forge-core" }
 forge-cap = { path = "../crates/forge-cap" }
 forge-api = { path = "../crates/forge-api" }
 forge-protocol = { path = "../crates/forge-protocol" }
+forge-store = { path = "../crates/forge-store" }
+forge-types = { path = "../crates/forge-types" }
 serde_json = "1"
+# Already a production dependency of forge-api; the round-trip target needs the
+# reader side to extract what `forge export tar` wrote.
+tar = "0.4.41"
 
 [[bin]]
 name = "object_decode"
@@ -33,6 +38,27 @@ bench = false
 [[bin]]
 name = "protocol_frame"
 path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_name"
+path = "fuzz_targets/tree_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ref_name"
+path = "fuzz_targets/ref_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_roundtrip"
+path = "fuzz_targets/tar_roundtrip.rs"
 test = false
 doc = false
 bench = false
