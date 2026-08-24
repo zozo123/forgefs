@@ -73,3 +73,50 @@ fn refused_checkin_keeps_staged_work() {
         "a refused checkin discarded the overlay"
     );
 }
+
+#[test]
+fn i18_stale_observation_refusal_keeps_staged_work() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+
+    f.branch(&root, "main", "shared").unwrap();
+
+    // Seed shared with a value another session can observe.
+    let seed = f.session_open(&root, "shared").unwrap();
+    f.mount(&root, &seed, "/", "ref:shared", true).unwrap();
+    f.write(&root, &seed, "/a.txt", b"v0", false).unwrap();
+    assert!(matches!(
+        f.checkin(&root, &seed, "/", "seed").unwrap(),
+        CasResult::Updated { .. }
+    ));
+
+    // The session under test observes shared through a live read-only mount and
+    // stages unrelated work in its own read-write mount.
+    let session = f.session_open(&root, "shared").unwrap();
+    f.mount(&root, &session, "/live", "ref:shared", false)
+        .unwrap();
+    assert_eq!(f.read(&root, &session, "/live/a.txt").unwrap(), b"v0");
+    f.write(&root, &session, "/kept.txt", b"still staged", false)
+        .unwrap();
+
+    // Someone else moves shared, so the recorded observation can no longer hold.
+    let other = f.session_open(&root, "shared").unwrap();
+    f.mount(&root, &other, "/", "ref:shared", true).unwrap();
+    f.write(&root, &other, "/a.txt", b"v1", false).unwrap();
+    assert!(matches!(
+        f.checkin(&root, &other, "/", "advance").unwrap(),
+        CasResult::Updated { .. }
+    ));
+
+    let error = f
+        .checkin(&root, &session, "/", "stale read must refuse")
+        .unwrap_err();
+    assert!(matches!(error, Error::StaleObservation { .. }), "{error:?}");
+
+    // I18: this refusal publishes nothing, so it must leave the overlay intact.
+    let kept = f
+        .read(&root, &session, "/kept.txt")
+        .expect("a checkin refused for a stale observation discarded the overlay");
+    assert_eq!(kept, b"still staged");
+}
