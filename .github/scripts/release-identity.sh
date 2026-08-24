@@ -21,8 +21,12 @@ if [ "$REF_TYPE" = tag ]; then
   publish=true
   case "$tag" in *-*) prerelease=true ;; esac
 
-  # A tag is not a review. Its commit must already be reachable from main.
-  git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+  # A tag is not a review. checkout's authenticated full-history fetch must
+  # contain main, and the tagged commit must already be reachable from it.
+  if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+    echo "::error title=Missing main ref::checkout did not provide refs/remotes/origin/main"
+    exit 1
+  fi
   if ! git merge-base --is-ancestor "$COMMIT_SHA" refs/remotes/origin/main; then
     echo "::error title=Release commit is not on main::$COMMIT_SHA is not reachable from origin/main"
     exit 1

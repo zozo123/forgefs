@@ -10,10 +10,11 @@ The model is intentionally small:
 4. The release tag must exactly equal `v<workspace version>` and its commit must already be reachable from `origin/main`.
 5. Four target artifacts are built from that exact commit.
 6. All four target artifacts run the end-to-end ForgeFS release gate on their native hosted architecture, from the packaged binary rather than a rebuild.
-7. All binaries, BUILD-INFO files and gate evidence are assembled into one `release-payload` artifact.
-8. `SHA256SUMS` covers every file in that payload.
-9. The exact checksum manifest is attested.
-10. The publish job downloads only that immutable payload, re-verifies it, and hands exactly those files to `gh release create`.
+7. Release build, gate and audit jobs start without a shared compilation cache.
+8. All binaries, BUILD-INFO files and gate evidence are assembled into one `release-payload` artifact.
+9. `SHA256SUMS` covers every file in that payload.
+10. The exact checksum manifest is attested.
+11. The publish job downloads only that immutable payload, re-verifies it, and hands exactly those files to `gh release create`.
 
 No other workflow may create ForgeFS releases.
 
@@ -58,6 +59,7 @@ The workflow refuses publication unless all of the following are true:
 - Rust 1.89 MSRV check/tests pass;
 - `cargo audit` and `cargo deny` pass against the committed lockfile;
 - all four release targets build;
+- no release gate, audit or artifact build restores a shared Cargo/target cache;
 - every natively runnable packaged binary reports the expected version;
 - all four native target packages pass `scripts/release-gate.sh`;
 - the 36 non-manifest payload files exactly match the audited asset/evidence catalog, with no extra or non-regular entries;
