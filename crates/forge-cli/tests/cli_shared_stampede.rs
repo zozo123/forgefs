@@ -40,6 +40,14 @@ fn init(dir: &Path) -> PathBuf {
     dir.join(".forge/keys/root.cap")
 }
 
+fn fork_name(stdout: &str, requested: &str) -> Option<String> {
+    let mut fields = stdout.split_whitespace();
+    if fields.next()? != "forked" || fields.next()? != requested || fields.next()? != "->" {
+        return None;
+    }
+    fields.next().map(str::to_string)
+}
+
 #[test]
 fn cli_shared_ref_stampede_has_one_winner_and_seven_forks() {
     let d = tempdir().unwrap();
@@ -78,32 +86,34 @@ fn cli_shared_ref_stampede_has_one_winner_and_seven_forks() {
             .arg("--text")
             .arg(format!("writer-{i}"));
         run(&mut write);
-        sessions.push(ns);
+        sessions.push((i, ns));
     }
 
     let barrier = Arc::new(Barrier::new(WRITERS));
     let mut launchers = Vec::with_capacity(WRITERS);
-    for ns in sessions {
+    for (writer, ns) in sessions {
         let barrier = Arc::clone(&barrier);
         let dir = d.path().to_path_buf();
         let cap = root.clone();
         launchers.push(std::thread::spawn(move || {
             barrier.wait();
-            authenticated(&dir, &cap)
+            let output = authenticated(&dir, &cap)
                 .arg("checkin")
                 .arg("--ns")
                 .arg(&ns)
                 .arg("-m")
                 .arg("shared stampede")
                 .output()
-                .expect("spawn concurrent forge checkin")
+                .expect("spawn concurrent forge checkin");
+            (writer, ns, output)
         }));
     }
 
     let mut updated = 0;
     let mut forked = 0;
+    let mut completed = Vec::with_capacity(WRITERS);
     for launcher in launchers {
-        let out = launcher.join().unwrap();
+        let (writer, ns, out) = launcher.join().unwrap();
         assert!(
             out.status.success(),
             "checkin failed status={:?}\nstdout={}\nstderr={}",
@@ -114,11 +124,12 @@ fn cli_shared_ref_stampede_has_one_winner_and_seven_forks() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         if stdout.contains("updated heads/hot") {
             updated += 1;
-        } else if stdout.contains("forked heads/hot") {
+        } else if fork_name(&stdout, "heads/hot").is_some() {
             forked += 1;
         } else {
             panic!("unexpected checkin result: {stdout}");
         }
+        completed.push((writer, ns, stdout.into_owned()));
     }
 
     assert_eq!(updated, 1, "shared CAS must have exactly one winner");
@@ -127,6 +138,36 @@ fn cli_shared_ref_stampede_has_one_winner_and_seven_forks() {
         WRITERS - 1,
         "every loser must be preserved as a fork"
     );
+
+    // I18: a successful checkin transition clears the overlay only after its
+    // contribution is durably reachable. Prove every losing process retained
+    // its exact bytes both through the retargeted session and through a fresh
+    // session opened from the reported fork ref.
+    for (writer, ns, stdout) in &completed {
+        let Some(fork) = fork_name(stdout, "heads/hot") else {
+            continue;
+        };
+        let path = format!("/writer-{writer}.txt");
+        let expected = format!("writer-{writer}");
+
+        let mut read = authenticated(d.path(), &root);
+        read.arg("read").arg("--ns").arg(ns).arg(&path);
+        assert_eq!(run(&mut read), expected, "retargeted session lost {path}");
+
+        let mut open = authenticated(d.path(), &root);
+        open.arg("session")
+            .arg("open")
+            .arg(format!("--from={fork}"));
+        let fork_ns = run(&mut open).trim().to_string();
+
+        let mut read_fork = authenticated(d.path(), &root);
+        read_fork.arg("read").arg("--ns").arg(&fork_ns).arg(&path);
+        assert_eq!(
+            run(&mut read_fork),
+            expected,
+            "durable fork {fork} lost {path}"
+        );
+    }
 
     let mut refs = authenticated(d.path(), &root);
     refs.arg("refs");
