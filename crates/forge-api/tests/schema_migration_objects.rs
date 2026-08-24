@@ -112,5 +112,12 @@ fn migrating_the_catalog_never_rewrites_objects_or_object_ids() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(ledger, vec![forge_store::CURRENT_SCHEMA_VERSION]);
+    // The ledger is contiguous by design: every version stepped through is
+    // recorded, so a half-applied catalog (1 present, 2 absent) is
+    // distinguishable from one that reached the current shape. When there was
+    // only one schema version this was indistinguishable from "record the
+    // version reached"; asserting the full range keeps the check meaningful as
+    // versions accumulate.
+    let expected: Vec<i64> = (1..=forge_store::CURRENT_SCHEMA_VERSION).collect();
+    assert_eq!(ledger, expected);
 }
