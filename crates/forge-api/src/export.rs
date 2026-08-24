@@ -1,6 +1,8 @@
+use crate::Forge;
+use forge_cap::Cap;
 use forge_core::Tree;
 use forge_store::Store;
-use forge_types::{EntryKind, Error, ObjectId, Result};
+use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use std::fs::File;
 use std::path::Path;
 use tar::{Builder, Header};
@@ -89,4 +91,23 @@ fn write_tree(store: &Store, b: &mut Builder<File>, prefix: &str, tree: ObjectId
         }
     }
     Ok(())
+}
+
+impl Forge {
+    pub fn export_tar(&self, cap: &Cap, spec: &str, out: &Path) -> Result<()> {
+        self.check_spec_read(cap, spec)?;
+        crate::export::export_tar(&self.store, self.resolve_tree(spec)?, out)
+    }
+
+    pub(crate) fn resolve_tree(&self, spec: &str) -> Result<ObjectId> {
+        if let Ok((.., c)) = self.peel_commit(spec) {
+            return Ok(c.tree);
+        }
+        let oid = self.resolve_spec_oid(spec)?;
+        match self.store.object_type(oid)? {
+            ObjectType::Tree => Ok(oid),
+            ObjectType::Snapshot => Ok(self.store.get_snapshot(oid)?.tree),
+            _ => Err(Error::Invalid("cannot export".into())),
+        }
+    }
 }
