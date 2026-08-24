@@ -89,6 +89,13 @@ impl Forge {
         // created mid-scan on a repository whose bytes are entirely intact.
         // `late_ref` re-resolves those before they are reported as corruption.
         let mut report = FsckReport::new(full);
+        for path in crate::init_staging_siblings(self.root())? {
+            report.finding(
+                "INIT_STAGING",
+                format!("path:{}", path.display()),
+                "orphaned repository-initialization staging path; rerun `forge init` to reclaim it",
+            );
+        }
         let refs = self.store.meta.list_refs()?;
         report.checked_refs = refs.len();
         let mut ref_types = HashMap::new();

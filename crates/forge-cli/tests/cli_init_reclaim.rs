@@ -100,5 +100,8 @@ fn fsck_reports_reserved_init_staging_debris() {
     // reserved-prefix cleanup before reporting "already a forge".
     let retry = output(forge().arg("init").current_dir(d.path()));
     assert!(!retry.status.success());
-    assert!(!debris.exists(), "existing-cell init did not reclaim debris");
+    assert!(
+        !debris.exists(),
+        "existing-cell init did not reclaim debris"
+    );
 }
