@@ -227,6 +227,10 @@ pub struct CatalogAudit {
     pub roots: Vec<CatalogObjectRoot>,
     pub seals: Vec<SealRow>,
     pub refs: Vec<RefRow>,
+    /// Every refs row was decoded, including its object ID. Consumers may
+    /// diagnose absent ref targets only when this is true; otherwise absence
+    /// from `refs` means "unreadable row", not "missing relation".
+    pub refs_complete: bool,
     pub namespaces: Vec<CatalogNamespaceRow>,
     pub mounts: Vec<CatalogMountRow>,
 }
@@ -1071,6 +1075,7 @@ impl Meta {
                 }
             }
         }
+        audit.refs_complete = refs_relations_clean;
 
         if refs_relations_clean && reflog_clean {
             let mut stmt = tx
