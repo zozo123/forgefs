@@ -388,6 +388,7 @@ mod tests {
             durability: None,
             store: Some(BlobStoreStats {
                 puts: 2,
+                dedup_hits: 1,
                 fsync_file: 3,
                 fsync_file_us: 11,
                 fsync_dir: 4,
@@ -402,10 +403,13 @@ mod tests {
                 cas_updated: 7,
                 cas_forked: 1,
                 cas_denied: 0,
+                cas_noop: 0,
             }),
             api: Some(ApiStats {
                 stale_observation: 2,
                 merge_conflict: 3,
+                sessions_opened: 0,
+                merge_applied: 0,
             }),
         };
 

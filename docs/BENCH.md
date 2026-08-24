@@ -157,6 +157,14 @@ compared with one checkin's latency, or described as an average/p50/p99
 checkin cost. They include different phase populations, and concurrent phase
 durations can overlap.
 
+## Machine-readable counters
+
+`forge stats --json` emits the same process-lifetime counters as one stable
+JSON document; `CLI_ABI.md` owns its key set. It carries the identical scope
+boundary: those totals are cumulative for one process and never a per-checkin
+measurement. It is a counter surface, not a benchmark protocol -- a claim
+about ForgeFS performance still comes from this document, not from that one.
+
 ## Per-checkin cost mix: unavailable
 
 A true checkin mix remains follow-up instrumentation. It requires

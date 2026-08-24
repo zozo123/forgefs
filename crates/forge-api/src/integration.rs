@@ -99,7 +99,7 @@ impl Forge {
         };
         let cid = self.store.put_commit(&commit)?;
         let intro_oids = self.store.collect_intros(Some(ours_c.tree), tree)?;
-        self.store.meta.cas_ref_with_intros(
+        let result = self.store.meta.cas_ref_with_intros(
             into,
             into_row.oid,
             cid,
@@ -108,7 +108,9 @@ impl Forge {
             cap.agent_id(),
             into_row.protected,
             &intro_oids,
-        )
+        )?;
+        self.stats.merge_applied.fetch_add(1, Ordering::Relaxed);
+        Ok(result)
     }
 
     pub fn seal(&self, cap: &Cap, r#ref: &str, tag: &str) -> Result<ObjectId> {

@@ -10,6 +10,7 @@ mod refs;
 mod repository;
 mod serve;
 mod soak;
+mod stats;
 mod test_hooks;
 mod workspace;
 
@@ -21,6 +22,10 @@ pub use fsck::{FsckFinding, FsckReport};
 pub use repository::find_forge;
 pub use serve::{dispatch as dispatch_request, serve, unix_worker_count};
 pub use soak::{private_checkins_bounded, run_bench_with_workers, shared_stampede_bounded};
+pub use stats::{
+    ApiCounterReport, DurabilityReport, MetaCounterReport, StatsReport, StoreCounterReport,
+    STATS_SCHEMA_VERSION, STATS_SCOPE,
+};
 
 /// Stable fail-closed error for the legacy raw-tree merge resolution input.
 ///
@@ -40,12 +45,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ApiStats {
     pub stale_observation: u64,
     pub merge_conflict: u64,
+    /// I8 session pins established by `session_open`. A session is counted
+    /// once when its namespace row exists; it is never decremented on close,
+    /// because a process-lifetime counter has no close event to observe.
+    pub sessions_opened: u64,
+    /// Merges that produced a merge commit and reached the ref CAS. The CAS
+    /// outcome itself belongs to the SQLite `cas_*` counters; conflicts that
+    /// refused before any commit belong to `merge_conflict`.
+    pub merge_applied: u64,
 }
 
 #[derive(Debug, Default)]
 struct ApiCounters {
     stale_observation: AtomicU64,
     merge_conflict: AtomicU64,
+    sessions_opened: AtomicU64,
+    merge_applied: AtomicU64,
 }
 
 pub struct Forge {
@@ -70,6 +85,8 @@ impl Forge {
         ApiStats {
             stale_observation: self.stats.stale_observation.load(Ordering::Relaxed),
             merge_conflict: self.stats.merge_conflict.load(Ordering::Relaxed),
+            sessions_opened: self.stats.sessions_opened.load(Ordering::Relaxed),
+            merge_applied: self.stats.merge_applied.load(Ordering::Relaxed),
         }
     }
 }

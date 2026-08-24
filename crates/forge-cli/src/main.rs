@@ -144,6 +144,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report this process lifetime counters for objects, SQLite, ref CAS,
+    /// sessions and merges. Never a per-operation measurement.
+    Stats {
+        /// Emit the structured report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Timed concurrent checkin / shared-ref stampede / merge+seal+verify.
     Bench {
         /// New, dedicated benchmark workspace to preserve after the run.
@@ -537,6 +544,21 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
                     "fsck found {} problem(s)",
                     report.findings.len()
                 )));
+            }
+        }
+        // I14: no ambient authority. The counters name no object and no ref,
+        // but the command still runs behind a loaded capability so it cannot
+        // become an unauthenticated read of a repository durability policy.
+        Cmd::Stats { json } => {
+            let report = f.stats_report();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| Error::Internal(e.to_string()))?
+                );
+            } else {
+                print!("{}", report.render());
             }
         }
         Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Bench { .. } => unreachable!(),

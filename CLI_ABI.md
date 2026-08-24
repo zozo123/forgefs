@@ -50,3 +50,42 @@ writer half-updated. Refusing to enter the band is the only safe answer.
 `scripts/enospc-sigbus-probe.sh` reproduces and asserts this contract. It needs
 Linux, root and `mkfs.ext4`, so it is not part of `scripts/release-gate.sh`.
 
+## Structured metrics: `forge stats --json`
+
+`forge stats --json` writes exactly one JSON object to stdout and exits 0. It
+introduces no exit code: a missing capability, an unreadable repository, or a
+corrupt catalog are reported by the table above, unchanged.
+
+The document is:
+
+```
+schema_version   integer, currently 1
+scope            "process-lifetime"
+note             prose restating scope
+durability       journal_mode, synchronous, fullfsync, read_only
+store            puts, dedup_hits, fsync_file, fsync_file_us,
+                 fsync_dir, fsync_dir_us, barrier_us
+sqlite           txn_count, txn_us, lock_acquires, lock_wait_us, busy,
+                 cas_updated, cas_forked, cas_denied, cas_noop, accounted_us
+api              sessions_opened, stale_observation, merge_applied, merge_conflict
+```
+
+Stability rules for consumers:
+
+- Keys are added, never renamed or removed, while `schema_version` is 1. A
+  consumer must ignore keys it does not know.
+- Every counter is a non-negative integer. `barrier_us` and `accounted_us` are
+  saturating sums of the components printed beside them, not wall time.
+- **`scope` is the whole contract.** Every counter is a cumulative total for
+  the single process that ran the command, from its repository open until the
+  snapshot. It is not per-operation, not per-checkin, and not a benchmark. A
+  one-shot `forge stats` therefore reports little more than its own open; the
+  totals are meaningful for a long-lived embedder calling
+  `Forge::stats_report()`, and the per-checkin cost mix remains unavailable
+  (`docs/BENCH.md`).
+- Values are environment-dependent. Automation may assert the shape; it must
+  not assert amounts.
+
+`forge stats` without `--json` renders the same numbers for humans and is not
+part of this contract.
+
