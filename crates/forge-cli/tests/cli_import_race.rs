@@ -192,15 +192,27 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
     } else {
         "/only-right.txt"
     };
+    let winner_other = if winner_marker == b'L' {
+        "/only-right.txt"
+    } else {
+        "/only-left.txt"
+    };
     let loser_only = if loser_marker == b'L' {
         "/only-left.txt"
     } else {
         "/only-right.txt"
     };
+    let loser_other = if loser_marker == b'L' {
+        "/only-right.txt"
+    } else {
+        "/only-left.txt"
+    };
     let winner_ns = reopened.session_open(&cap, "heads/import").unwrap();
     let loser_ns = reopened.session_open(&cap, fork).unwrap();
     assert!(reopened.read(&cap, &winner_ns, winner_only).is_ok());
+    assert!(reopened.read(&cap, &winner_ns, winner_other).is_err());
     assert!(reopened.read(&cap, &loser_ns, loser_only).is_ok());
+    assert!(reopened.read(&cap, &loser_ns, loser_other).is_err());
 
     let report = reopened.fsck(&cap, true).unwrap();
     assert!(
