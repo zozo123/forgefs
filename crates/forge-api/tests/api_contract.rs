@@ -396,6 +396,7 @@ fn full_fsck_reports_a_damaged_schema_ledger() {
     assert!(Forge::open_read_only(dir.path()).is_err());
     assert!(Forge::open_for_fsck(dir.path(), false).is_err());
     let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
+    assert!(matches!(forge.fsck(&root, false), Err(Error::Invalid(_))));
     let report = forge.fsck(&root, true).unwrap();
     assert_eq!(
         finding_resources(&report, "SCHEMA_LEDGER"),
