@@ -1,3 +1,4 @@
+//! Process-level proof that double-checkin of one namespace has one live-ref winner.
 
 mod support;
 
