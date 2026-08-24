@@ -102,6 +102,34 @@ A Contribution (`0x06`) has an empty payload and the required header map:
 are strictly increasing and unique by raw UTF-8 bytes. Limits are 1024 parents,
 100,000 reads, 100,000 writes, 1024 agent bytes, and an 8 MiB encoded header.
 
+## Snapshot provenance manifest
+
+`Snapshot.prov` names a Blob whose current payload is the canonical CBOR map
+`{entries: {oid_hex: attribution}, version: 1}`. `oid_hex` is lowercase
+64-character ObjectId hex; an attribution is UTF-8 text of at most 1024 bytes.
+The entry map has at most 1,000,000 items and the complete canonical payload is
+at most 64 MiB. Its exact key set is the union of:
+
+- every Tree and Blob reachable from `Snapshot.tree`; and
+- every Contribution reachable from `Snapshot.commit` through the typed
+  immutable graph.
+
+Tree/Blob labels preserve the v1 first-introducer hint (or `unknown`). A
+Contribution label must equal that receipt's immutable `agent` field. Missing
+or additional keys, a mismatched Contribution agent, malformed/non-canonical
+CBOR, and a wrongly typed graph edge are corruption. The snapshot signature
+binds the manifest because `prov` is the Blob's ObjectId. This payload rule
+formalizes the existing VERSION 1 Snapshot field; it does not change any
+object framing or type encoding.
+
+Earlier ForgeFS builds wrote the entry map directly as the Blob payload and
+included only the sealed Tree/Blob closure. Readers identify that
+legacy shape unambiguously because its top-level keys are 64-character OIDs;
+they preserve its content-only verification semantics while still walking and
+type-checking the reachable Contribution graph. New seals always write the
+versioned envelope and must attest Contributions. Unknown envelope versions or
+fields fail closed.
+
 ## Metadata schema is a separate contract
 
 `meta.sqlite` is mutable and is not part of an ObjectId. Its

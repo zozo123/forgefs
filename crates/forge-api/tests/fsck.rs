@@ -144,6 +144,61 @@ fn contribution_read_edges_must_reference_blobs() {
 }
 
 #[test]
+fn repeated_contribution_read_edges_are_bounded_by_distinct_constraints() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+    let store = Store::open(&d.path().join(".forge")).unwrap();
+
+    let main = store.meta.get_ref("main").unwrap().unwrap();
+    let base = store.get_commit(main.oid).unwrap();
+    let observed = store.put_blob_data(b"same immutable input").unwrap();
+    let reads = (0..128)
+        .map(|n| ContributionRead {
+            path: format!("/observed/{n:03}"),
+            id: observed,
+        })
+        .collect();
+    let contribution = store
+        .put_contribution(&Contribution {
+            base: main.oid,
+            tree: base.tree,
+            parents: vec![main.oid],
+            reads,
+            writes: vec![],
+            agent: "test".into(),
+            ts: 1,
+        })
+        .unwrap();
+    let commit = store
+        .put_commit(&Commit {
+            tree: base.tree,
+            parents: vec![main.oid],
+            agent: "test".into(),
+            msg: "repeated contribution reads".into(),
+            ts: 2,
+            landmark: false,
+            contrib: Some(contribution),
+        })
+        .unwrap();
+    store
+        .meta
+        .insert_ref(
+            "heads/repeated-reads",
+            commit,
+            "commit",
+            false,
+            false,
+            "test",
+            "fsck-test",
+        )
+        .unwrap();
+
+    let report = f.fsck(&root, false).unwrap();
+    assert!(report.ok, "{:#?}", report.findings);
+}
+
+#[test]
 fn full_fsck_reports_malformed_orphan_layout() {
     let d = tempdir().unwrap();
     let f = Forge::init(d.path()).unwrap();

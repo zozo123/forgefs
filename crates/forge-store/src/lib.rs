@@ -1,10 +1,15 @@
 //! Local content-addressed objects + SQLite mutable surface.
 
 pub mod blob;
+mod graph;
 pub mod meta;
 mod metrics;
 
 pub use blob::{LocalBlobStore, PublishBatch};
+pub use graph::{
+    decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, GraphWorkQueue,
+    VerifiedGraphObject, MAX_GRAPH_OBJECTS,
+};
 pub use meta::{
     sanitize_agent, CatalogAudit, CatalogObjectExpectation, CheckpointResult, DurabilityPolicy,
     Meta, MetaStats, MountRow, NsRow, OverlayRow, CURRENT_SCHEMA_VERSION,
@@ -472,46 +477,11 @@ impl Store {
 
     /// Type-aware walk that fail-closes on decode errors (I15 / #35).
     pub fn reachable_oids_verified(&self, tree: ObjectId) -> Result<Vec<ObjectId>> {
-        let mut out = Vec::new();
-        let mut stack = vec![(tree, ObjectType::Tree)];
-        let mut seen = std::collections::HashSet::new();
-        while let Some((id, expected)) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let bytes = self.get_raw_verified(id)?;
-            let actual = decode_object_type(&bytes)?;
-            if actual != expected {
-                return Err(Error::Corrupt(format!(
-                    "typed edge expected {}, found {} at {id}",
-                    expected.as_str(),
-                    actual.as_str()
-                )));
-            }
-            out.push(id);
-            match actual {
-                ObjectType::Tree => {
-                    let t = Tree::decode(&bytes)?;
-                    for e in t.entries {
-                        let expected = match e.kind {
-                            EntryKind::Blob => ObjectType::Blob,
-                            EntryKind::Tree => ObjectType::Tree,
-                        };
-                        stack.push((e.id, expected));
-                    }
-                }
-                ObjectType::Blob => {
-                    Blob::decode(&bytes)?;
-                }
-                other => {
-                    return Err(Error::Corrupt(format!(
-                        "unexpected {} in tree walk at {id}",
-                        other.as_str()
-                    )));
-                }
-            }
-        }
-        Ok(out)
+        Ok(self
+            .reachable_graph_verified(tree, ObjectType::Tree)?
+            .into_iter()
+            .map(|object| object.id)
+            .collect())
     }
 }
 

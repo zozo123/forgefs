@@ -168,8 +168,18 @@ impl<'a> Reader<'a> {
 
     /// Map keys must be strictly increasing by **encoded** CBOR bytes (RFC 8949).
     pub fn text_map_key(&mut self, last: &mut Option<Vec<u8>>) -> Result<String> {
+        self.text_map_key_bounded(last, usize::MAX, "cbor map key")
+    }
+
+    /// Read one canonical text map key without allocating beyond `max_bytes`.
+    pub fn text_map_key_bounded(
+        &mut self,
+        last: &mut Option<Vec<u8>>,
+        max_bytes: usize,
+        what: &str,
+    ) -> Result<String> {
         let start = self.pos;
-        let k = self.text()?;
+        let k = self.text_bounded(max_bytes, what)?;
         let encoded = self.buf[start..self.pos].to_vec();
         if let Some(prev) = last.as_ref() {
             if encoded.as_slice() <= prev.as_slice() {
@@ -229,12 +239,20 @@ impl<'a> Reader<'a> {
     }
 
     pub fn text(&mut self) -> Result<String> {
+        self.text_bounded(usize::MAX, "text")
+    }
+
+    /// Read canonical UTF-8 text and reject an oversized value before copying.
+    pub fn text_bounded(&mut self, max_bytes: usize, what: &str) -> Result<String> {
         let (major, ai) = self.header()?;
         if major != 3 {
             return Err(Error::Corrupt("expected text".into()));
         }
         let raw = self.take_uint(ai)?;
         let n = self.bounded_len(raw, "text")?;
+        if n > max_bytes {
+            return Err(Error::Corrupt(format!("{what} exceeds byte limit")));
+        }
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).map_err(|_| Error::Corrupt("utf8".into()))
     }

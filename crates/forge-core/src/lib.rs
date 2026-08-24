@@ -3,12 +3,14 @@
 pub mod cbor;
 pub mod contribution;
 pub mod object;
+pub mod provenance;
 pub mod tree;
 
 pub use contribution::{Contribution, ContributionRead};
 pub use object::{
     decode_object_type, hash_bytes, parse_file, Blob, Commit, Conflict, ConflictPath, Snapshot,
 };
+pub use provenance::ProvenanceManifest;
 pub use tree::{apply_overlay, split_path, validate_name, Overlay, Tree, TreeEntry, TreeStore};
 
 use forge_types::{ObjectId, Result};
