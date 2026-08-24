@@ -242,6 +242,48 @@ version = "1.2.3"
             self.assertEqual(applied.returncode, 0, applied.stderr)
             self.assertIn('version = "1.2.4"', manifest.read_text(encoding="utf-8"))
 
+            subprocess.run(
+                ["git", "add", "Cargo.toml", "Cargo.lock"],
+                cwd=directory,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=release-test",
+                    "-c",
+                    "user.email=release-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "release",
+                ],
+                cwd=directory,
+                check=True,
+            )
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=directory, text=True
+            ).strip()
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/main", head],
+                cwd=directory,
+                check=True,
+            )
+            identity_output = directory / "identity-output"
+            identity = run(
+                "release-identity.sh",
+                cwd=directory,
+                environment={
+                    "REF_TYPE": "tag",
+                    "REF_NAME": "v1.2.4",
+                    "EVENT_NAME": "push",
+                    "COMMIT_SHA": head,
+                    "GITHUB_OUTPUT": str(identity_output),
+                },
+            )
+            self.assertEqual(identity.returncode, 0, identity.stderr)
+            self.assertIn("publish=true\n", identity_output.read_text(encoding="utf-8"))
+
     def test_assembly_and_verification_require_the_exact_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
