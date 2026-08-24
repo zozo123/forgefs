@@ -1,4 +1,3 @@
-//! Process-level proof that double-checkin of one namespace has one live-ref winner.
 
 mod support;
 
@@ -129,7 +128,8 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
         "one and only one live-ref update is allowed: {outputs:?}"
     );
     assert_eq!(
-        forks.len(), 1,
+        forks.len(),
+        1,
         "the synchronized CAS loser must be an explicit fork: {outputs:?}"
     );
     assert_eq!(
