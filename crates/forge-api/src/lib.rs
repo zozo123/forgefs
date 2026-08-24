@@ -75,6 +75,20 @@ pub struct Forge {
 impl Forge {
     pub fn init(dir: &Path) -> Result<Self> {
         let root = forge_root(dir);
+        let parent = root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        create_dir_all_durable(parent)?;
+
+        // Serialize initializers on the repository's parent directory itself:
+        // no persistent lock artifact is needed, and a crash releases the
+        // kernel lock. Once held, every matching sibling staging directory is
+        // from a previous failed initializer and can be reclaimed without
+        // racing another current ForgeFS initializer.
+        let _init_parent_lock = acquire_init_parent_lock(parent)?;
+        cleanup_init_staging_siblings(&root)?;
+
         if root.exists() {
             if root.join("VERSION").exists() {
                 validate_repo_version(&root)?;
@@ -91,11 +105,6 @@ impl Forge {
 
         // Build completely under a sibling name. Publication is one atomic,
         // no-replace rename; VERSION remains the validity marker written last.
-        let parent = root
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        create_dir_all_durable(parent)?;
         let base = root
             .file_name()
             .and_then(|name| name.to_str())
@@ -1578,6 +1587,81 @@ fn acquire_cell_lock(root: &Path, intent: LockIntent) -> Result<Option<File>> {
         } else {
             "forge daemon owns this cell; use the socket or stop forge serve".into()
         })),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn init_staging_siblings(root: &Path) -> Result<Vec<PathBuf>> {
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".forge");
+    let prefix = format!("{base}.init-");
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((pid, ulid)) = suffix.split_once('-') else {
+            continue;
+        };
+        if pid.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || ulid.parse::<ulid::Ulid>().is_err()
+        {
+            continue;
+        }
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn cleanup_init_staging_siblings(root: &Path) -> Result<()> {
+    let paths = init_staging_siblings(root)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    for path in &paths {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(Error::Invalid(format!(
+                "reserved ForgeFS init staging path is not a directory: {}",
+                path.display()
+            )));
+        }
+        fs::remove_dir_all(path)?;
+    }
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn acquire_init_parent_lock(parent: &Path) -> Result<File> {
+    let file = File::open(parent)?;
+    if !file.metadata()?.is_dir() {
+        return Err(Error::Invalid(format!(
+            "ForgeFS init parent is not a directory: {}",
+            parent.display()
+        )));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy(
+            "another ForgeFS initializer owns this directory".into(),
+        )),
         Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
 }
