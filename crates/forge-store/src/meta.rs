@@ -591,6 +591,10 @@ impl Meta {
     /// busy checkpoint in the result row rather than as an execution error, so
     /// treat partial completion as an explicit failure.
     pub fn checkpoint_truncate(&self) -> Result<CheckpointResult> {
+        // SQLite owns the VFS barriers inside this call. Bracket the operation
+        // so the state machine covers both "never started" and "completed but
+        // not acknowledged" failures without installing a production VFS.
+        crate::inject_barrier_failure(crate::DurabilityBarrier::MetadataCheckpointBefore)?;
         let conn = self.write.lock();
         let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -602,6 +606,7 @@ impl Meta {
                 "WAL checkpoint incomplete: busy={busy} log={log_frames} checkpointed={checkpointed_frames}"
             )));
         }
+        crate::inject_barrier_failure(crate::DurabilityBarrier::MetadataCheckpointAfter)?;
         Ok(CheckpointResult {
             log_frames,
             checkpointed_frames,
@@ -619,6 +624,11 @@ impl Meta {
     fn begin_tx<'a>(&self, conn: &'a mut Connection) -> Result<rusqlite::Transaction<'a>> {
         conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| self.map_sql_counted(error))
+    }
+
+    fn commit_ref_tx(&self, tx: rusqlite::Transaction<'_>) -> Result<()> {
+        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        crate::inject_barrier_failure(crate::DurabilityBarrier::MetadataRefCommitAfter)
     }
 
     fn txn_timer(&self) -> TxnTimer<'_> {
@@ -1008,7 +1018,7 @@ impl Meta {
                 params![name, new.as_bytes().as_slice(), agent_id, ts],
             )
             .map_err(|error| self.map_sql_counted(error))?;
-            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.commit_ref_tx(tx)?;
             txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
@@ -1059,7 +1069,7 @@ impl Meta {
                 ],
             )
             .map_err(|error| self.map_sql_counted(error))?;
-            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.commit_ref_tx(tx)?;
             txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
@@ -1092,7 +1102,7 @@ impl Meta {
             ],
         )
         .map_err(|error| self.map_sql_counted(error))?;
-        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        self.commit_ref_tx(tx)?;
         txn_timer.finish();
         self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
         Ok(CasResult::Forked {
@@ -1155,7 +1165,7 @@ impl Meta {
             )
             .map_err(|error| self.map_sql_counted(error))?;
             Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.commit_ref_tx(tx)?;
             txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
@@ -1207,7 +1217,7 @@ impl Meta {
             )
             .map_err(|error| self.map_sql_counted(error))?;
             Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-            tx.commit().map_err(|error| self.map_sql_counted(error))?;
+            self.commit_ref_tx(tx)?;
             txn_timer.finish();
             self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
             return Ok(CasResult::Updated {
@@ -1241,7 +1251,7 @@ impl Meta {
         )
         .map_err(|error| self.map_sql_counted(error))?;
         Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        self.commit_ref_tx(tx)?;
         txn_timer.finish();
         self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
         Ok(CasResult::Forked {
@@ -1375,7 +1385,7 @@ impl Meta {
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
             .map_err(|error| self.map_sql_counted(error))?;
         Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-        tx.commit().map_err(|error| self.map_sql_counted(error))?;
+        self.commit_ref_tx(tx)?;
         txn_timer.finish();
         match &result {
             CasResult::Updated { .. } => {

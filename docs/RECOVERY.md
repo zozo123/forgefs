@@ -56,6 +56,27 @@ A crash may leave durable but unreachable objects or temporary files. Those are 
 
 `forge fsck --full` is the end-to-end validator. If a referenced object cannot be read and rehashed, recovery has failed and ForgeFS reports corruption rather than inventing bytes or silently moving refs.
 
+## Executable fault matrix
+
+Debug/test builds expose an explicitly armed, thread-local fault seam at each
+durability transition. It has no environment trigger, global mutable plan, or
+process-exit behavior, and its state and branches are compiled out of release
+builds. The matrix covers failures of the real file and directory barriers as
+well as interruptions immediately after file sync, object linking, directory
+sync, and ref-transaction commit.
+
+Failures through the final object-directory barrier must leave refs unchanged.
+An interruption after the SQLite commit is different: the durable transaction
+may have advanced the ref even though the caller did not receive its result.
+That outcome is deliberately not rolled back or relabeled. A retry observes the
+committed session state as a no-op, and a cold reopen plus full fsck must find
+the exact committed ref and rehash its complete object graph.
+
+The same suite exercises init staging, key, cleanup, parent, publication, and
+cold-open publication barriers, orphan re-proof, and checkpoint bracketing.
+This is deterministic state-machine evidence, not a physical power-loss claim;
+real process-kill tests remain separate evidence for abrupt termination.
+
 ## Near-exhausted free space
 
 A filesystem that cannot allocate is an availability failure, not a durability

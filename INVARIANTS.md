@@ -44,7 +44,7 @@ not diluted into a mock:
 | Invariants | Production owner | Primary evidence |
 |---|---|---|
 | I1, I2, I10, I17 | `forge-core`, `forge-api/import.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `checkin_contribution.rs`, `bootstrap_contract.rs` |
-| I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `session_atomicity.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `docs/RECOVERY.md` |
+| I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `docs/RECOVERY.md` |
 | I5, I7, I8 | `forge-store/meta.rs`, `forge-api/workspace.rs`, `refs.rs` | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs` |
 | I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs` |

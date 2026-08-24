@@ -174,7 +174,11 @@ impl LocalBlobStore {
                 "existing object does not match its id: {id}"
             )));
         }
-        sync_file_counted(&file, &self.stats)?;
+        sync_file_counted(
+            &file,
+            &self.stats,
+            crate::DurabilityBarrier::ObjectExistingFile,
+        )?;
         Ok(())
     }
 
@@ -263,11 +267,13 @@ impl PublishBatch<'_> {
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(bytes)?;
-            sync_file_counted(&f, &self.store.stats)?;
+            sync_file_counted(&f, &self.store.stats, crate::DurabilityBarrier::ObjectFile)?;
+            crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectFileAfter)?;
         }
 
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
+                crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectLinkAfter)?;
                 self.dirs.insert(shard_b);
                 self.oids.insert(id);
                 self.new_puts += 1;
@@ -297,7 +303,14 @@ impl PublishBatch<'_> {
 
     pub fn finish(self) -> Result<()> {
         for dir in &self.dirs {
-            sync_dir_counted(dir, &self.store.stats)?;
+            sync_dir_counted(
+                dir,
+                &self.store.stats,
+                crate::DurabilityBarrier::ObjectPublicationDirectory,
+            )?;
+            crate::inject_barrier_failure(
+                crate::DurabilityBarrier::ObjectPublicationDirectoryAfter,
+            )?;
         }
         // This is the sole OID-proof publication point. A dropped or failed
         // batch never teaches later callers that its visible links are durable.
@@ -363,7 +376,7 @@ fn ensure_dir_durable(
         }
         Err(e) => return Err(Error::Io(e.to_string())),
     }
-    sync_dir_counted(parent, stats)?;
+    sync_dir_counted(parent, stats, crate::DurabilityBarrier::ObjectPathDirectory)?;
     durable_dirs.lock().put(child.to_path_buf(), ());
     Ok(())
 }
@@ -399,21 +412,33 @@ fn cleanup_stale_tmp(tmp: &Path, stats: &BlobStoreCounters) -> Result<()> {
         }
     }
     if removed {
-        sync_dir_counted(tmp, stats)?;
+        sync_dir_counted(
+            tmp,
+            stats,
+            crate::DurabilityBarrier::ObjectTemporaryDirectory,
+        )?;
     }
     Ok(())
 }
 
-fn sync_dir_counted(path: &Path, stats: &BlobStoreCounters) -> Result<()> {
+fn sync_dir_counted(
+    path: &Path,
+    stats: &BlobStoreCounters,
+    point: crate::DurabilityBarrier,
+) -> Result<()> {
     let started = Instant::now();
-    crate::durable_sync_dir(path)?;
+    crate::durable_sync_dir_at(path, point)?;
     stats.fsync_dir.observe(started.elapsed());
     Ok(())
 }
 
-fn sync_file_counted(file: &std::fs::File, stats: &BlobStoreCounters) -> Result<()> {
+fn sync_file_counted(
+    file: &std::fs::File,
+    stats: &BlobStoreCounters,
+    point: crate::DurabilityBarrier,
+) -> Result<()> {
     let started = Instant::now();
-    crate::durable_sync_file(file)?;
+    crate::durable_sync_file_at(file, point)?;
     stats.fsync_file.observe(started.elapsed());
     Ok(())
 }
