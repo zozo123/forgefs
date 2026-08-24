@@ -195,14 +195,15 @@ impl Forge {
         Self::open_locked_mode(root, cell_lock, false, true, false)
     }
 
-    /// Detection-only read-only open for `fsck`. A broken migration ledger is
-    /// admitted far enough for fsck to report `SCHEMA_LEDGER`; all filesystem,
+    /// Detection-only read-only open for `fsck`. Full fsck admits a broken
+    /// migration ledger far enough to report `SCHEMA_LEDGER`; reachable fsck
+    /// retains the normal fail-closed compatibility check. All filesystem,
     /// lock, object-store, and SQLite write prohibitions remain identical to
-    /// `open_read_only`.
-    pub fn open_for_fsck(dir: &Path) -> Result<Self> {
+    /// `open_read_only` in either mode.
+    pub fn open_for_fsck(dir: &Path, full: bool) -> Result<Self> {
         let root = find_forge(dir)?;
         let cell_lock = acquire_cell_lock(&root, LockIntent::ReadOnly)?;
-        Self::open_locked_mode(root, cell_lock, false, true, true)
+        Self::open_locked_mode(root, cell_lock, false, true, full)
     }
 
     /// Open a cell for `forge serve`. The exclusive lock is acquired before

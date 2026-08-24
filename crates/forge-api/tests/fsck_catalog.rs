@@ -19,7 +19,7 @@ fn corrupted_report(sql: &str) -> FsckReport {
     drop(forge);
     edit_catalog(dir.path(), sql);
 
-    let forge = Forge::open_for_fsck(dir.path()).unwrap();
+    let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
     forge.fsck(&root, true).unwrap()
 }
 
@@ -46,7 +46,7 @@ fn healthy_catalog_is_clean_after_reopen() {
     forge.seal(&root, "main", "catalog-clean").unwrap();
     drop(forge);
 
-    let reopened = Forge::open_for_fsck(dir.path()).unwrap();
+    let reopened = Forge::open_for_fsck(dir.path(), true).unwrap();
     let report = reopened.fsck(&root, true).unwrap();
     assert!(report.ok, "{:#?}", report.findings);
 }
@@ -89,7 +89,8 @@ fn fsck_opens_and_reports_a_damaged_schema_ledger() {
     edit_catalog(dir.path(), "DELETE FROM schema_migrations;");
 
     assert!(Forge::open_read_only(dir.path()).is_err());
-    let forge = Forge::open_for_fsck(dir.path()).unwrap();
+    assert!(Forge::open_for_fsck(dir.path(), false).is_err());
+    let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
     let report = forge.fsck(&root, true).unwrap();
     assert_eq!(
         findings(&report, "SCHEMA_LEDGER"),
@@ -109,7 +110,7 @@ fn seal_row_must_agree_with_snapshot_payload() {
         "UPDATE seals SET tree_oid=commit_oid WHERE tag='catalog-seal';",
     );
 
-    let forge = Forge::open_for_fsck(dir.path()).unwrap();
+    let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
     let report = forge.fsck(&root, true).unwrap();
     assert_eq!(
         findings(&report, "SEAL_PAYLOAD"),
@@ -129,7 +130,7 @@ fn seal_row_must_have_its_frozen_tag_ref() {
         "DELETE FROM refs WHERE name='tags/orphan-seal';",
     );
 
-    let forge = Forge::open_for_fsck(dir.path()).unwrap();
+    let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
     let report = forge.fsck(&root, true).unwrap();
     assert_eq!(
         findings(&report, "SEAL_TAG_REF"),
@@ -152,7 +153,7 @@ fn landmark_oid_must_have_its_declared_type() {
         ),
     );
 
-    let forge = Forge::open_for_fsck(dir.path()).unwrap();
+    let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
     let report = forge.fsck(&root, true).unwrap();
     let expected = format!("catalog:landmark:{}", snapshot.hex());
     assert_eq!(findings(&report, "TYPE_MISMATCH"), [expected.as_str()]);
@@ -194,7 +195,7 @@ fn orphan_mount_is_reported_deterministically() {
         &format!("UPDATE mounts SET ns_id='ghost' WHERE ns_id='{ns}' AND path='/';"),
     );
 
-    let forge = Forge::open_for_fsck(dir.path()).unwrap();
+    let forge = Forge::open_for_fsck(dir.path(), true).unwrap();
     let report = forge.fsck(&root, true).unwrap();
     assert_eq!(
         findings(&report, "MOUNT_NAMESPACE"),

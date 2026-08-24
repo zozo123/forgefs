@@ -230,7 +230,7 @@ fn restore_default_sigpipe() {
 }
 
 fn run(cli: Cli) -> forge_types::Result<()> {
-    match &cli.cmd {
+    match cli.cmd {
         Cmd::Bench {
             scratch,
             agents,
@@ -296,14 +296,14 @@ fn run(cli: Cli) -> forge_types::Result<()> {
 
 /// `fsck` and `verify` are documented as read-only, so they take structurally
 /// read-only opens unconditionally -- not only when the media happens to be
-/// read-only. Fsck alone defers migration-ledger compatibility to its catalog
-/// audit so it can report the defect; SQLite still refuses every write. Verify
-/// retains the strict compatible-schema open. Every other command opens for
-/// writing exactly as before.
+/// read-only. Full fsck alone defers migration-ledger compatibility to its
+/// catalog audit so it can report the defect; reachable fsck and verify retain
+/// the strict compatible-schema open. SQLite refuses every write in all three
+/// modes. Every other command opens for writing exactly as before.
 fn open(cli: &Cli) -> forge_types::Result<Forge> {
     let dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
-    match cli.cmd {
-        Cmd::Fsck { .. } => Forge::open_for_fsck(&dir),
+    match &cli.cmd {
+        Cmd::Fsck { full, .. } => Forge::open_for_fsck(&dir, *full),
         Cmd::Verify { .. } => Forge::open_read_only(&dir),
         _ => Forge::open(&dir),
     }
