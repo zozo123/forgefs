@@ -1593,9 +1593,23 @@ fn init_staging_siblings(root: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            paths.push(entry.path());
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((pid, ulid)) = suffix.split_once('-') else {
+            continue;
+        };
+        if pid.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || ulid.parse::<ulid::Ulid>().is_err()
+        {
+            continue;
         }
+        paths.push(entry.path());
     }
     paths.sort();
     Ok(paths)

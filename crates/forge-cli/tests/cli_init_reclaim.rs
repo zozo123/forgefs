@@ -126,14 +126,12 @@ fn staging_prefix_lookalikes_are_never_claimed_or_deleted() {
     assert_eq!(fs::read(lookalike.join("keep")).unwrap(), b"user-data");
 
     let root = d.path().join(".forge/keys/root.cap");
-    let checked = run(
-        forge()
-            .arg("--dir")
-            .arg(d.path())
-            .arg("--cap")
-            .arg(&root)
-            .arg("fsck")
-            .arg("--full"),
-    );
+    let checked = run(forge()
+        .arg("--dir")
+        .arg(d.path())
+        .arg("--cap")
+        .arg(&root)
+        .arg("fsck")
+        .arg("--full"));
     assert!(!checked.contains("INIT_STAGING"), "{checked}");
 }
