@@ -1,11 +1,14 @@
 //! Process-level proof that concurrent imports report the ref that actually owns their commit.
 
+mod support;
+
 use forge_api::Forge;
 use forge_types::RefRow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Barrier};
+use support::output;
 use tempfile::tempdir;
 
 fn forge() -> Command {
@@ -16,10 +19,6 @@ fn authenticated(dir: &Path, cap: &Path) -> Command {
     let mut cmd = forge();
     cmd.arg("--dir").arg(dir).arg("--cap").arg(cap);
     cmd
-}
-
-fn output(cmd: &mut Command) -> Output {
-    cmd.output().expect("spawn forge")
 }
 
 fn run(cmd: &mut Command) -> String {
@@ -91,34 +90,16 @@ fn fork_name(stdout: &str) -> Option<String> {
     fields.next().map(str::to_string)
 }
 
-#[test]
-fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
-    let d = tempdir().unwrap();
-    let root = init(d.path());
-
-    let baseline = d.path().join("baseline");
-    fs::create_dir(&baseline).unwrap();
-    fs::write(baseline.join("marker.txt"), b"0").unwrap();
-    let baseline_result = import(d.path(), &root, &baseline, None);
-    assert!(baseline_result.status.success(), "{baseline_result:?}");
-
-    let before = Forge::open(d.path()).unwrap();
-    let before_cap = before.root_cap().unwrap();
-    let baseline_oid = before.peel_commit("heads/import").unwrap().0;
-    drop(before_cap);
-    drop(before);
-
-    let left = make_source(d.path(), "left", b'L');
-    let right = make_source(d.path(), "right", b'R');
-    let barrier_dir = d.path().join("import-snapshot-barrier");
+fn race_imports(repo: &Path, cap: &Path, left: PathBuf, right: PathBuf) -> Vec<Output> {
+    let barrier_dir = repo.join("import-snapshot-barrier");
     fs::create_dir(&barrier_dir).unwrap();
 
     let launch = Arc::new(Barrier::new(2));
     let mut workers = Vec::new();
     for source in [left, right] {
         let launch = Arc::clone(&launch);
-        let repo = d.path().to_path_buf();
-        let cap = root.clone();
+        let repo = repo.to_path_buf();
+        let cap = cap.to_path_buf();
         let barrier = barrier_dir.clone();
         workers.push(std::thread::spawn(move || {
             launch.wait();
@@ -126,10 +107,13 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
         }));
     }
 
-    let results = workers
+    workers
         .into_iter()
         .map(|worker| worker.join().expect("join import worker"))
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn reported_fork(results: &[Output]) -> String {
     assert!(
         results.iter().all(|result| result.status.success()),
         "both imports preserve work and must exit successfully: {:?}",
@@ -164,22 +148,45 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
         1,
         "the CAS loser must name its fork: {stdout:?}"
     );
-    let fork = &forks[0];
+    forks.into_iter().next().unwrap()
+}
+
+#[test]
+fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
+    let d = tempdir().unwrap();
+    let root = init(d.path());
+
+    let baseline = d.path().join("baseline");
+    fs::create_dir(&baseline).unwrap();
+    fs::write(baseline.join("marker.txt"), b"0").unwrap();
+    let baseline_result = import(d.path(), &root, &baseline, None);
+    assert!(baseline_result.status.success(), "{baseline_result:?}");
+
+    let before = Forge::open(d.path()).unwrap();
+    let before_cap = before.root_cap().unwrap();
+    let baseline_oid = before.peel_commit("heads/import").unwrap().0;
+    drop(before_cap);
+    drop(before);
+
+    let left = make_source(d.path(), "left", b'L');
+    let right = make_source(d.path(), "right", b'R');
+    let results = race_imports(d.path(), &root, left, right);
+    let fork = reported_fork(&results);
 
     let reopened = Forge::open(d.path()).unwrap();
     let cap = reopened.root_cap().unwrap();
     let refs = reopened.refs(&cap).unwrap();
     let target = find_ref(&refs, "heads/import");
-    let loser = find_ref(&refs, fork);
+    let loser = find_ref(&refs, &fork);
     assert_ne!(target.oid, loser.oid, "winner and loser commits collapsed");
 
     let (_, winner_commit) = reopened.peel_commit("heads/import").unwrap();
-    let (_, loser_commit) = reopened.peel_commit(fork).unwrap();
+    let (_, loser_commit) = reopened.peel_commit(&fork).unwrap();
     assert_eq!(winner_commit.parents, vec![baseline_oid]);
     assert_eq!(loser_commit.parents, vec![baseline_oid]);
 
     let winner_marker = marker_at(&reopened, &cap, "heads/import");
-    let loser_marker = marker_at(&reopened, &cap, fork);
+    let loser_marker = marker_at(&reopened, &cap, &fork);
     assert!(matches!(winner_marker, b'L' | b'R'));
     assert!(matches!(loser_marker, b'L' | b'R'));
     assert_ne!(
@@ -208,7 +215,7 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
         "/only-left.txt"
     };
     let winner_ns = reopened.session_open(&cap, "heads/import").unwrap();
-    let loser_ns = reopened.session_open(&cap, fork).unwrap();
+    let loser_ns = reopened.session_open(&cap, &fork).unwrap();
     assert!(reopened.read(&cap, &winner_ns, winner_only).is_ok());
     assert!(reopened.read(&cap, &winner_ns, winner_other).is_err());
     assert!(reopened.read(&cap, &loser_ns, loser_only).is_ok());
@@ -220,4 +227,30 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
         "concurrent import left corruption: {:?}",
         report.findings
     );
+}
+
+#[test]
+fn concurrent_first_imports_also_preserve_the_loser_as_a_fork() {
+    let d = tempdir().unwrap();
+    let root = init(d.path());
+    let left = make_source(d.path(), "left", b'L');
+    let right = make_source(d.path(), "right", b'R');
+
+    let results = race_imports(d.path(), &root, left, right);
+    let fork = reported_fork(&results);
+
+    let reopened = Forge::open(d.path()).unwrap();
+    let cap = reopened.root_cap().unwrap();
+    let (_, winner) = reopened.peel_commit("heads/import").unwrap();
+    let (_, loser) = reopened.peel_commit(&fork).unwrap();
+    assert!(winner.parents.is_empty());
+    assert!(loser.parents.is_empty());
+    assert_ne!(
+        marker_at(&reopened, &cap, "heads/import"),
+        marker_at(&reopened, &cap, &fork),
+        "first-import snapshots mixed or work was lost"
+    );
+
+    let report = reopened.fsck(&cap, true).unwrap();
+    assert!(report.ok, "first-import race: {:?}", report.findings);
 }

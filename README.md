@@ -37,7 +37,8 @@ cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full
 
 Two agents, one forge, no shared mutable checkout. Same-path edits become a **Conflict object**. If one agent changes `/x` after another observed its old OID, the stale agent's later checkin fails even when it only writes `/y`. If writers race one mutable ref, one wins and every loser becomes an explicit fork.
 
-See [INVARIANTS.md](INVARIANTS.md) for the compact correctness contract.
+See [INVARIANTS.md](INVARIANTS.md) for the compact correctness contract and
+[AGENTS.md](AGENTS.md) for the contributor architecture and change rules.
 
 ## Integrity is a product surface
 
@@ -108,7 +109,7 @@ CI runs the workspace on the pinned current Rust toolchain, Rust 1.89 MSRV, and 
 | `forge-cap` | `(operation, resource)` macaroon-style capabilities |
 | `forge-ns` | Session mounts and overlay resolution |
 | `forge-merge` | DAG merge bases, deterministic 3-way merge, Conflict objects |
-| `forge-api` | Capability-checked sessions, checkin, merge, seal, verify, fsck, serve |
+| `forge-api` | Small public facade over invariant-aligned repository, authority, workspace, refs, integration, import/export, fsck, and serve modules |
 | `forge-cli` | `forge`; requires explicit `--cap` / `FORGE_CAP` |
 
 ## Many-agent direction
