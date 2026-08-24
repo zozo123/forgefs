@@ -39,7 +39,9 @@ fn healthy_catalog_is_clean_after_reopen() {
     let root = forge.root_cap().unwrap();
 
     let ns = forge.session_open(&root, "main").unwrap();
-    forge.write(&root, &ns, "/kept.txt", b"kept", false).unwrap();
+    forge
+        .write(&root, &ns, "/kept.txt", b"kept", false)
+        .unwrap();
     forge.checkin(&root, &ns, "/", "catalog fixture").unwrap();
     forge.seal(&root, "main", "catalog-clean").unwrap();
     drop(forge);
@@ -65,10 +67,7 @@ fn reflog_chain_must_be_contiguous() {
          SELECT name, zeroblob(32), oid, 'test', 'cas', 0
          FROM refs WHERE name='main';",
     );
-    assert_eq!(
-        findings(&report, "REFLOG_CHAIN"),
-        ["catalog:reflog:main:2"]
-    );
+    assert_eq!(findings(&report, "REFLOG_CHAIN"), ["catalog:reflog:main:2"]);
 }
 
 #[test]
@@ -78,10 +77,7 @@ fn reflog_name_must_have_a_current_ref() {
          SELECT 'ghost', NULL, oid, 'test', 'test', 0
          FROM refs WHERE name='main';",
     );
-    assert_eq!(
-        findings(&report, "REFLOG_ORPHAN"),
-        ["catalog:reflog:ghost"]
-    );
+    assert_eq!(findings(&report, "REFLOG_ORPHAN"), ["catalog:reflog:ghost"]);
 }
 
 #[test]
@@ -159,10 +155,7 @@ fn landmark_oid_must_have_its_declared_type() {
     let forge = Forge::open_for_fsck(dir.path()).unwrap();
     let report = forge.fsck(&root, true).unwrap();
     let expected = format!("catalog:landmark:{}", snapshot.hex());
-    assert_eq!(
-        findings(&report, "TYPE_MISMATCH"),
-        [expected.as_str()]
-    );
+    assert_eq!(findings(&report, "TYPE_MISMATCH"), [expected.as_str()]);
 }
 
 #[test]
@@ -203,5 +196,8 @@ fn orphan_mount_is_reported_deterministically() {
 
     let forge = Forge::open_for_fsck(dir.path()).unwrap();
     let report = forge.fsck(&root, true).unwrap();
-    assert_eq!(findings(&report, "MOUNT_NAMESPACE"), ["catalog:mount:ghost:/"]);
+    assert_eq!(
+        findings(&report, "MOUNT_NAMESPACE"),
+        ["catalog:mount:ghost:/"]
+    );
 }

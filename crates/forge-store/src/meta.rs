@@ -618,12 +618,7 @@ fn catalog_object_type(kind: &str) -> Option<ObjectType> {
 }
 
 impl CatalogAudit {
-    fn finding(
-        &mut self,
-        code: &str,
-        resource: impl Into<String>,
-        detail: impl Into<String>,
-    ) {
+    fn finding(&mut self, code: &str, resource: impl Into<String>, detail: impl Into<String>) {
         self.findings.push(CatalogFinding {
             code: code.to_string(),
             resource: resource.into(),
@@ -631,12 +626,7 @@ impl CatalogAudit {
         });
     }
 
-    fn oid(
-        &mut self,
-        bytes: Vec<u8>,
-        resource: &str,
-        field: &str,
-    ) -> Option<ObjectId> {
+    fn oid(&mut self, bytes: Vec<u8>, resource: &str, field: &str) -> Option<ObjectId> {
         match oid_from_blob(bytes) {
             Ok(oid) => Some(oid),
             Err(error) => {
@@ -753,9 +743,7 @@ impl Meta {
         let mut refs = BTreeMap::new();
         {
             let mut stmt = tx
-                .prepare(
-                    "SELECT name, oid, kind, protected, sealed FROM refs ORDER BY name",
-                )
+                .prepare("SELECT name, oid, kind, protected, sealed FROM refs ORDER BY name")
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -782,9 +770,7 @@ impl Meta {
         let mut previous_reflog = BTreeMap::new();
         {
             let mut stmt = tx
-                .prepare(
-                    "SELECT id, name, old_oid, new_oid, reason FROM reflog ORDER BY name, id",
-                )
+                .prepare("SELECT id, name, old_oid, new_oid, reason FROM reflog ORDER BY name, id")
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -837,9 +823,7 @@ impl Meta {
                 Some(log_oid) if log_oid != ref_oid => audit.finding(
                     "REFLOG_TERMINAL",
                     format!("catalog:ref:{name}"),
-                    format!(
-                        "current ref is {ref_oid}, terminal reflog new_oid is {log_oid}"
-                    ),
+                    format!("current ref is {ref_oid}, terminal reflog new_oid is {log_oid}"),
                 ),
                 Some(_) => {}
             }
@@ -892,9 +876,7 @@ impl Meta {
         };
         {
             let mut stmt = tx
-                .prepare(
-                    "SELECT DISTINCT ns_id, mount FROM observations ORDER BY ns_id, mount",
-                )
+                .prepare("SELECT DISTINCT ns_id, mount FROM observations ORDER BY ns_id, mount")
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -950,9 +932,7 @@ impl Meta {
         let mut seal_tags = BTreeSet::new();
         {
             let mut stmt = tx
-                .prepare(
-                    "SELECT tag, snap_oid, commit_oid, tree_oid FROM seals ORDER BY tag",
-                )
+                .prepare("SELECT tag, snap_oid, commit_oid, tree_oid FROM seals ORDER BY tag")
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1006,17 +986,12 @@ impl Meta {
                         format!("missing sealed ref {tag_ref}"),
                     ),
                     Some((oid, kind, protected, sealed))
-                        if *oid != snap_oid
-                            || kind != "snapshot"
-                            || !*protected
-                            || !*sealed =>
+                        if *oid != snap_oid || kind != "snapshot" || !*protected || !*sealed =>
                     {
                         audit.finding(
                             "SEAL_TAG_REF",
                             &resource,
-                            format!(
-                                "{tag_ref} must be protected+sealed snapshot {snap_oid}"
-                            ),
+                            format!("{tag_ref} must be protected+sealed snapshot {snap_oid}"),
                         )
                     }
                     Some(_) => {}
@@ -1089,9 +1064,7 @@ impl Meta {
 
         {
             let mut stmt = tx
-                .prepare(
-                    "SELECT oid, lower(hex(oid)), commit_oid FROM object_intro ORDER BY oid",
-                )
+                .prepare("SELECT oid, lower(hex(oid)), commit_oid FROM object_intro ORDER BY oid")
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {

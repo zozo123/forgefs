@@ -144,10 +144,8 @@ impl Forge {
                         "tag refs must be protected+sealed snapshots",
                     );
                 }
-                if !full {
-                    if let Err(err) = self.verify_tag(cap, tag) {
-                        report.finding("SEAL", format!("tag:{tag}"), err.to_string());
-                    }
+                if !full && let Err(err) = self.verify_tag(cap, tag) {
+                    report.finding("SEAL", format!("tag:{tag}"), err.to_string());
                 }
             }
         }
@@ -203,21 +201,17 @@ impl Forge {
                 let mount_resource = format!("{ns_resource}:mount:{}", mount.path);
                 match parse_spec(&mount.spec) {
                     Ok(Spec::Ref(name)) => match ref_types.get(&name) {
-                        Some((oid, ty)) => {
-                            roots.push((
-                                *oid,
-                                ObjectExpectation::Exact(*ty),
-                                format!("{mount_resource}:ref:{name}"),
-                            ))
-                        }
+                        Some((oid, ty)) => roots.push((
+                            *oid,
+                            ObjectExpectation::Exact(*ty),
+                            format!("{mount_resource}:ref:{name}"),
+                        )),
                         None => match self.late_ref(&name) {
-                            Some((oid, ty)) => {
-                                roots.push((
-                                    oid,
-                                    ObjectExpectation::Exact(ty),
-                                    format!("{mount_resource}:ref:{name}"),
-                                ))
-                            }
+                            Some((oid, ty)) => roots.push((
+                                oid,
+                                ObjectExpectation::Exact(ty),
+                                format!("{mount_resource}:ref:{name}"),
+                            )),
                             None => report.finding(
                                 "MOUNT_REF",
                                 &mount_resource,
@@ -261,7 +255,6 @@ impl Forge {
             }
         }
 
-
         if let Some(catalog) = catalog {
             for seal in &catalog.seals {
                 if let Err(error) = self.verify_seal_payload(
@@ -283,9 +276,7 @@ impl Forge {
             for root in catalog.roots {
                 let expected = match root.expected {
                     CatalogObjectExpectation::Any => ObjectExpectation::Any,
-                    CatalogObjectExpectation::Exact(expected) => {
-                        ObjectExpectation::Exact(expected)
-                    }
+                    CatalogObjectExpectation::Exact(expected) => ObjectExpectation::Exact(expected),
                     CatalogObjectExpectation::TreeEntry => ObjectExpectation::TreeEntry,
                 };
                 roots.push((root.oid, expected, root.resource));
@@ -323,9 +314,7 @@ fn check_object_expectation(
     let expected_name = match expected {
         ObjectExpectation::Any => None,
         ObjectExpectation::Exact(expected) if actual != expected => Some(expected.as_str()),
-        ObjectExpectation::TreeEntry
-            if !matches!(actual, ObjectType::Blob | ObjectType::Tree) =>
-        {
+        ObjectExpectation::TreeEntry if !matches!(actual, ObjectType::Blob | ObjectType::Tree) => {
             Some("blob or tree")
         }
         _ => None,
@@ -334,10 +323,7 @@ fn check_object_expectation(
         report.finding(
             "TYPE_MISMATCH",
             resource,
-            format!(
-                "{id} is {}, expected {expected_name}",
-                actual.as_str()
-            ),
+            format!("{id} is {}, expected {expected_name}", actual.as_str()),
         );
     }
 }
