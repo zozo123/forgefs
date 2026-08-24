@@ -90,17 +90,54 @@ A Contribution (`0x06`) has an empty payload and the required header map:
 
 ```text
 {
-  base: bstr32, tree: bstr32, parents: [bstr32...],
-  reads: [{p: text, id: bstr32}...], writes: [text...],
-  agent: text, ts: uint
+  ts: uint,
+  base: bstr32,
+  tree: bstr32,
+  agent: text,
+  reads: [{p: text, id: bstr32}...],
+  writes: [text...],
+  parents: [bstr32...]
 }
 ```
+
+| Key | Meaning |
+|---|---|
+| `base` | pinned Commit whose tree the checkin transformed |
+| `tree` | resulting immutable Tree |
+| `parents` | ordered Commit inputs to the receipt |
+| `reads` | sorted path and observed Blob facts consumed by the checkin |
+| `writes` | sorted paths changed by the checkin |
+| `agent` | authenticated capability identity that published the checkin |
+| `ts` | informational timestamp hint; never causal or a merge key |
+
+Canonical CBOR ordering is ordering by the complete encoded key bytes, not by
+the human spelling of keys. The header order is therefore `ts`, `base`, `tree`,
+`agent`, `reads`, `writes`, `parents`. Each read-map order is `p`, then `id`
+because the one-byte text key encodes before the two-byte key. The canonical
+fixture freezes both orders.
 
 `base` and every `parents` item name Commits, `tree` names a Tree, and each
 `reads[].id` names a Blob when the graph is fully verified. `reads` and
 `writes` paths are non-empty, NUL-free UTF-8 strings of at most 4096 bytes and
 are strictly increasing and unique by raw UTF-8 bytes. Limits are 1024 parents,
 100,000 reads, 100,000 writes, 1024 agent bytes, and an 8 MiB encoded header.
+
+### Contribution join law
+
+A Contribution ObjectId is an immutable monotonic fact. Let `C(c)` be the set
+of Contribution OIDs in the typed graph reachable from Commit `c`. A merge
+commit has both input commits as parents and does not copy, replace, rank, or
+retract their receipts, so:
+
+```text
+C(merge(a, b)) = C(a) union C(b)
+```
+
+Set union makes receipt reachability commutative, associative, and idempotent,
+even though parent order still participates in the merge Commit's own identity.
+Adding a descendant can only preserve or grow its reachable Contribution set.
+Mutable “current contribution” pointers, decrementing counters, last-writer
+wins, and wall-clock maxima as causal truth are outside the object contract.
 
 ## Snapshot provenance manifest
 

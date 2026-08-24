@@ -27,7 +27,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Reads through a session resolve against a pinned base -- per mount, see I19 -- and its overlay, never a live ref another agent can move. Checkin CASes that oid, never a moving head. |
 | I9 | Every read records what it saw at a path: a blob id, a directory's tree id, or its absence. Silence is not a recorded read. Stale observations fail checkin even on disjoint writes. |
-| I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. Every current-version seal manifest includes each Contribution reachable from its commit and binds the entry to the receipt's immutable agent. |
+| I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. Reachable Contribution sets are monotonic facts: merge is set union, so parent order and wall clocks cannot select or retract a receipt. Every current-version seal manifest includes each Contribution reachable from its commit and binds the entry to the receipt's immutable agent. |
 | I11 | Overlap is a Conflict object. |
 | I12 | Merge order comes only from the commit parent DAG and real merge-bases. `Commit.ts` and `Contribution.ts` are advisory metadata, never causal order. |
 | I13 | Authority(c+d) ⊆ Authority(c). Holder attenuates without the root secret. |
@@ -53,7 +53,7 @@ not diluted into a mock:
 
 | Invariants | Production owner | Primary evidence |
 |---|---|---|
-| I1, I2, I10, I17 | `forge-core`, `forge-store/graph.rs`, `forge-store/meta.rs`, `forge-api/import.rs`, `integration.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `provenance.rs`, `checkin_contribution.rs`, `typed_graph.rs`, `api_contract.rs`, `bootstrap_contract.rs`, `schema_migrations.rs`, `schema_migration_fixtures.rs`, `schema_migration_objects.rs`, `testdata/schema/README.md`, `property_canonical.rs`, `large_blob_memory.rs`, `fanout_input_vs_corruption.rs`, `import_fanout_is_input.rs`, `fuzz/tree_name` |
+| I1, I2, I10, I17 | `forge-core`, `forge-store/graph.rs`, `forge-store/meta.rs`, `forge-api/import.rs`, `integration.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `provenance.rs`, `checkin_contribution.rs`, `contribution_join.rs`, `typed_graph.rs`, `api_contract.rs`, `bootstrap_contract.rs`, `schema_migrations.rs`, `schema_migration_fixtures.rs`, `schema_migration_objects.rs`, `testdata/schema/README.md`, `property_canonical.rs`, `large_blob_memory.rs`, `fanout_input_vs_corruption.rs`, `import_fanout_is_input.rs`, `fuzz/tree_name` |
 | I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `group_commit.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `forge-store/objectstore/conformance.rs`, `docs/RECOVERY.md`, `docs/OBJECTSTORE.md` |
 | I5, I7, I8 | `forge-store/meta.rs` (`cas_ref*`, `commit_seal`), `forge-api/workspace.rs`, `refs.rs`, `integration.rs` (`seal`) | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `multi_mount_shape.rs`, `model_composition.rs`, `cli_seal_head_moves.rs`, `fuzz/ref_name` |
 | I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs`, `multi_mount_shape.rs`, `model_composition.rs` |

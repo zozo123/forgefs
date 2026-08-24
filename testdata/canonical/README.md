@@ -11,6 +11,10 @@ The Commit fixtures deliberately cover both wire shapes:
 - `commit_with_contribution.hex` / `.oid`: `contrib` is present as a 32-byte
   Contribution ObjectId and therefore changes Commit identity.
 
+`contribution.hex` / `.oid` freezes the complete Contribution object,
+including encoded-key order (`ts`, `base`, `tree`, `agent`, `reads`, `writes`,
+`parents`) and the nested read-map order (`p`, `id`).
+
 Changing an existing fixture requires preserving the old fixture and reader,
 then defining an explicit repository VERSION transition. A mutable SQLite
 schema migration is never a reason to rewrite these bytes.
