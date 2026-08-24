@@ -28,6 +28,8 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
     let fixture = Fixture::new();
     let alice = fixture.agent("alice");
     let bob = fixture.agent("bob");
+    let store = Store::open(&fixture.path().join(".forge")).unwrap();
+    let shared_base = store.meta.get_ref("main").unwrap().unwrap().oid;
 
     let alice_ns = fixture.session(&alice, "main");
     fixture
@@ -48,9 +50,21 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
         .unwrap();
     let (bob_ref, bob_commit) = updated(fixture.forge.checkin(&bob, &bob_ns, "/", "bob").unwrap());
 
-    let store = Store::open(&fixture.path().join(".forge")).unwrap();
     let alice_contribution = store.get_commit(alice_commit).unwrap().contrib.unwrap();
     let bob_contribution = store.get_commit(bob_commit).unwrap().contrib.unwrap();
+    assert_eq!(
+        store.get_contribution(alice_contribution).unwrap().base,
+        shared_base
+    );
+    assert_eq!(
+        store.get_contribution(bob_contribution).unwrap().base,
+        shared_base
+    );
+    assert_eq!(
+        store.meta.get_ref("main").unwrap().unwrap().oid,
+        shared_base,
+        "private checkins must not advance their shared starting ref"
+    );
     let expected = BTreeSet::from([alice_contribution, bob_contribution]);
 
     fixture
