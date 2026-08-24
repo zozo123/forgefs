@@ -54,15 +54,17 @@ pub struct Cap {
     pub id: String,
     pub caveats: Vec<String>,
     pub sig: [u8; 32],
-    pub ops: HashSet<Op>,
+    // Authorization state is derived exclusively from signed caveats and must
+    // never be caller-mutable independently of those authenticated bytes.
+    ops: HashSet<Op>,
     /// Positive global reference caveats. Each inner set is OR; all sets are ANDed.
-    pub ref_sets: Vec<Vec<String>>,
+    ref_sets: Vec<Vec<String>>,
     /// Operation-specific positive reference caveats. These are additionally
     /// ANDed with the global reference caveats for that operation.
-    pub op_ref_sets: HashMap<Op, Vec<Vec<String>>>,
-    pub ref_not: Vec<String>,
-    pub time_le: Option<u64>,
-    pub agent: Option<String>,
+    op_ref_sets: HashMap<Op, Vec<Vec<String>>>,
+    ref_not: Vec<String>,
+    time_le: Option<u64>,
+    agent: Option<String>,
     agent_conflict: bool,
 }
 
