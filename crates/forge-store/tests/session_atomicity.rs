@@ -1,4 +1,4 @@
-use forge_store::Meta;
+use forge_store::{Meta, Observed};
 use forge_types::{CasResult, ObjectId};
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -15,7 +15,8 @@ fn seed(meta: &Meta, ns: &str, ref_name: &str, pin: ObjectId, current: ObjectId)
         .unwrap();
     meta.overlay_upsert(ns, "/", "x", Some(oid(9)), false)
         .unwrap();
-    meta.observe(ns, "/", "read", oid(8)).unwrap();
+    meta.observe(ns, "/", "read", Observed::Blob(oid(8)))
+        .unwrap();
 }
 
 #[test]

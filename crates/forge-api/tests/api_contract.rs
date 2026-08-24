@@ -32,6 +32,18 @@ fn invariant_contract_matrix() {
             i9_stale_observations_block_checkin,
         ),
         (
+            "I9 an absent path that another agent creates is a stale read",
+            i9_absent_read_then_created_blocks_checkin,
+        ),
+        (
+            "I9 a directory listing that gains a child is a stale read",
+            i9_directory_read_then_child_added_blocks_checkin,
+        ),
+        (
+            "I9 an unrelated write does not invalidate a directory or absent read",
+            i9_unrelated_change_leaves_observations_fresh,
+        ),
+        (
             "I11 overlapping writes are loud",
             i11_overlapping_writes_are_loud,
         ),
@@ -197,6 +209,121 @@ fn i9_stale_observations_block_checkin() {
         .checkin(&bob, &bob_session, "/", "stale")
         .unwrap_err();
     assert!(matches!(error, Error::StaleObservation { .. }), "{error}");
+}
+
+/// Publishes `edits` from `agent` on top of `main` and lands them on `main`.
+fn land_on_main(fixture: &Fixture, agent: &forge_cap::Cap, edits: &[(&str, &[u8])]) {
+    let session = fixture.session(agent, "main");
+    for (path, data) in edits {
+        fixture
+            .forge
+            .write(agent, &session, path, data, false)
+            .unwrap();
+    }
+    let published = updated_ref(fixture.forge.checkin(agent, &session, "/", "land").unwrap());
+    fixture
+        .forge
+        .merge(&fixture.integrator, "main", &published, None)
+        .unwrap();
+}
+
+// I9: a lookup that found nothing is a read. Recording nothing for it let a
+// second agent create the path under the reader and still let the reader check
+// in, which is exactly the cross-mount write skew I9 exists to catch.
+fn i9_absent_read_then_created_blocks_checkin() {
+    let fixture = Fixture::new();
+    let alice = fixture.agent("alice");
+    let bob = fixture.agent("bob");
+    land_on_main(&fixture, &alice, &[("/seed.txt", b"seed")]);
+
+    let bob_session = fixture.session(&bob, "main");
+    let miss = fixture
+        .forge
+        .read(&bob, &bob_session, "/main/new.txt")
+        .unwrap_err();
+    assert!(matches!(miss, Error::NotFound(_)), "{miss}");
+
+    land_on_main(&fixture, &alice, &[("/new.txt", b"created")]);
+
+    fixture
+        .forge
+        .write(&bob, &bob_session, "/notes.txt", b"mine", false)
+        .unwrap();
+    let error = fixture
+        .forge
+        .checkin(&bob, &bob_session, "/", "after absent read")
+        .unwrap_err();
+    assert!(matches!(error, Error::StaleObservation { .. }), "{error}");
+}
+
+// I9: a directory read is a read. A forge tree is the canonical encoding of
+// exactly the entries `ls` returns, so a child appearing under an observed
+// directory must fail checkin.
+fn i9_directory_read_then_child_added_blocks_checkin() {
+    let fixture = Fixture::new();
+    let alice = fixture.agent("alice");
+    let bob = fixture.agent("bob");
+    land_on_main(
+        &fixture,
+        &alice,
+        &[("/dir/a.txt", b"a"), ("/dir/b.txt", b"b")],
+    );
+
+    let bob_session = fixture.session(&bob, "main");
+    let listing = fixture.forge.ls(&bob, &bob_session, "/main/dir").unwrap();
+    assert_eq!(listing.len(), 2, "{listing:?}");
+
+    land_on_main(&fixture, &alice, &[("/dir/c.txt", b"c")]);
+
+    fixture
+        .forge
+        .write(&bob, &bob_session, "/notes.txt", b"mine", false)
+        .unwrap();
+    let error = fixture
+        .forge
+        .checkin(&bob, &bob_session, "/", "after directory read")
+        .unwrap_err();
+    assert!(matches!(error, Error::StaleObservation { .. }), "{error}");
+}
+
+// I9 must stay useful: recording directory and absent reads must not degrade
+// into "every foreign commit is stale". A write outside the observed directory
+// and away from the observed absent path leaves both observations fresh.
+fn i9_unrelated_change_leaves_observations_fresh() {
+    let fixture = Fixture::new();
+    let alice = fixture.agent("alice");
+    let bob = fixture.agent("bob");
+    land_on_main(
+        &fixture,
+        &alice,
+        &[("/dir/a.txt", b"a"), ("/elsewhere.txt", b"v1")],
+    );
+
+    let bob_session = fixture.session(&bob, "main");
+    assert_eq!(
+        fixture
+            .forge
+            .ls(&bob, &bob_session, "/main/dir")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(fixture
+        .forge
+        .read(&bob, &bob_session, "/main/never.txt")
+        .is_err());
+
+    land_on_main(&fixture, &alice, &[("/elsewhere.txt", b"v2")]);
+
+    fixture
+        .forge
+        .write(&bob, &bob_session, "/notes.txt", b"mine", false)
+        .unwrap();
+    let result = fixture
+        .forge
+        .checkin(&bob, &bob_session, "/", "disjoint")
+        .expect("an unrelated write must not invalidate these observations");
+    assert!(matches!(result, CasResult::Updated { .. }), "{result:?}");
 }
 
 fn i11_overlapping_writes_are_loud() {

@@ -4,7 +4,7 @@ use forge_core::decode_object_type;
 use forge_ns::{parse_spec, Spec};
 use forge_store::{
     decode_graph_object, CatalogAudit, CatalogObjectExpectation, GraphEdge, GraphExpectation,
-    GraphWorkQueue,
+    GraphWorkQueue, Observed,
 };
 use forge_types::{Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
@@ -217,9 +217,19 @@ impl Forge {
             }
 
             for observation in self.store.meta.observations(&ns.id)? {
+                // An absent observation names no bytes and so roots nothing;
+                // a directory observation roots the tree object it named.
+                let expectation = match observation.seen {
+                    Observed::Blob(_) => ObjectType::Blob,
+                    Observed::Tree(_) => ObjectType::Tree,
+                    Observed::Absent => continue,
+                };
+                let Some(oid) = observation.seen.oid() else {
+                    continue;
+                };
                 roots.push((
-                    observation.oid,
-                    GraphExpectation::Exact(ObjectType::Blob),
+                    oid,
+                    GraphExpectation::Exact(expectation),
                     format!(
                         "{ns_resource}:observation:{}:{}",
                         observation.mount, observation.path
