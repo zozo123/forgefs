@@ -137,14 +137,17 @@ impl Forge {
             ));
 
             if let Some(tag) = row.name.strip_prefix("tags/") {
-                if !full && (!row.protected || !row.sealed || row.kind != "snapshot") {
+                if full {
+                    continue;
+                }
+                if !row.protected || !row.sealed || row.kind != "snapshot" {
                     report.finding(
                         "TAG_FLAGS",
                         format!("ref:{}", row.name),
                         "tag refs must be protected+sealed snapshots",
                     );
                 }
-                if !full && let Err(err) = self.verify_tag(cap, tag) {
+                if let Err(err) = self.verify_tag(cap, tag) {
                     report.finding("SEAL", format!("tag:{tag}"), err.to_string());
                 }
             }
