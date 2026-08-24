@@ -268,11 +268,9 @@ impl Forge {
                         format!("{mount_resource}:ref:{name}"),
                     )),
                     Some(None) => {}
-                    None => report.finding(
-                        "MOUNT_REF",
-                        &mount_resource,
-                        format!("missing ref {name}"),
-                    ),
+                    None => {
+                        report.finding("MOUNT_REF", &mount_resource, format!("missing ref {name}"))
+                    }
                 },
                 Ok(Spec::Oid(id)) => {
                     if mount.mode == "rw" {
@@ -289,12 +287,9 @@ impl Forge {
         }
 
         for seal in &catalog.seals {
-            if let Err(error) = self.verify_seal_payload(
-                &seal.tag,
-                seal.snap_oid,
-                seal.commit_oid,
-                seal.tree_oid,
-            ) {
+            if let Err(error) =
+                self.verify_seal_payload(&seal.tag, seal.snap_oid, seal.commit_oid, seal.tree_oid)
+            {
                 report.finding(
                     "SEAL_PAYLOAD",
                     format!("catalog:seal:{}", seal.tag),
