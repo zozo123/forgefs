@@ -139,6 +139,24 @@ const CAP_ROOT_VALUES: &str = "typeof(id)='integer' AND id=1 AND typeof(hmac_key
 const MIGRATION_COLUMNS: &[&str] = &["version", "applied_ms"];
 const MIGRATION_VALUES: &str = "typeof(version)='integer' AND typeof(applied_ms)='integer'";
 
+/// Every relation the current schema owns, paired with the exact column list
+/// this binary requires. One definition governs both the catalog audit and the
+/// post-migration shape check, so the two can never disagree about what
+/// "current" means.
+const CATALOG_TABLES: &[(&str, &[&str])] = &[
+    ("refs", REFS_COLUMNS),
+    ("reflog", REFLOG_COLUMNS),
+    ("namespaces", NAMESPACE_COLUMNS),
+    ("observations", OBSERVATION_COLUMNS),
+    ("mounts", MOUNT_COLUMNS),
+    ("overlay", OVERLAY_COLUMNS),
+    ("seals", SEAL_COLUMNS),
+    ("landmarks", LANDMARK_COLUMNS),
+    ("object_intro", INTRO_COLUMNS),
+    ("cap_root", CAP_ROOT_COLUMNS),
+    ("schema_migrations", MIGRATION_COLUMNS),
+];
+
 #[derive(Clone, Debug)]
 pub struct MountRow {
     pub path: String,
@@ -600,12 +618,46 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sql)?;
     tx.execute_batch(SCHEMA).map_err(map_sql)?;
+    // `CREATE TABLE IF NOT EXISTS` is a no-op against a relation that already
+    // exists with an older column list, so applying the current schema to a
+    // pre-versioning catalog does not by itself prove the catalog reached it.
+    // Recording a version the migration did not reach is worse than refusing:
+    // the ledger would claim it forever, every later open would take the
+    // "already current" path, and the first query would fail as a raw SQLite
+    // error instead of a migration diagnostic. Checking inside the transaction
+    // rolls the whole attempt back, so nothing is repaired and nothing is lost.
+    verify_migrated_shape(&tx, from)?;
     tx.execute(
         "INSERT INTO schema_migrations (version, applied_ms) VALUES (?1, ?2)",
         params![CURRENT_SCHEMA_VERSION, now_ms() as i64],
     )
     .map_err(map_sql)?;
     tx.commit().map_err(map_sql)
+}
+
+/// Confirm the catalog actually reached the shape `SCHEMA` describes.
+/// Detection only: this never drops, rewrites, or repairs a relation, and it
+/// never touches an immutable object (I17).
+fn verify_migrated_shape(tx: &rusqlite::Transaction<'_>, from: i64) -> Result<()> {
+    for (table, expected) in CATALOG_TABLES {
+        let mut stmt = tx
+            .prepare(&format!("PRAGMA table_info('{table}')"))
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(map_sql)?;
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(map_sql)?);
+        }
+        let actual: Vec<&str> = columns.iter().map(String::as_str).collect();
+        if actual != **expected {
+            return Err(Error::Invalid(format!(
+                "metadata schema migration {from} -> {CURRENT_SCHEMA_VERSION} did not reach the current shape: table {table} has columns {actual:?}, expected {expected:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn ref_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
