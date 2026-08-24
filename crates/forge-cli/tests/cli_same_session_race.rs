@@ -1,9 +1,59 @@
 //! Process-level proof that double-checkin of one namespace has one live-ref winner.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn spawn(cmd: &mut Command) -> Self {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        Self(Some(cmd.spawn().expect("spawn forge")))
+    }
+
+    fn wait(mut self, timeout: Duration) -> Output {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let child = self.0.as_mut().expect("guard owns child");
+            if child.try_wait().expect("poll forge child").is_some() {
+                return self.collect();
+            }
+            if Instant::now() >= deadline {
+                let mut child = self.0.take().expect("guard owns child");
+                let _ = child.kill();
+                let output = collect_output(child);
+                panic!(
+                    "forge child exceeded {timeout:?}\nstdout={}\nstderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn collect(&mut self) -> Output {
+        collect_output(self.0.take().expect("guard owns child"))
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn collect_output(child: Child) -> Output {
+    child.wait_with_output().expect("collect forge output")
+}
 
 fn forge() -> Command {
     Command::new(env!("CARGO_BIN_EXE_forge"))
@@ -16,7 +66,7 @@ fn authenticated(dir: &Path, cap: &Path) -> Command {
 }
 
 fn output(cmd: &mut Command) -> Output {
-    cmd.output().expect("spawn forge")
+    ChildGuard::spawn(cmd).wait(PROCESS_TIMEOUT)
 }
 
 fn run(cmd: &mut Command) -> String {
@@ -39,14 +89,13 @@ fn init(dir: &Path) -> PathBuf {
 }
 
 fn checkin(dir: &Path, root: &Path, ns: &str) -> Output {
-    authenticated(dir, root)
-        .arg("checkin")
+    let mut cmd = authenticated(dir, root);
+    cmd.arg("checkin")
         .arg("--ns")
         .arg(ns)
         .arg("-m")
-        .arg("same-session race")
-        .output()
-        .expect("spawn forge checkin")
+        .arg("same-session race");
+    output(&mut cmd)
 }
 
 #[test]

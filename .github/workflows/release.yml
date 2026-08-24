@@ -1,0 +1,406 @@
+name: release
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - 'crates/**/Cargo.toml'
+      - '.github/workflows/release.yml'
+      - 'scripts/release-gate.sh'
+      - 'scripts/cli-abi-conformance.sh'
+      - 'scripts/verify-tag-version.sh'
+      - 'docs/RELEASING.md'
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_RUST: '1.97.0'
+  MSRV_RUST: '1.89.0'
+
+jobs:
+  identity:
+    name: release identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      publish: ${{ steps.identity.outputs.publish }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate version and release identity
+        id: identity
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          tag=''
+          publish=false
+          prerelease=false
+          if [ "$REF_TYPE" = tag ]; then
+            tag="$REF_NAME"
+            if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+              echo "::error title=Invalid release tag::$tag is not canonical SemVer vMAJOR.MINOR.PATCH[-PRERELEASE]"
+              exit 1
+            fi
+            report="$(scripts/verify-tag-version.sh "$tag")"
+            publish=true
+            case "$tag" in *-*) prerelease=true ;; esac
+
+            # A tag is not a review. The release commit must already be reachable
+            # from origin/main; this runs in the identity gate itself so every
+            # downstream release job inherits the same trust decision.
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            if ! git merge-base --is-ancestor "$COMMIT_SHA" refs/remotes/origin/main; then
+              echo "::error title=Release commit is not on main::$COMMIT_SHA is not reachable from origin/main"
+              exit 1
+            fi
+          else
+            report="$(scripts/verify-tag-version.sh)"
+          fi
+          printf '%s\n' "$report"
+          version="$(printf '%s\n' "$report" | sed -n 's/^workspace_version=//p')"
+          test -n "$version"
+
+          # The binary version must be sourced from Cargo metadata, not duplicated
+          # in workflow YAML or release notes.
+          cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error title=Version source mismatch::Cargo.toml=$cargo_version verifier=$version"
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+
+          printf 'version=%s tag=%s publish=%s event=%s\n' "$version" "${tag:-<none>}" "$publish" "$EVENT_NAME"
+
+  gate:
+    name: gate (${{ matrix.os }})
+    needs: identity
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-gate-${{ matrix.os }}
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+      - name: Prove lockfile is committed
+        run: git diff --exit-code -- Cargo.lock
+
+  msrv:
+    name: msrv
+    needs: identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.MSRV_RUST }}
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo test --workspace --all-targets --locked
+
+  supply-chain:
+    name: supply chain
+    needs: identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-supply-chain
+      - run: cargo install cargo-audit --locked
+      - run: cargo install cargo-deny --locked
+      - run: cargo audit --deny warnings
+      - run: cargo deny --locked check advisories bans licenses sources
+      - run: cargo metadata --locked --format-version 1 >/dev/null
+      - run: git diff --exit-code -- Cargo.lock
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: identity
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-build-${{ matrix.target }}
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.identity.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p forge-cli --target "$TARGET"
+          bin="target/$TARGET/release/forge"
+          test -x "$bin"
+
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "$TARGET" = "$host" ]; then
+            observed="$("$bin" --version | awk '{print $2}')"
+            test "$observed" = "$VERSION"
+          elif [[ "$TARGET" == *-apple-darwin ]]; then
+            test "$(lipo -archs "$bin")" = "${TARGET%%-*}"
+          else
+            file "$bin"
+          fi
+
+          name="forge-$VERSION-$TARGET"
+          mkdir -p "out/$name"
+          cp "$bin" "out/$name/forge"
+          cp LICENSE README.md CLI_ABI.md INVARIANTS.md "out/$name/"
+          tar -czf "out/$name.tar.gz" -C out "$name"
+          rm -rf "out/$name"
+          {
+            echo "artifact=$name.tar.gz"
+            echo "version=$VERSION"
+            echo "target=$TARGET"
+            echo "commit=$COMMIT_SHA"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "host=$host"
+          } >"out/$name.BUILD-INFO.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: forge-${{ matrix.target }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  e2e-artifact:
+    name: artifact gate ${{ matrix.target }}
+    needs: [identity, build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: forge-${{ matrix.target }}
+          path: dist
+      - name: Gate the exact shipped binary
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="forge-$VERSION-$TARGET"
+          mkdir unpack
+          tar -xzf "dist/$name.tar.gz" -C unpack
+          bin="$PWD/unpack/$name/forge"
+          chmod +x "$bin"
+          test "$("$bin" --version | awk '{print $2}')" = "$VERSION"
+          scripts/release-gate.sh "$bin" evidence
+      - name: Namespace evidence by target
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p labelled
+          if [ -d evidence ]; then
+            for f in evidence/*; do
+              [ -f "$f" ] || continue
+              base="$(basename "$f")"
+              stem="${base%.*}"
+              ext="${base##*.}"
+              cp "$f" "labelled/$stem-$TARGET.$ext"
+            done
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: release-gate-${{ matrix.target }}
+          path: labelled/
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: assemble immutable release payload
+    needs: [identity, gate, msrv, supply-chain, build, e2e-artifact]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: forge-*
+          merge-multiple: true
+          path: payload
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-gate-*
+          merge-multiple: true
+          path: payload
+      - name: Validate and checksum the exact publication set
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd payload
+          test "$(find . -maxdepth 1 -name "forge-$VERSION-*.tar.gz" | wc -l | tr -d ' ')" -eq 4
+          test "$(find . -maxdepth 1 -name 'gate-summary-*' | wc -l | tr -d ' ')" -eq 3
+          test "$(find . -maxdepth 1 -name 'fsck-full-*' | wc -l | tr -d ' ')" -eq 3
+
+          # SHA256SUMS is the manifest. Nothing outside this directory is ever
+          # handed to gh release create, and every regular file except the
+          # manifest itself is covered by it.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort | while read -r f; do
+            sha256sum "$f"
+          done >SHA256SUMS
+          sha256sum -c SHA256SUMS
+          test -s SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-payload
+          path: payload/
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    name: attest exact release payload
+    needs: [identity, assemble]
+    if: needs.identity.outputs.publish == 'true'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-payload
+          path: payload
+      - run: cd payload && sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-checksums: payload/SHA256SUMS
+
+  publish:
+    name: publish
+    needs: [identity, assemble, attest]
+    if: needs.identity.outputs.publish == 'true'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-payload
+          path: payload
+      - name: Reverify payload and publish once
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.identity.outputs.tag }}
+          VERSION: ${{ needs.identity.outputs.version }}
+          PRERELEASE: ${{ needs.identity.outputs.prerelease }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd payload
+          sha256sum -c SHA256SUMS
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error title=Release already exists::$TAG already exists; refusing to mutate an existing release"
+            exit 1
+          fi
+
+          cat >../notes.md <<EOF
+          # ForgeFS $TAG
+
+          Commit \`$COMMIT_SHA\`. Workspace version \`$VERSION\`.
+
+          This release was built with the locked dependency graph, gated on Linux and macOS, tested from the exact packaged binaries, checksummed as one immutable payload, and attested before publication.
+
+          Verify downloaded assets with:
+
+          \`sha256sum -c SHA256SUMS\`
+
+          Evidence files (gate summary, full fsck, CLI ABI, seal attestation, environment line, and build info) are attached alongside the binaries.
+          EOF
+
+          args=(--title "ForgeFS $TAG" --notes-file ../notes.md --verify-tag)
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}" ./*

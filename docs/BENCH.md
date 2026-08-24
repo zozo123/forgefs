@@ -32,6 +32,12 @@ cargo run --release --locked -p forge-cli -- bench \
   --agents <N> --shared <M> --workers <W>
 ```
 
+By default the CLI creates and owns a fresh temporary workspace and removes it
+after a successful run. To retain a run for inspection or crash testing, pass
+`--scratch <new-path>`; the path must not already exist. The global
+`--dir`/`FORGE_DIR` repository selector is deliberately rejected by `bench` and
+is never interpreted as disposable storage.
+
 For a published performance claim, run at least **5 independent fresh-repository repetitions** at every reported concurrency point. Keep every repetition. Summaries report the median run-level throughput and median run-level p50/p95/p99/max; do not pool samples across runs unless the pooled distribution is also published separately.
 
 ## W3-W5 correctness status

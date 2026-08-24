@@ -1,0 +1,72 @@
+# cargo-deny policy for ForgeFS. Issue #45: harden the dependency and release
+# supply chain.
+#
+#   cargo deny --locked check advisories bans licenses sources
+#
+# ForgeFS is security-sensitive infrastructure (SECURITY.md), so this file is a
+# policy statement, not a lint. Widening it is a deliberate review decision -
+# specifically: adding a license class, an advisory ignore, or a source is a
+# change to what ForgeFS is willing to ship on the trusted path, and belongs in
+# its own pull request with the reasoning written down.
+#
+# Intentionally version-field-free so the policy parses across cargo-deny
+# releases; every check below is set explicitly rather than inherited.
+
+[advisories]
+# A yanked crate in a committed lockfile is a supply-chain fact, not noise.
+yanked = "deny"
+# Every entry here must name an advisory ID, a reason, and a removal condition.
+# An empty list is the correct steady state.
+ignore = []
+
+[licenses]
+# Exactly the license classes the current dependency graph needs, and no more.
+# Verified against `cargo metadata` at 5ea795a:
+#   Apache-2.0    the workspace itself, plus most of the graph via MIT/Apache dual
+#   MIT           dual-licensed graph, rusqlite / libsqlite3-sys / lru / ulid
+#   BSD-3-Clause  curve25519-dalek, ed25519-dalek, subtle (the seal signing path)
+#   Unicode-3.0   unicode-ident, whose terms are AND-ed, not OR-ed
+#   Zlib          foldhash
+# A new license class failing this gate is the gate working. Do not add one to
+# unblock a release; decide about it on its own.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+# Per-crate escapes from `allow`. Empty on purpose.
+exceptions = []
+
+[bans]
+# Duplicate transitive versions are a hygiene signal, not a security boundary,
+# and denying them would let an unrelated upstream bump block a release. They
+# are surfaced as warnings and triaged, not used as a release veto.
+multiple-versions = "warn"
+# A wildcard version requirement means the build is not pinned by the manifest.
+# This is "warn", not "deny", for one specific and verified reason: cargo-deny's
+# `allow-wildcard-paths` escape hatch only applies to crates marked
+# `publish = false`, and every forge-* member is publishable, so its own
+# intra-workspace `{ path = ... }` dependencies are all reported as wildcards.
+# Flipping this to "deny" is a one-word change once `[workspace.dependencies]`
+# gives each forge-* entry a `version` alongside its `path` - which crates.io
+# would require anyway before these crates could ever be published. Until then,
+# denying here would fail the release on ForgeFS's own layout, which is exactly
+# the kind of false gate that gets a gate switched off.
+wildcards = "warn"
+allow-wildcard-paths = true
+# ForgeFS's trusted core is deliberately small; nothing is banned outright yet.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Everything ForgeFS builds must come from crates.io. A git dependency or a
+# private registry appearing on the trusted path is a release-blocking event,
+# not a convenience.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
