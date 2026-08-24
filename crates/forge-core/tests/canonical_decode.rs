@@ -3,8 +3,10 @@ use forge_core::cbor::{
     Reader,
 };
 use forge_core::object::encode_file;
-use forge_core::{Commit, Conflict, Snapshot};
-use forge_types::{ObjectId, ObjectType};
+use forge_core::{
+    parse_file, Blob, Commit, Conflict, Contribution, ContributionRead, Snapshot, Tree, TreeEntry,
+};
+use forge_types::{EntryKind, Error, ObjectId, ObjectType};
 
 fn append_kv(out: &mut Vec<u8>, key: &str, value: &[u8]) {
     encode_text(out, key);
@@ -98,5 +100,211 @@ fn huge_declared_length_returns_error_without_panicking() {
     assert!(
         matches!(outcome, Ok(Err(_))),
         "decoder panicked or accepted impossible length"
+    );
+}
+
+/// I1: a uint written in a longer-than-shortest form is Corrupt at every width.
+/// Accepting one would give a single logical value two distinct encodings, and
+/// therefore two distinct ObjectIds for one object.
+#[test]
+fn i1_non_minimal_uints_are_corrupt_at_every_width() {
+    // (bytes, decoded value) pairs that are the shortest form for their value.
+    let canonical: [(&[u8], u64); 4] = [
+        (&[0x18, 0x18], 24),
+        (&[0x19, 0x01, 0x00], 256),
+        (&[0x1a, 0x00, 0x01, 0x00, 0x00], 65_536),
+        (
+            &[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            4_294_967_296,
+        ),
+    ];
+    for (bytes, want) in canonical {
+        let mut r = Reader::new(bytes);
+        assert_eq!(
+            r.u64().expect("shortest form must decode"),
+            want,
+            "canonical uint rejected"
+        );
+    }
+
+    // The same values one width too wide, plus each width boundary.
+    let non_minimal: [&[u8]; 8] = [
+        &[0x18, 0x00],
+        &[0x18, 0x17],
+        &[0x19, 0x00, 0x01],
+        &[0x19, 0x00, 0xff],
+        &[0x1a, 0x00, 0x00, 0x00, 0x01],
+        &[0x1a, 0x00, 0x00, 0xff, 0xff],
+        &[0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+        &[0x1b, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+    ];
+    for bytes in non_minimal {
+        let mut r = Reader::new(bytes);
+        assert!(
+            r.u64().is_err(),
+            "decoder accepted non-minimal uint {bytes:02x?}"
+        );
+    }
+}
+
+/// I1 at the object layer: a commit whose `ts` is padded to eight bytes must be
+/// Corrupt, not silently re-encoded to a different identity.
+#[test]
+fn i1_commit_rejects_non_minimal_ts_width() {
+    fn commit_bytes(ts: &[u8]) -> Vec<u8> {
+        let mut header = Vec::new();
+        encode_map_header(&mut header, 6);
+
+        let mut lm = Vec::new();
+        encode_bool(&mut lm, false);
+        let mut msg = Vec::new();
+        encode_text(&mut msg, "m");
+        let mut tree = Vec::new();
+        encode_bytes(&mut tree, ObjectId([1; 32]).as_bytes());
+        let mut agent = Vec::new();
+        encode_text(&mut agent, "a");
+        let mut parents = Vec::new();
+        encode_array_header(&mut parents, 0);
+
+        // Canonical encoded-key order: lm, ts, msg, tree, agent, parents.
+        append_kv(&mut header, "lm", &lm);
+        append_kv(&mut header, "ts", ts);
+        append_kv(&mut header, "msg", &msg);
+        append_kv(&mut header, "tree", &tree);
+        append_kv(&mut header, "agent", &agent);
+        append_kv(&mut header, "parents", &parents);
+
+        encode_file(ObjectType::Commit, &header, &[])
+    }
+
+    let mut canonical_ts = Vec::new();
+    encode_u64(&mut canonical_ts, 1);
+    let good = commit_bytes(&canonical_ts);
+    let decoded = Commit::decode(&good).expect("canonical commit must decode");
+    assert_eq!(decoded.ts, 1);
+    assert_eq!(
+        decoded.encode(),
+        good,
+        "canonical commit did not round-trip"
+    );
+
+    let padded = commit_bytes(&[0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    assert!(
+        Commit::decode(&padded).is_err(),
+        "commit decoder accepted a non-minimal ts encoding"
+    );
+}
+
+/// I1: unknown header fields are Corrupt. A decoder that skipped an unknown key
+/// would accept bytes it cannot reproduce, so `Decode(encode(x)) == encode(x)`
+/// would no longer hold and two distinct byte strings would name one object.
+#[test]
+fn i1_decoders_reject_unknown_header_fields() {
+    // Canonical map order is by encoded key bytes, so a 24-byte text key
+    // (0x78 0x18 ...) sorts after every real key in the v1 format. The only
+    // non-canonical property of a spliced object is the unknown field itself.
+    const UNKNOWN_KEY: &str = "zzzzzzzzzzzzzzzzzzzzzzzz";
+
+    fn with_unknown_field(bytes: &[u8]) -> Vec<u8> {
+        let (ty, header, payload) = parse_file(bytes).expect("valid object parses");
+        assert_eq!(
+            header[0] & 0xe0,
+            0xa0,
+            "object header must start with a CBOR map"
+        );
+        let count = header[0] & 0x1f;
+        assert!(count < 23, "map count must stay in the one-byte form");
+        let mut grown = header.to_vec();
+        grown[0] = 0xa0 | (count + 1);
+        encode_text(&mut grown, UNKNOWN_KEY);
+        encode_text(&mut grown, "ignored");
+        encode_file(ty, &grown, payload)
+    }
+
+    fn assert_corrupt(what: &str, decoded: Result<(), Error>) {
+        match decoded {
+            Err(Error::Corrupt(_)) => {}
+            Err(other) => panic!("{what} rejected an unknown field as {other:?}, not Corrupt"),
+            Ok(()) => panic!("{what} decoder accepted an unknown header field"),
+        }
+    }
+
+    let blob = Blob {
+        data: b"forgefs-unknown-field".to_vec(),
+    }
+    .encode();
+    assert_corrupt("blob", Blob::decode(&with_unknown_field(&blob)).map(|_| ()));
+
+    let tree = Tree::new(vec![TreeEntry {
+        name: "alpha".into(),
+        kind: EntryKind::Blob,
+        id: ObjectId([0x11; 32]),
+        exec: false,
+    }])
+    .unwrap()
+    .encode()
+    .unwrap();
+    assert_corrupt("tree", Tree::decode(&with_unknown_field(&tree)).map(|_| ()));
+
+    let commit = Commit {
+        tree: ObjectId([0x33; 32]),
+        parents: vec![ObjectId([0x44; 32])],
+        agent: "agent-a".into(),
+        msg: "unknown field must not be tolerated".into(),
+        ts: 42,
+        landmark: false,
+        contrib: None,
+    }
+    .encode();
+    assert_corrupt(
+        "commit",
+        Commit::decode(&with_unknown_field(&commit)).map(|_| ()),
+    );
+
+    let conflict = Conflict {
+        bases: vec![ObjectId([1; 32])],
+        ours: ObjectId([2; 32]),
+        theirs: ObjectId([3; 32]),
+        paths: vec![],
+        causal: vec![],
+    }
+    .encode();
+    assert_corrupt(
+        "conflict",
+        Conflict::decode(&with_unknown_field(&conflict)).map(|_| ()),
+    );
+
+    let snapshot = Snapshot {
+        tree: ObjectId([1; 32]),
+        commit: ObjectId([2; 32]),
+        tag: "v0".into(),
+        ts: 1,
+        prov: ObjectId([3; 32]),
+        pk: [4; 32],
+        sig: [5; 64],
+    }
+    .encode();
+    assert_corrupt(
+        "snapshot",
+        Snapshot::decode(&with_unknown_field(&snapshot)).map(|_| ()),
+    );
+
+    let contribution = Contribution {
+        base: ObjectId([0x10; 32]),
+        tree: ObjectId([0x20; 32]),
+        parents: vec![ObjectId([0x30; 32])],
+        reads: vec![ContributionRead {
+            path: "src/lib.rs".into(),
+            id: ObjectId([0x40; 32]),
+        }],
+        writes: vec!["README.md".into()],
+        agent: "agent-a".into(),
+        ts: 1,
+    }
+    .encode()
+    .unwrap();
+    assert_corrupt(
+        "contribution",
+        Contribution::decode(&with_unknown_field(&contribution)).map(|_| ()),
     );
 }

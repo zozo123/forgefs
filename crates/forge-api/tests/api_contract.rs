@@ -40,6 +40,10 @@ fn invariant_contract_matrix() {
             i13_i14_roles_and_namespaces_have_no_ambient_authority,
         ),
         (
+            "I14 a namespace id is not a capability",
+            i14_namespace_id_is_not_a_capability,
+        ),
+        (
             "I10/I15 sealed releases attest contributions after a durable reopen",
             i15_sealed_releases_verify_after_reopen,
         ),
@@ -250,6 +254,53 @@ fn i13_i14_roles_and_namespaces_have_no_ambient_authority() {
     );
     let role_error = fixture.forge.seal(&alice, "main", "forbidden").unwrap_err();
     assert!(matches!(role_error, Error::Denied(_)), "{role_error}");
+}
+
+fn i14_namespace_id_is_not_a_capability() {
+    // I14: holding a valid capability plus another agent's namespace id is not
+    // authority over that namespace. Both agents carry `ref=main`, so every
+    // ref-scope check inside these calls succeeds on its own merits and the only
+    // thing that can deny bob is namespace ownership -- which keeps the
+    // assertions about I14 rather than about capability ref scope.
+    let fixture = Fixture::new();
+    let alice = fixture.agent("alice");
+    let bob = fixture.agent("bob");
+    let alice_ns = fixture.session(&alice, "main");
+    let bob_ns = fixture.session(&bob, "main");
+
+    // session_open mounts `ref:main` read-only at /main, so this listing is
+    // legal for each agent inside its own namespace.
+    fixture.forge.ls(&alice, &alice_ns, "/main").unwrap();
+    fixture.forge.ls(&bob, &bob_ns, "/main").unwrap();
+
+    let ls_error = match fixture.forge.ls(&bob, &alice_ns, "/main") {
+        Ok(entries) => panic!("namespace id granted a foreign read: {entries:?}"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&ls_error, Error::Denied(m) if m.contains("is owned by")),
+        "foreign read denied for the wrong reason: {ls_error}"
+    );
+
+    // Nor may bob graft a fresh read-write mount onto alice's namespace.
+    let mount_error = match fixture
+        .forge
+        .mount(&bob, &alice_ns, "/borrowed", "ref:main", true)
+    {
+        Ok(()) => panic!("namespace id granted a foreign read-write mount"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&mount_error, Error::Denied(m) if m.contains("is owned by")),
+        "foreign mount denied for the wrong reason: {mount_error}"
+    );
+
+    // The refused mount left alice's namespace untouched.
+    let absent = fixture
+        .forge
+        .ls(&alice, &alice_ns, "/borrowed")
+        .unwrap_err();
+    assert!(!matches!(absent, Error::Denied(_)), "{absent}");
 }
 
 fn i15_sealed_releases_verify_after_reopen() {

@@ -93,3 +93,32 @@ fn malformed_names_and_kind_changes_fail() {
         Err(Error::Invalid(_))
     ));
 }
+
+/// I6: the tag ref, its reflog entry, and the seals row publish together, so a
+/// rejected seals row must leave no `tags/` ref and no reflog entry behind.
+#[test]
+fn seal_ref_reflog_and_seal_row_publish_atomically() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("m.sqlite");
+    let meta = Meta::open(&db).unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_seals BEFORE INSERT ON seals BEGIN SELECT RAISE(FAIL, 'boom'); END;",
+        )
+        .unwrap();
+
+    assert!(meta
+        .commit_seal("v1", oid(1), oid(2), oid(3), "sealer")
+        .is_err());
+
+    assert!(
+        meta.get_ref("tags/v1").unwrap().is_none(),
+        "sealed tag ref survived a failed seals row"
+    );
+    assert!(
+        meta.reflog("tags/v1", 10).unwrap().is_empty(),
+        "seal reflog entry survived a failed seals row"
+    );
+    assert!(meta.get_seal("v1").unwrap().is_none());
+}

@@ -350,3 +350,60 @@ fn key_material_has_strict_permissions_and_open_rejects_loose_secret() {
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(matches!(Forge::open(d.path()), Err(Error::Denied(_))));
 }
+
+/// I15: a seal payload is only trusted when its signature verifies under the
+/// trusted seal key of this forge, so a snapshot that claims that key but was
+/// signed by another must fail closed in `verify_tag` and in a full fsck.
+#[test]
+fn verify_rejects_seal_signature_not_made_by_this_forge_trusted_key() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+    let ns = f.session_open(&root, "main").unwrap();
+    f.write(&root, &ns, "/release.txt", b"sealed", false)
+        .unwrap();
+    let contribution_ref = match f.checkin(&root, &ns, "/", "release").unwrap() {
+        CasResult::Updated { name, .. } => name,
+        other => panic!("material checkin did not update its private ref: {other:?}"),
+    };
+    f.merge(&root, "main", &contribution_ref, None).unwrap();
+    let honest_oid = f.seal(&root, "main", "honest-signature").unwrap();
+
+    let store = root_store(d.path());
+    let honest = store.get_snapshot(honest_oid).unwrap();
+    assert_eq!(honest.pk, signing_key(d.path()).verifying_key().to_bytes());
+
+    // Same commit, tree and provenance manifest, and the trusted public key is
+    // reproduced verbatim; only the signature comes from a key this forge does
+    // not trust.
+    let attacker = SigningKey::from_bytes(&[9u8; 32]);
+    let mut forged = honest.clone();
+    forged.tag = "forged-signature".into();
+    forged.ts += 1;
+    sign_snapshot(&attacker, &mut forged);
+    assert_eq!(forged.pk, honest.pk);
+    assert_ne!(forged.sig, honest.sig);
+    let forged_oid = store.put_snapshot(&forged).unwrap();
+    store
+        .meta
+        .commit_seal(&forged.tag, forged_oid, forged.commit, forged.tree, "test")
+        .unwrap();
+
+    assert_eq!(f.verify_tag(&root, "honest-signature").unwrap(), honest_oid);
+    let error = f.verify_tag(&root, &forged.tag).unwrap_err();
+    assert!(
+        matches!(&error, Error::Corrupt(detail) if detail.contains("snapshot signature")),
+        "{error:?}"
+    );
+
+    let report = f.fsck(&root, true).unwrap();
+    assert!(!report.ok);
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.code == "SEAL_PAYLOAD"
+                && finding.resource == format!("catalog:seal:{}", forged.tag)
+        }),
+        "{:#?}",
+        report.findings
+    );
+}
