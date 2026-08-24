@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
 // A pre-publication init crash may leave private material only in reserved
-// staging; the next serialized init must reclaim every such sibling.
+// staging; the next serialized init must reclaim every such sibling. Prefix
+// lookalikes are user paths unless they match ForgeFS's exact pid+ULID grammar.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
