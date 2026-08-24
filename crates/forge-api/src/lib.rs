@@ -1036,13 +1036,14 @@ impl Forge {
         }
     }
 
-    pub fn import_dir(&self, cap: &Cap, dir: &Path, r#ref: &str) -> Result<ObjectId> {
+    pub fn import_dir(&self, cap: &Cap, dir: &Path, r#ref: &str) -> Result<CasResult> {
         self.check(cap, Op::Write, Some(r#ref))?;
         let previous = self.store.meta.get_ref(r#ref)?;
         let previous_commit = match previous.as_ref() {
             Some(row) => Some(self.store.get_commit(row.oid)?),
             None => None,
         };
+        import_snapshot_barrier()?;
         let tree = import_walk(&self.store, dir, true)?;
         let parents = previous
             .as_ref()
@@ -1062,18 +1063,16 @@ impl Forge {
             .store
             .collect_intros(previous_commit.as_ref().map(|c| c.tree), tree)?;
         match previous {
-            Some(row) => {
-                self.store.meta.cas_ref_with_intros(
-                    r#ref,
-                    row.oid,
-                    cid,
-                    "commit",
-                    cap.agent_id(),
-                    cap.agent_id(),
-                    false,
-                    &intro_oids,
-                )?;
-            }
+            Some(row) => self.store.meta.cas_ref_with_intros(
+                r#ref,
+                row.oid,
+                cid,
+                "commit",
+                cap.agent_id(),
+                cap.agent_id(),
+                false,
+                &intro_oids,
+            ),
             None => {
                 self.store.meta.insert_ref_with_intros(
                     r#ref,
@@ -1085,9 +1084,12 @@ impl Forge {
                     "import",
                     &intro_oids,
                 )?;
+                Ok(CasResult::Updated {
+                    name: r#ref.to_string(),
+                    oid: cid,
+                })
             }
         }
-        Ok(cid)
     }
 
     pub fn landmark(&self, cap: &Cap, oid: ObjectId) -> Result<()> {
@@ -1797,6 +1799,32 @@ pub fn find_forge(start: &Path) -> Result<PathBuf> {
         "no .forge above {}",
         start.display()
     )))
+}
+
+/// Debug-build-only synchronization hook for the process-level import CAS race.
+/// Each participant has already snapshotted the target ref before entering this
+/// barrier, so two real CLI processes deterministically race the same expected OID.
+fn import_snapshot_barrier() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if let Some(raw) = std::env::var_os("FORGEFS_TEST_IMPORT_SNAPSHOT_BARRIER") {
+        let dir = PathBuf::from(raw);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(std::process::id().to_string()), b"ready")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let ready = fs::read_dir(&dir)?.filter_map(|entry| entry.ok()).count();
+            if ready >= 2 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Busy(
+                    "timed out waiting for import snapshot test barrier".into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    Ok(())
 }
 
 /// Debug-build-only process crash hook used by the cross-process init matrix.

@@ -159,7 +159,11 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
         .iter()
         .filter_map(|line| fork_name(line))
         .collect::<Vec<_>>();
-    assert_eq!(forks.len(), 1, "the CAS loser must name its fork: {stdout:?}");
+    assert_eq!(
+        forks.len(),
+        1,
+        "the CAS loser must name its fork: {stdout:?}"
+    );
     let fork = &forks[0];
 
     let reopened = Forge::open(d.path()).unwrap();
@@ -178,7 +182,10 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
     let loser_marker = marker_at(&reopened, &cap, fork);
     assert!(matches!(winner_marker, b'L' | b'R'));
     assert!(matches!(loser_marker, b'L' | b'R'));
-    assert_ne!(winner_marker, loser_marker, "snapshots mixed or work was lost");
+    assert_ne!(
+        winner_marker, loser_marker,
+        "snapshots mixed or work was lost"
+    );
 
     let winner_only = if winner_marker == b'L' {
         "/only-left.txt"
@@ -196,5 +203,9 @@ fn concurrent_cli_imports_preserve_and_truthfully_report_the_loser() {
     assert!(reopened.read(&cap, &loser_ns, loser_only).is_ok());
 
     let report = reopened.fsck(&cap, true).unwrap();
-    assert!(report.ok, "concurrent import left corruption: {:?}", report.findings);
+    assert!(
+        report.ok,
+        "concurrent import left corruption: {:?}",
+        report.findings
+    );
 }
