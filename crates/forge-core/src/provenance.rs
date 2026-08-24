@@ -91,9 +91,7 @@ impl ProvenanceManifest {
 
     fn decode_with_limit(bytes: &[u8], max_bytes: usize) -> Result<Self> {
         if bytes.len() > max_bytes {
-            return Err(Error::Corrupt(
-                "provenance serialized size limit".into(),
-            ));
+            return Err(Error::Corrupt("provenance serialized size limit".into()));
         }
         let mut reader = Reader::new(bytes);
         let count = reader.map()?;
@@ -104,8 +102,7 @@ impl ProvenanceManifest {
         let mut entries = BTreeMap::new();
         let mut last = None;
         for _ in 0..count {
-            let encoded_id =
-                reader.text_map_key_bounded(&mut last, 64, "provenance object id")?;
+            let encoded_id = reader.text_map_key_bounded(&mut last, 64, "provenance object id")?;
             if encoded_id.len() != 64 {
                 return Err(Error::Corrupt("provenance object id length".into()));
             }
@@ -116,10 +113,7 @@ impl ProvenanceManifest {
                     "provenance object ids must be lowercase hex".into(),
                 ));
             }
-            let agent = reader.text_bounded(
-                MAX_LABEL_BYTES,
-                "provenance attribution label",
-            )?;
+            let agent = reader.text_bounded(MAX_LABEL_BYTES, "provenance attribution label")?;
             if entries.insert(id, agent).is_some() {
                 return Err(Error::Corrupt("duplicate provenance object id".into()));
             }
@@ -144,20 +138,15 @@ mod limit_tests {
 
     #[test]
     fn attribution_and_canonical_payload_limits_apply_before_publication() {
-        let oversized_label = BTreeMap::from([(
-            ObjectId([1; 32]),
-            "x".repeat(MAX_LABEL_BYTES + 1),
-        )]);
+        let oversized_label =
+            BTreeMap::from([(ObjectId([1; 32]), "x".repeat(MAX_LABEL_BYTES + 1))]);
         assert!(ProvenanceManifest::new(oversized_label).is_err());
 
-        let manifest = ProvenanceManifest::new(BTreeMap::from([(
-            ObjectId([2; 32]),
-            "agent".into(),
-        )]))
-        .unwrap();
+        let manifest =
+            ProvenanceManifest::new(BTreeMap::from([(ObjectId([2; 32]), "agent".into())])).unwrap();
         let canonical = manifest.encode();
-        let error = ProvenanceManifest::decode_with_limit(&canonical, canonical.len() - 1)
-            .unwrap_err();
+        let error =
+            ProvenanceManifest::decode_with_limit(&canonical, canonical.len() - 1).unwrap_err();
         assert!(error.to_string().contains("serialized size limit"));
     }
 
