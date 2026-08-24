@@ -2,6 +2,7 @@
 
 mod support;
 
+use forge_api::Forge;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Barrier};
@@ -48,6 +49,14 @@ fn checkin(dir: &Path, root: &Path, ns: &str, barrier: Option<&Path>) -> Output 
         cmd.env("FORGEFS_TEST_CHECKIN_CAS_BARRIER", barrier);
     }
     output(&mut cmd)
+}
+
+fn fork_name(stdout: &str, requested: &str) -> Option<String> {
+    let mut fields = stdout.split_whitespace();
+    if fields.next()? != "forked" || fields.next()? != requested || fields.next()? != "->" {
+        return None;
+    }
+    fields.next().map(str::to_string)
 }
 
 #[test]
@@ -107,10 +116,10 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
         .iter()
         .filter(|stdout| stdout.contains(&format!("updated {live_ref}")))
         .count();
-    let forked = outputs
+    let forks = outputs
         .iter()
-        .filter(|stdout| stdout.contains(&format!("forked {live_ref} -> forks/{live_ref}/")))
-        .count();
+        .filter_map(|stdout| fork_name(stdout, &live_ref))
+        .collect::<Vec<_>>();
     let noop = outputs
         .iter()
         .filter(|stdout| stdout.contains(&format!("noop {live_ref}")))
@@ -120,13 +129,29 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
         "one and only one live-ref update is allowed: {outputs:?}"
     );
     assert_eq!(
-        forked, 1,
+        forks.len(), 1,
         "the synchronized CAS loser must be an explicit fork: {outputs:?}"
     );
     assert_eq!(
         noop, 0,
         "the pre-CAS barrier must prevent a serialized noop: {outputs:?}"
     );
+
+    let fork = &forks[0];
+    assert!(
+        fork.starts_with(&format!("forks/{live_ref}/")),
+        "checkin reported an unexpected fork namespace: {fork}"
+    );
+    let reopened = Forge::open(d.path()).unwrap();
+    let reopened_cap = reopened.root_cap().unwrap();
+    let refs = reopened.refs(&reopened_cap).unwrap();
+    assert_eq!(
+        refs.iter().filter(|row| row.name == *fork).count(),
+        1,
+        "reported fork is not a unique durable ref: {fork}; refs={refs:?}"
+    );
+    drop(reopened_cap);
+    drop(reopened);
 
     // The losing CAS retargets the persisted namespace to its durable fork.
     // That completed transition must still resolve the exact committed bytes.
