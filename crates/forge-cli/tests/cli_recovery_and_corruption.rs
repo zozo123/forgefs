@@ -268,3 +268,25 @@ fn cli_full_fsck_fails_closed_after_durable_blob_bitrot() {
         "bitrot was not reported clearly\nstdout={stdout}\nstderr={stderr}"
     );
 }
+
+#[test]
+fn cli_full_fsck_classifies_a_corrupt_sqlite_header_as_catalog_corruption() {
+    let d = tempdir().unwrap();
+    let root_path = init(d.path());
+    let root = root_path.to_str().unwrap();
+    let catalog = d.path().join(".forge/meta.sqlite");
+    let mut bytes = fs::read(&catalog).unwrap();
+    assert!(bytes.len() >= 16);
+    bytes[..16].copy_from_slice(b"not a sqlite db!");
+    fs::write(&catalog, bytes).unwrap();
+
+    let mut fsck = authenticated(d.path(), root);
+    fsck.arg("fsck").arg("--full");
+    let result = output(&mut fsck);
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("metadata catalog") && stderr.contains("corrupt"),
+        "catalog corruption was not classified clearly: {stderr}"
+    );
+}

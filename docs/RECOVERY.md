@@ -54,7 +54,7 @@ barrier.
 
 A crash may leave durable but unreachable objects or temporary files. Those are safe because immutable object publication is idempotent and refs are the roots of truth. A crash must not leave a successfully committed ref pointing at a missing or corrupt object.
 
-`forge fsck --full` is the end-to-end validator. If a referenced object cannot be read and rehashed, recovery has failed and ForgeFS reports corruption rather than inventing bytes or silently moving refs.
+`forge fsck --full` is the end-to-end validator. It validates SQLite's physical structure and the mutable catalog's schema, reflog, seal, landmark, provenance, and namespace relations from one read snapshot before proving immutable object closure. If a catalog relation is inconsistent or a referenced object cannot be read and rehashed, recovery has failed and ForgeFS reports corruption rather than inventing bytes, moving refs, or silently repairing rows. A damaged migration ledger is admitted only to this detection-only fsck path so it can be named precisely; all other read-only and writable opens continue to fail closed on incompatible schema state.
 
 ## Executable fault matrix
 

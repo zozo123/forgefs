@@ -46,14 +46,14 @@ See [INVARIANTS.md](INVARIANTS.md) for the compact correctness contract and
 # refs, seals, namespaces, mounts, observations, and reachable typed object closure
 cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck
 
-# additionally scan every object file, including unreachable/orphan objects
+# additionally prove SQLite structure/catalog relations and scan every object file
 cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full
 
 # machine-readable report for CI/agents
 cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full --json
 ```
 
-`fsck` is read-only. It bypasses hot object caches, rehashes durable bytes, verifies expected type on every graph edge, checks sealed tags against the trusted local seal key, validates namespace/live-ref/mount state, and bounds graph work. It reports corruption; it does not silently repair it.
+`fsck` is read-only. It bypasses hot object caches, rehashes durable bytes, verifies expected type on every graph edge, checks sealed tags against the trusted local seal key, validates namespace/live-ref/mount state, and bounds graph work. `fsck --full` also runs SQLite integrity checking from one coherent read transaction; proves the schema ledger, ref/reflog terminal state and chain, seal/tag/landmark closure, provenance rows, and namespace-owned relations; then scans unreachable object files. Findings are deterministic and detection-only: ForgeFS never silently repairs catalog rows.
 
 ## Why it is agent-native
 

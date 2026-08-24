@@ -185,6 +185,16 @@ impl Forge {
             return Err(Error::Corrupt("sealed tag ref metadata mismatch".into()));
         }
 
+        self.verify_seal_payload(tag, snap_oid, commit_oid, tree_oid)
+    }
+
+    pub(crate) fn verify_seal_payload(
+        &self,
+        tag: &str,
+        snap_oid: ObjectId,
+        commit_oid: ObjectId,
+        tree_oid: ObjectId,
+    ) -> Result<ObjectId> {
         let snap = Snapshot::decode(&self.store.get_raw_verified(snap_oid)?)?;
         if snap.pk != self.seal_pk {
             return Err(Error::Corrupt(

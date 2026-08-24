@@ -2,6 +2,7 @@ use crate::Forge;
 use forge_cap::{Cap, Op};
 use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snapshot, Tree};
 use forge_ns::{parse_spec, Spec};
+use forge_store::CatalogObjectExpectation;
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -9,6 +10,13 @@ use std::fs;
 use std::path::Path;
 
 const MAX_OBJECTS: usize = 1_000_000;
+
+#[derive(Clone, Copy, Debug)]
+enum ObjectExpectation {
+    Any,
+    Exact(ObjectType),
+    TreeEntry,
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct FsckFinding {
@@ -46,6 +54,13 @@ impl FsckReport {
             resource: resource.into(),
             detail: detail.into(),
         });
+    }
+
+    fn finish(&mut self) {
+        self.findings.sort_by(|a, b| {
+            (&a.code, &a.resource, &a.detail).cmp(&(&b.code, &b.resource, &b.detail))
+        });
+        self.findings.dedup();
     }
 }
 
@@ -89,6 +104,11 @@ impl Forge {
         // created mid-scan on a repository whose bytes are entirely intact.
         // `late_ref` re-resolves those before they are reported as corruption.
         let mut report = FsckReport::new(full);
+        let catalog = if full {
+            Some(self.store.meta.audit_catalog()?)
+        } else {
+            None
+        };
         for path in crate::repository::init_staging_siblings(self.root())? {
             report.finding(
                 "INIT_STAGING",
@@ -110,18 +130,24 @@ impl Forge {
                 }
             };
             ref_types.insert(row.name.clone(), (row.oid, expected));
-            roots.push((row.oid, Some(expected), format!("ref:{}", row.name)));
+            roots.push((
+                row.oid,
+                ObjectExpectation::Exact(expected),
+                format!("ref:{}", row.name),
+            ));
 
             if let Some(tag) = row.name.strip_prefix("tags/") {
-                if !row.protected || !row.sealed || row.kind != "snapshot" {
+                if !full && (!row.protected || !row.sealed || row.kind != "snapshot") {
                     report.finding(
                         "TAG_FLAGS",
                         format!("ref:{}", row.name),
                         "tag refs must be protected+sealed snapshots",
                     );
                 }
-                if let Err(err) = self.verify_tag(cap, tag) {
-                    report.finding("SEAL", format!("tag:{tag}"), err.to_string());
+                if !full {
+                    if let Err(err) = self.verify_tag(cap, tag) {
+                        report.finding("SEAL", format!("tag:{tag}"), err.to_string());
+                    }
                 }
             }
         }
@@ -131,7 +157,11 @@ impl Forge {
         for ns in &namespaces {
             let ns_resource = format!("namespace:{}", ns.id);
             if let Some(pin) = ns.pinned_oid {
-                roots.push((pin, Some(ObjectType::Commit), format!("{ns_resource}:pin")));
+                roots.push((
+                    pin,
+                    ObjectExpectation::Exact(ObjectType::Commit),
+                    format!("{ns_resource}:pin"),
+                ));
             } else {
                 report.finding("NS_PIN", &ns_resource, "namespace has no pinned commit");
             }
@@ -140,7 +170,7 @@ impl Forge {
                 match ref_types.get(live) {
                     Some((oid, ty)) if *ty == ObjectType::Commit => roots.push((
                         *oid,
-                        Some(ObjectType::Commit),
+                        ObjectExpectation::Exact(ObjectType::Commit),
                         format!("{ns_resource}:live_ref:{live}"),
                     )),
                     Some((_oid, ty)) => report.finding(
@@ -151,7 +181,7 @@ impl Forge {
                     None => match self.late_ref(live) {
                         Some((oid, ObjectType::Commit)) => roots.push((
                             oid,
-                            Some(ObjectType::Commit),
+                            ObjectExpectation::Exact(ObjectType::Commit),
                             format!("{ns_resource}:live_ref:{live}"),
                         )),
                         Some((_oid, ty)) => report.finding(
@@ -174,11 +204,19 @@ impl Forge {
                 match parse_spec(&mount.spec) {
                     Ok(Spec::Ref(name)) => match ref_types.get(&name) {
                         Some((oid, ty)) => {
-                            roots.push((*oid, Some(*ty), format!("{mount_resource}:ref:{name}")))
+                            roots.push((
+                                *oid,
+                                ObjectExpectation::Exact(*ty),
+                                format!("{mount_resource}:ref:{name}"),
+                            ))
                         }
                         None => match self.late_ref(&name) {
                             Some((oid, ty)) => {
-                                roots.push((oid, Some(ty), format!("{mount_resource}:ref:{name}")))
+                                roots.push((
+                                    oid,
+                                    ObjectExpectation::Exact(ty),
+                                    format!("{mount_resource}:ref:{name}"),
+                                ))
                             }
                             None => report.finding(
                                 "MOUNT_REF",
@@ -195,7 +233,7 @@ impl Forge {
                                 "read-write mount cannot target immutable raw OID",
                             );
                         }
-                        roots.push((id, None, format!("{mount_resource}:oid")));
+                        roots.push((id, ObjectExpectation::Any, format!("{mount_resource}:oid")));
                     }
                     Err(err) => report.finding("MOUNT_SPEC", &mount_resource, err.to_string()),
                 }
@@ -204,7 +242,7 @@ impl Forge {
                     if let Some(id) = row.blob_oid {
                         roots.push((
                             id,
-                            Some(ObjectType::Blob),
+                            ObjectExpectation::Exact(ObjectType::Blob),
                             format!("{mount_resource}:overlay:{}", row.path),
                         ));
                     }
@@ -214,7 +252,7 @@ impl Forge {
             for observation in self.store.meta.observations(&ns.id)? {
                 roots.push((
                     observation.oid,
-                    Some(ObjectType::Blob),
+                    ObjectExpectation::Exact(ObjectType::Blob),
                     format!(
                         "{ns_resource}:observation:{}:{}",
                         observation.mount, observation.path
@@ -223,11 +261,43 @@ impl Forge {
             }
         }
 
+
+        if let Some(catalog) = catalog {
+            for seal in &catalog.seals {
+                if let Err(error) = self.verify_seal_payload(
+                    &seal.tag,
+                    seal.snap_oid,
+                    seal.commit_oid,
+                    seal.tree_oid,
+                ) {
+                    report.finding(
+                        "SEAL_PAYLOAD",
+                        format!("catalog:seal:{}", seal.tag),
+                        error.to_string(),
+                    );
+                }
+            }
+            for finding in catalog.findings {
+                report.finding(&finding.code, finding.resource, finding.detail);
+            }
+            for root in catalog.roots {
+                let expected = match root.expected {
+                    CatalogObjectExpectation::Any => ObjectExpectation::Any,
+                    CatalogObjectExpectation::Exact(expected) => {
+                        ObjectExpectation::Exact(expected)
+                    }
+                    CatalogObjectExpectation::TreeEntry => ObjectExpectation::TreeEntry,
+                };
+                roots.push((root.oid, expected, root.resource));
+            }
+        }
+
         if full {
             scan_all_object_paths(&self.store.root(), &mut roots, &mut report)?;
         }
 
         verify_graph(&self.store, roots, &mut report);
+        report.finish();
         Ok(report)
     }
 }
@@ -243,9 +313,38 @@ fn object_type_for_kind(kind: &str) -> std::result::Result<ObjectType, String> {
     }
 }
 
+fn check_object_expectation(
+    report: &mut FsckReport,
+    id: ObjectId,
+    actual: ObjectType,
+    expected: ObjectExpectation,
+    resource: &str,
+) {
+    let expected_name = match expected {
+        ObjectExpectation::Any => None,
+        ObjectExpectation::Exact(expected) if actual != expected => Some(expected.as_str()),
+        ObjectExpectation::TreeEntry
+            if !matches!(actual, ObjectType::Blob | ObjectType::Tree) =>
+        {
+            Some("blob or tree")
+        }
+        _ => None,
+    };
+    if let Some(expected_name) = expected_name {
+        report.finding(
+            "TYPE_MISMATCH",
+            resource,
+            format!(
+                "{id} is {}, expected {expected_name}",
+                actual.as_str()
+            ),
+        );
+    }
+}
+
 fn verify_graph(
     store: &forge_store::Store,
-    roots: Vec<(ObjectId, Option<ObjectType>, String)>,
+    roots: Vec<(ObjectId, ObjectExpectation, String)>,
     report: &mut FsckReport,
 ) {
     let mut queue: VecDeque<_> = roots.into();
@@ -265,19 +364,7 @@ fn verify_graph(
         }
 
         if let Some(actual) = verified.get(&id).copied() {
-            if let Some(expected) = expected {
-                if actual != expected {
-                    report.finding(
-                        "TYPE_MISMATCH",
-                        resource,
-                        format!(
-                            "{id} is {}, expected {}",
-                            actual.as_str(),
-                            expected.as_str()
-                        ),
-                    );
-                }
-            }
+            check_object_expectation(report, id, actual, expected, &resource);
             continue;
         }
 
@@ -298,19 +385,7 @@ fn verify_graph(
         report.checked_objects += 1;
         verified.insert(id, actual);
 
-        if let Some(expected) = expected {
-            if actual != expected {
-                report.finding(
-                    "TYPE_MISMATCH",
-                    resource.clone(),
-                    format!(
-                        "{id} is {}, expected {}",
-                        actual.as_str(),
-                        expected.as_str()
-                    ),
-                );
-            }
-        }
+        check_object_expectation(report, id, actual, expected, &resource);
 
         if !expanded.insert(id) {
             continue;
@@ -326,7 +401,7 @@ fn verify_graph(
                     };
                     queue.push_back((
                         entry.id,
-                        Some(expected),
+                        ObjectExpectation::Exact(expected),
                         format!("tree:{id}:{}", entry.name),
                     ));
                 }
@@ -334,20 +409,20 @@ fn verify_graph(
             ObjectType::Commit => Commit::decode(&bytes).map(|commit| {
                 queue.push_back((
                     commit.tree,
-                    Some(ObjectType::Tree),
+                    ObjectExpectation::Exact(ObjectType::Tree),
                     format!("commit:{id}:tree"),
                 ));
                 for parent in commit.parents {
                     queue.push_back((
                         parent,
-                        Some(ObjectType::Commit),
+                        ObjectExpectation::Exact(ObjectType::Commit),
                         format!("commit:{id}:parent"),
                     ));
                 }
                 if let Some(contrib) = commit.contrib {
                     queue.push_back((
                         contrib,
-                        Some(ObjectType::Contribution),
+                        ObjectExpectation::Exact(ObjectType::Contribution),
                         format!("commit:{id}:contribution"),
                     ));
                 }
@@ -355,70 +430,78 @@ fn verify_graph(
             ObjectType::Snapshot => Snapshot::decode(&bytes).map(|snapshot| {
                 queue.push_back((
                     snapshot.tree,
-                    Some(ObjectType::Tree),
+                    ObjectExpectation::Exact(ObjectType::Tree),
                     format!("snapshot:{id}:tree"),
                 ));
                 queue.push_back((
                     snapshot.commit,
-                    Some(ObjectType::Commit),
+                    ObjectExpectation::Exact(ObjectType::Commit),
                     format!("snapshot:{id}:commit"),
                 ));
                 queue.push_back((
                     snapshot.prov,
-                    Some(ObjectType::Blob),
+                    ObjectExpectation::Exact(ObjectType::Blob),
                     format!("snapshot:{id}:provenance"),
                 ));
             }),
             ObjectType::Contribution => Contribution::decode(&bytes).map(|contribution| {
                 queue.push_back((
                     contribution.base,
-                    Some(ObjectType::Commit),
+                    ObjectExpectation::Exact(ObjectType::Commit),
                     format!("contribution:{id}:base"),
                 ));
                 queue.push_back((
                     contribution.tree,
-                    Some(ObjectType::Tree),
+                    ObjectExpectation::Exact(ObjectType::Tree),
                     format!("contribution:{id}:tree"),
                 ));
                 for parent in contribution.parents {
                     queue.push_back((
                         parent,
-                        Some(ObjectType::Commit),
+                        ObjectExpectation::Exact(ObjectType::Commit),
                         format!("contribution:{id}:parent"),
                     ));
                 }
                 for read in contribution.reads {
                     queue.push_back((
                         read.id,
-                        Some(ObjectType::Blob),
+                        ObjectExpectation::Exact(ObjectType::Blob),
                         format!("contribution:{id}:read:{}", read.path),
                     ));
                 }
             }),
             ObjectType::Conflict => Conflict::decode(&bytes).map(|conflict| {
                 for base in conflict.bases {
-                    queue.push_back((base, Some(ObjectType::Tree), format!("conflict:{id}:base")));
+                    queue.push_back((
+                        base,
+                        ObjectExpectation::Exact(ObjectType::Tree),
+                        format!("conflict:{id}:base"),
+                    ));
                 }
                 queue.push_back((
                     conflict.ours,
-                    Some(ObjectType::Tree),
+                    ObjectExpectation::Exact(ObjectType::Tree),
                     format!("conflict:{id}:ours"),
                 ));
                 queue.push_back((
                     conflict.theirs,
-                    Some(ObjectType::Tree),
+                    ObjectExpectation::Exact(ObjectType::Tree),
                     format!("conflict:{id}:theirs"),
                 ));
                 for causal in conflict.causal {
                     queue.push_back((
                         causal,
-                        Some(ObjectType::Commit),
+                        ObjectExpectation::Exact(ObjectType::Commit),
                         format!("conflict:{id}:causal"),
                     ));
                 }
                 for path in conflict.paths {
                     for edge in [path.a, path.b, path.base].into_iter().flatten() {
-                        queue.push_back((edge, None, format!("conflict:{id}:path:{}", path.path)));
+                        queue.push_back((
+                            edge,
+                            ObjectExpectation::Any,
+                            format!("conflict:{id}:path:{}", path.path),
+                        ));
                     }
                 }
             }),
@@ -432,7 +515,7 @@ fn verify_graph(
 
 fn scan_all_object_paths(
     root: &Path,
-    roots: &mut Vec<(ObjectId, Option<ObjectType>, String)>,
+    roots: &mut Vec<(ObjectId, ObjectExpectation, String)>,
     report: &mut FsckReport,
 ) -> Result<()> {
     let objects = root.join("objects");
@@ -490,7 +573,7 @@ fn scan_all_object_paths(
                         ),
                     );
                 }
-                roots.push((id, None, format!("object:{id}")));
+                roots.push((id, ObjectExpectation::Any, format!("object:{id}")));
             }
         }
     }

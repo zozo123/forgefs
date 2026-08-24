@@ -192,7 +192,17 @@ impl Forge {
     pub fn open_read_only(dir: &Path) -> Result<Self> {
         let root = find_forge(dir)?;
         let cell_lock = acquire_cell_lock(&root, LockIntent::ReadOnly)?;
-        Self::open_locked_mode(root, cell_lock, false, true)
+        Self::open_locked_mode(root, cell_lock, false, true, false)
+    }
+
+    /// Detection-only read-only open for `fsck`. A broken migration ledger is
+    /// admitted far enough for fsck to report `SCHEMA_LEDGER`; all filesystem,
+    /// lock, object-store, and SQLite write prohibitions remain identical to
+    /// `open_read_only`.
+    pub fn open_for_fsck(dir: &Path) -> Result<Self> {
+        let root = find_forge(dir)?;
+        let cell_lock = acquire_cell_lock(&root, LockIntent::ReadOnly)?;
+        Self::open_locked_mode(root, cell_lock, false, true, true)
     }
 
     /// Open a cell for `forge serve`. The exclusive lock is acquired before
@@ -214,7 +224,7 @@ impl Forge {
     }
 
     fn open_locked(root: PathBuf, cell_lock: Option<File>, exclusive: bool) -> Result<Self> {
-        Self::open_locked_mode(root, cell_lock, exclusive, false)
+        Self::open_locked_mode(root, cell_lock, exclusive, false, false)
     }
 
     fn open_locked_mode(
@@ -222,7 +232,9 @@ impl Forge {
         cell_lock: Option<File>,
         exclusive: bool,
         read_only: bool,
+        fsck_catalog: bool,
     ) -> Result<Self> {
+        debug_assert!(!fsck_catalog || read_only);
         // Revalidate after acquiring ownership. An updater may replace the
         // repository between discovery's read-only check and this lock grant.
         // No key, object, or SQLite state may be read or mutated first.
@@ -240,7 +252,9 @@ impl Forge {
         let seal_seed = read32(&root.join("keys/seal.ed25519"))?;
         let sk = SigningKey::from_bytes(&seal_seed);
         let seal_pk = sk.verifying_key().to_bytes();
-        let store = if read_only {
+        let store = if fsck_catalog {
+            Store::open_read_only_for_fsck(&root)?
+        } else if read_only {
             Store::open_read_only(&root)?
         } else {
             Store::open(&root)?

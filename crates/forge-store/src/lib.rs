@@ -263,6 +263,20 @@ impl Store {
         })
     }
 
+    /// Detection-only open used by fsck. It is byte-for-byte read-only like
+    /// `open_read_only`, but lets the catalog auditor report a damaged schema
+    /// ledger rather than rejecting it before fsck can produce a finding.
+    pub fn open_read_only_for_fsck(root: &Path) -> Result<Self> {
+        let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
+        let meta = Meta::open_read_only_for_fsck(&root.join("meta.sqlite"))?;
+        Ok(Self {
+            blobs,
+            meta,
+            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
+            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        })
+    }
+
     pub fn read_only(&self) -> bool {
         self.meta.read_only()
     }
