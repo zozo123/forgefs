@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use forge_api::Forge;
+use forge_api::{ExportOptions, Forge};
 use forge_cap::Cap;
 use forge_types::{CasResult, Error, ObjectId};
 use std::path::{Path, PathBuf};
@@ -119,6 +119,11 @@ enum Cmd {
         spec: String,
         #[arg(short, long)]
         output: PathBuf,
+        /// Write the archive even when sibling names collide under case
+        /// folding or Unicode NFC/NFD. Off by default: such an archive loses
+        /// an entry silently when extracted on macOS or Windows (I16).
+        #[arg(long)]
+        allow_name_collisions: bool,
     },
     Verify {
         tag: String,
@@ -462,8 +467,19 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
                 println!("attested ok");
             }
         }
-        Cmd::Export { spec, output } => {
-            f.export_tar(cap, &spec, &output)?;
+        Cmd::Export {
+            spec,
+            output,
+            allow_name_collisions,
+        } => {
+            f.export_tar_with(
+                cap,
+                &spec,
+                &output,
+                ExportOptions {
+                    allow_name_collisions,
+                },
+            )?;
             println!("wrote {}", output.display());
         }
         Cmd::Verify { tag } => {

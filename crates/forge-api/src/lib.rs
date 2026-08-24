@@ -16,6 +16,7 @@ mod workspace;
 pub use bench::{
     merge_all_and_seal, private_checkins, run as run_bench, shared_stampede, BenchReport,
 };
+pub use export::ExportOptions;
 pub use fsck::{FsckFinding, FsckReport};
 pub use repository::find_forge;
 pub use serve::{dispatch as dispatch_request, serve, unix_worker_count};

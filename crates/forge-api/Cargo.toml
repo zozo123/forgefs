@@ -23,6 +23,7 @@ serde_json.workspace = true
 tar.workspace = true
 tiny_http.workspace = true
 ulid.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
