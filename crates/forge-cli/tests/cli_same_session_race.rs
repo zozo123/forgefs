@@ -88,13 +88,16 @@ fn init(dir: &Path) -> PathBuf {
     dir.join(".forge/keys/root.cap")
 }
 
-fn checkin(dir: &Path, root: &Path, ns: &str) -> Output {
+fn checkin(dir: &Path, root: &Path, ns: &str, barrier: Option<&Path>) -> Output {
     let mut cmd = authenticated(dir, root);
     cmd.arg("checkin")
         .arg("--ns")
         .arg(ns)
         .arg("-m")
         .arg("same-session race");
+    if let Some(barrier) = barrier {
+        cmd.env("FORGEFS_TEST_CHECKIN_CAS_BARRIER", barrier);
+    }
     output(&mut cmd)
 }
 
@@ -119,15 +122,17 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
     run(&mut write);
 
     let barrier = Arc::new(Barrier::new(2));
+    let cas_barrier = d.path().join("checkin-cas-barrier");
     let mut launchers = Vec::with_capacity(2);
     for _ in 0..2 {
         let barrier = Arc::clone(&barrier);
+        let cas_barrier = cas_barrier.clone();
         let dir = d.path().to_path_buf();
         let cap = root.clone();
         let ns = ns.clone();
         launchers.push(std::thread::spawn(move || {
             barrier.wait();
-            checkin(&dir, &cap, &ns)
+            checkin(&dir, &cap, &ns, Some(&cas_barrier))
         }));
     }
 
@@ -166,18 +171,16 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
         "one and only one live-ref update is allowed: {outputs:?}"
     );
     assert_eq!(
-        updated + forked + noop,
-        2,
-        "the loser must be an explicit fork or an idempotent noop: {outputs:?}"
+        forked, 1,
+        "the synchronized CAS loser must be an explicit fork: {outputs:?}"
     );
-    assert!(
-        forked <= 1 && noop <= 1,
-        "unexpected duplicate outcome: {outputs:?}"
+    assert_eq!(
+        noop, 0,
+        "the pre-CAS barrier must prevent a serialized noop: {outputs:?}"
     );
 
-    // Regardless of whether the second process got far enough to publish an
-    // explicit fork or observed the already-cleared overlay as a noop, the
-    // persisted namespace must still resolve the complete committed bytes.
+    // The losing CAS retargets the persisted namespace to its durable fork.
+    // That completed transition must still resolve the exact committed bytes.
     let mut read = authenticated(d.path(), &root);
     read.arg("read").arg("--ns").arg(&ns).arg("/once.txt");
     let read = output(&mut read);
@@ -189,7 +192,7 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
 
     // A later invocation is idempotent: the overlay was cleared atomically by
     // the successful session transition and cannot be published again.
-    let third = checkin(d.path(), &root, &ns);
+    let third = checkin(d.path(), &root, &ns, None);
     assert!(third.status.success());
     assert!(
         String::from_utf8_lossy(&third.stdout).contains("noop"),
