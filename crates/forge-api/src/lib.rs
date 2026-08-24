@@ -380,14 +380,25 @@ impl Forge {
     }
 
     pub fn refs(&self, cap: &Cap) -> Result<Vec<RefRow>> {
+        Ok(self.refs_with_suppressed(cap)?.0)
+    }
+
+    /// Enumerate refs visible to `cap` and return how many durable rows were
+    /// hidden by ref authority. Names and contents remain undisclosed, but
+    /// automation can distinguish an actually complete view from a filtered one.
+    pub fn refs_with_suppressed(&self, cap: &Cap) -> Result<(Vec<RefRow>, usize)> {
         self.check(cap, Op::Read, None)?;
+        let now = now_ms();
         let mut out = Vec::new();
+        let mut suppressed = 0usize;
         for r in self.store.meta.list_refs()? {
-            if cap.allows(Op::Read, Some(&r.name), now_ms()).is_ok() {
+            if cap.allows(Op::Read, Some(&r.name), now).is_ok() {
                 out.push(r);
+            } else {
+                suppressed += 1;
             }
         }
-        Ok(out)
+        Ok((out, suppressed))
     }
 
     /// Publish a sealed snapshot to a recipient-owned inbox ref.

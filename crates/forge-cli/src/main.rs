@@ -462,13 +462,17 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             println!("ok {oid}");
         }
         Cmd::Refs => {
-            for r in f.refs(cap)? {
+            let (refs, suppressed) = f.refs_with_suppressed(cap)?;
+            for r in refs {
                 let flags = format!(
                     "{}{}",
                     if r.protected { "P" } else { "-" },
                     if r.sealed { "S" } else { "-" }
                 );
                 println!("{flags} {:<32} {} {}", r.kind, r.name, r.oid);
+            }
+            if suppressed > 0 {
+                eprintln!("{suppressed} ref(s) suppressed by authority");
             }
         }
         Cmd::Log { r#ref } => {

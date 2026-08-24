@@ -407,7 +407,7 @@ pub fn mint_integrator(root: &[u8]) -> Result<Cap> {
         "integrator",
         vec![
             "ops=read,merge,seal,grant".into(),
-            "allow=read:main,heads/agents/*,forks/*,tags/*".into(),
+            "allow=read:main,heads/agents/*,forks/*,tags/*,conflicts/*".into(),
             "allow=merge:main".into(),
             "allow=seal:main,tags/*".into(),
         ],
