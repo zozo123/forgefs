@@ -16,11 +16,14 @@ use tempfile::TempDir;
 
 const PRE_VERSIONING: &str = include_str!("../../../testdata/schema/v0_pre_versioning.sql");
 const SHAPE_DRIFT: &str = include_str!("../../../testdata/schema/v0_shape_drift.sql");
+const V1_PRE_OBSERVATION_KIND: &str =
+    include_str!("../../../testdata/schema/v1_pre_observation_kind.sql");
 
 /// Every retired schema version needs frozen bytes to migrate from. The guard
 /// test below fails the moment `CURRENT_SCHEMA_VERSION` is bumped without one,
 /// which is the intended entry point to `testdata/schema/README.md`.
-const RETIRED_SCHEMA_FIXTURES: &[(i64, &str)] = &[(0, PRE_VERSIONING)];
+const RETIRED_SCHEMA_FIXTURES: &[(i64, &str)] =
+    &[(0, PRE_VERSIONING), (1, V1_PRE_OBSERVATION_KIND)];
 
 /// Relations whose rows must survive a migration untouched. `cap_root` is
 /// excluded on purpose: a writable open scrubs a legacy root HMAC key (I14),
@@ -83,6 +86,12 @@ fn dump_all(conn: &Connection) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+/// Every version stepped through is recorded, so a half-applied catalog is
+/// distinguishable from one that reached the current shape.
+fn expected_ledger() -> Vec<i64> {
+    (1..=CURRENT_SCHEMA_VERSION).collect()
+}
+
 fn ledger(conn: &Connection) -> Vec<i64> {
     if !table_exists(conn, "schema_migrations") {
         return Vec::new();
@@ -134,12 +143,50 @@ fn pre_versioning_catalog_carries_every_row_forward() {
     drop(meta);
 
     let after = open_fixture(&path);
-    assert_eq!(ledger(&after), vec![CURRENT_SCHEMA_VERSION]);
+    assert_eq!(ledger(&after), expected_ledger());
+    // `observations` is the one table this migration deliberately reshapes: v2
+    // adds a `kind` discriminant. Asserting byte-equality across it would be
+    // asserting the migration did nothing. Every OTHER table must be untouched,
+    // and the reshaped rows are checked separately below.
+    let without_observations = |rows: &[(String, Vec<String>)]| -> Vec<(String, Vec<String>)> {
+        rows.iter()
+            .filter(|(table, _)| table != "observations")
+            .cloned()
+            .collect()
+    };
     assert_eq!(
-        dump_all(&after),
-        before_rows,
+        without_observations(&dump_all(&after)),
+        without_observations(&before_rows),
         "migration must not rewrite, drop, or reorder any mutable row"
     );
+
+    // Every pre-existing observation is carried forward as the blob
+    // observation it was: same key, same oid, tagged `blob`.
+    let obs_before = &before_rows
+        .iter()
+        .find(|(t, _)| t == "observations")
+        .expect("fixture has observations")
+        .1;
+    let obs_after = dump_all(&after)
+        .into_iter()
+        .find(|(t, _)| t == "observations")
+        .expect("migrated catalog has observations")
+        .1;
+    assert_eq!(
+        obs_after.len(),
+        obs_before.len(),
+        "migration must not drop or duplicate an observation"
+    );
+    for (before_row, after_row) in obs_before.iter().zip(&obs_after) {
+        let (key, oid) = before_row
+            .rsplit_once('|')
+            .expect("observation row is key|oid");
+        assert_eq!(
+            after_row,
+            &format!("{key}|'blob'|{oid}"),
+            "an existing observation must carry forward as a blob observation"
+        );
+    }
 }
 
 /// I14: a pre-versioning catalog may still carry a root HMAC key. Migration is
@@ -246,7 +293,11 @@ fn a_newer_schema_version_is_refused_by_every_normal_open() {
     let conn = open_fixture(&path);
     assert_eq!(
         ledger(&conn),
-        vec![CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1],
+        {
+            let mut expected = expected_ledger();
+            expected.push(CURRENT_SCHEMA_VERSION + 1);
+            expected
+        },
         "a refused open must not rewrite the ledger"
     );
     assert_eq!(dump_all(&conn), rows, "a refused open must not touch rows");
@@ -299,6 +350,6 @@ fn every_retired_schema_version_has_a_migration_fixture() {
             panic!("schema version {version} fixture must migrate forward: {error}")
         }));
         let conn = open_fixture(&path);
-        assert_eq!(ledger(&conn), vec![CURRENT_SCHEMA_VERSION]);
+        assert_eq!(ledger(&conn), expected_ledger());
     }
 }

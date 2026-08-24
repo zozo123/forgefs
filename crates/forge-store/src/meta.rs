@@ -687,13 +687,20 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sql)?;
+    // Version 0 is TWO different states, and conflating them is a real bug:
+    // a genuinely fresh catalog with no tables at all, and a *pre-versioning*
+    // catalog that already carries v1-shaped tables but no ledger.
+    // `CREATE TABLE IF NOT EXISTS` is a no-op against the second, so applying
+    // SCHEMA alone leaves its `observations` at the v1 shape and the catalog
+    // never reaches v2. verify_migrated_shape below catches that, but only
+    // after the fact; a pre-versioning catalog needs the migration steps too.
+    let pre_versioning = from == 0 && table_exists(&tx, "observations")?;
     if from == 0 {
-        // A fresh catalog is created directly at the current shape, but the
-        // ledger still records every version so it stays contiguous and fsck
-        // can tell a fresh v2 catalog from a half-applied one.
         tx.execute_batch(SCHEMA).map_err(map_sql)?;
-    } else {
-        for step in from..CURRENT_SCHEMA_VERSION {
+    }
+    let first_step = if from == 0 { 1 } else { from };
+    if from != 0 || pre_versioning {
+        for step in first_step..CURRENT_SCHEMA_VERSION {
             match step {
                 1 => tx.execute_batch(MIGRATE_1_TO_2).map_err(map_sql)?,
                 _ => {
@@ -748,6 +755,17 @@ fn verify_migrated_shape(tx: &rusqlite::Transaction<'_>, from: i64) -> Result<()
         }
     }
     Ok(())
+}
+
+fn table_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
+    let found: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )
+        .map_err(map_sql)?;
+    Ok(found != 0)
 }
 
 fn ref_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
