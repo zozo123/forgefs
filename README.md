@@ -35,7 +35,7 @@ The install below needs `curl`, `tar`, `sha256sum` (`shasum` on macOS) and root 
 curl ca-certificates` first, or the first line fails with `curl: command not found`.
 
 ```bash
-V=0.2.1; T=x86_64-unknown-linux-gnu
+V=0.3.0; T=x86_64-unknown-linux-gnu
 curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/forge-$V-$T.tar.gz
 curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
@@ -44,15 +44,18 @@ sudo install forge-$V-$T/forge /usr/local/bin/
 forge --version
 ```
 
+Those exact commands, run on Linux with `V=0.2.1`, printed:
+
 ```text
 forge-0.2.1-x86_64-unknown-linux-gnu.tar.gz: OK
 forge 0.2.1
 ```
 
+Only `$V` moves: with `V=0.3.0` the same two lines name `forge-0.3.0-…` and report `forge 0.3.0`.
 On macOS the same commands work with `shasum -a 256 --ignore-missing -c SHA256SUMS`; run against
-`T=aarch64-apple-darwin` it prints `forge-0.2.1-aarch64-apple-darwin.tar.gz: OK`, and the extracted
-binary reports `forge 0.2.1`. The tarball also contains `README.md`, `INVARIANTS.md`, `CLI_ABI.md`
-and `LICENSE`.
+`T=aarch64-apple-darwin` they printed `forge-0.2.1-aarch64-apple-darwin.tar.gz: OK` and the
+extracted binary reported `forge 0.2.1`. The tarball also contains `README.md`, `INVARIANTS.md`,
+`CLI_ABI.md` and `LICENSE`.
 
 `SHA256SUMS` has 36 entries. It covers the four binaries *and* the release-gate evidence published
 beside them — per target: a build-info file, the ABI conformance table, the Conflict-object
@@ -97,20 +100,47 @@ nothing and communicates through its exit status alone. Check `$?`, not the outp
 
 ### Which build this page documents
 
-`v0.2.1` is the latest release. Several things documented below **postdate it** and are only
-available from `main` until the next release. Checked against the shipped v0.2.1 binary:
+`v0.3.0` is the current release and everything on this page is in it. Several sections document
+behaviour that **postdates v0.2.1**, so on that older release they do not work. Checked against
+both shipped binaries:
 
-| Documented here | In v0.2.1? |
-|---|---|
-| `gc --collect` (reclamation actually unlinks) | no — v0.2.1 prints `--dry-run … Required. Collection is not implemented` |
-| `checkin --mount <path>` | no |
-| `import --follow-symlinks` | no |
-| per-read-write-mount pinning (I19–I21), the I22 checkin refusal | no |
-| everything else on this page | yes |
+| Documented here | In v0.2.1? | In v0.3.0? |
+|---|---|---|
+| `gc --collect` (reclamation actually unlinks) | no — v0.2.1 prints `--dry-run … Required. Collection is not implemented` | yes |
+| `checkin --mount <path>` | no | yes |
+| `import --follow-symlinks` | no | yes |
+| per-read-write-mount pinning (I19–I21), the I22 checkin refusal | no | yes |
+| everything else on this page | yes | yes |
 
-The worked example below runs unchanged on the released v0.2.1 binary, and the outputs shown for it
-were produced by exactly that binary. The reclamation section and a few of the limits need a build
-from `main`:
+### Upgrading a v0.2.1 repository
+
+The first **read-write** open of a v0.2.1 repository by a v0.3.0 binary migrates its metadata
+catalog from schema v2 to v3 in place — the `schema_migrations` ledger goes `[1, 2]` to `[1, 2, 3]`
+and `mounts` gains `base_oid`, which is what per-mount pinning (I19) needs. Any ordinary command
+does it; `forge refs` is enough.
+
+The migration never rewrites an object file or moves an ObjectId (I17). Verified by sha256 over
+every object file before and after on a repository written by the released v0.2.1 binary: 11 files,
+byte-identical, `.forge/VERSION` still `1`, the pre-existing seal still `verify`s, and
+`fsck --full` clean afterwards.
+
+Two things to know before you run anything:
+
+- **Run a read-write command first.** `forge fsck --full` on a repository that has *not* been
+  migrated yet reports `FAILED` and exits **2**, naming the v3 shape it did not find
+  (`[CATALOG_SCHEMA] catalog:mounts: expected columns [… "base_oid"], found […]` and
+  `[SCHEMA_LEDGER] … expected contiguous supported versions [1, 2, 3], found [1, 2]`). That is the
+  un-migrated catalog, not corruption: one read-write open and `fsck --full` returns `ok`. Read-only
+  verbs likewise refuse rather than migrate behind your back — `forge verify` exits 1 with
+  `metadata schema version 2 needs migration to 3, which a read-only open cannot perform`.
+- **The migration is one-way.** A v0.2.1 binary pointed at a migrated repository fails closed with
+  `forge: invalid: metadata schema version 3 is newer than supported 2`, exit 1. Objects stay
+  readable by any VERSION 1 reader, but the catalog does not go back. Copy the repository first if
+  you need to roll back.
+
+The worked example's outputs were produced by the released **v0.2.1** binary and reproduce
+unchanged on v0.3.0, content object id for content object id. If you want to track `main` rather
+than a release:
 
 ```bash
 cargo install --locked --git https://github.com/zozo123/forgefs forge-cli
@@ -138,9 +168,9 @@ In a clone rustup *does* honour `rust-toolchain.toml` and will fetch the pinned 
 
 Every command on this page was executed. The worked example ran against the installed **v0.2.1
 release binary**; the benchmark ran against a build of commit
-`2b4634488f49450537019fff0b5b4d1436f5181a`, and the reclamation section and the gates were re-run
-against `507924f` on current `main` with identical results, down to the reclamation byte counts
-(both builds report `forge 0.2.1`). Object ids for
+`2b4634488f49450537019fff0b5b4d1436f5181a` (which reports `forge 0.2.1`), and the reclamation
+section and the gates were re-run against `507924f` and again against `d49c46f`, the v0.3.0 tree,
+with identical results down to the reclamation byte counts. Object ids for
 *content* are reproducible and you should see the same ones — `b6b49a01…` for `pub fn a() {}` in
 both the worked example and the reclamation example below. Commit and tree ids embed a timestamp, so
 those will differ on your machine.
@@ -413,7 +443,7 @@ bash scripts/release-gate.sh target/release/forge
 ```
 
 ```text
-release-gate: PASS - forge 0.2.1 sealed and verified itself as v0.2.1
+release-gate: PASS - forge 0.3.0 sealed and verified itself as v0.3.0
 ```
 
 Its `release-gate-out/gate-summary.json` records what each phase actually proved. Four of the
@@ -421,11 +451,11 @@ Its `release-gate-out/gate-summary.json` records what each phase actually proved
 
 ```text
 gate/same-path-overlap
-  merge exit 4, Conflict 13887a383a635f45b576311ef71bd33430def0482f44a117018b71eaa6ede315 at conflicts/main/01M0WZH53PS5HR0HYCBDYF8G4F, main pinned at f65beb75bcdd29ff32dc7f14b3280ff6bb13da319e63464731e00d0e502128de
+  merge exit 4, Conflict bdeaef70603985e0ae8b8d6dd51b014ea5ab25f348aa484275d1c58298200852 at conflicts/main/01M0X2CAWB0CDGQ9AHSCVNJS5D, main pinned at a01e790937a3816094094f1fec6871f1ab6e3709fbb4a31026351b73902f7b42
 gate/stale-observation
-  checkin exit 4, heads/agents/bob/01M0WZH57HJQK0MVWJRW8CVNBZ pinned at '54512e6ce9b41ebfdc2a9229f9f59862616bd1ea46a7cf3ffdbc396fb6895d43', control ref advanced to 8da26b1d4e4a4ce84168743071920db5f557cbe9f48da36a185cebf4ccaab14b
+  checkin exit 4, heads/agents/bob/01M0X2CAZD8Q04XMDNGD55X92B pinned at '52ce175c2171c1f9ec4f0052cee9f97cdf18c2a1020cc8161954c54bcdd7e0ad', control ref advanced to 835028d766187f97f2ccb8992d3de62392d68dd1b19726747567a59e60006bc4
 gate/seal-verify
-  sealed tags/v0.2.1 -> df5228f31a883f7dae6ce16e570fc54323d20206718fcb46c1bdd381e33cc86d, --attest ok, verify ok, flags PS
+  sealed tags/v0.3.0 -> 03096b4f1c181aafedc3c4880966a9c751b694439c1f097d6a0254e661d25df0, --attest ok, verify ok, flags PS
 gate/fsck
   fsck --full --json ok: refs=13 objects=40 namespaces=10 findings=0
 ```
@@ -436,7 +466,7 @@ current `main` gate against the shipped v0.2.1 tarball and it correctly fails on
 the gate evidence published with a release to check that release, and the in-tree gate to check the
 tree.
 
-At `507924f`, on a box of the class described below, the local gates produce:
+At `d49c46f`, the v0.3.0 tree, on a box of the class described below, the local gates produce:
 `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --locked -- -D warnings`
 clean; **368 tests passed, 0 failed**, 2 ignored, across 100 test binaries; `abi rows=46 blocking=45
 known_failing=0 unexercised=1 blocking_failures=0`; and the release-gate PASS above.
@@ -451,7 +481,7 @@ bash scripts/release-gate.sh target/release/forge
 
 ## Reclamation
 
-> Needs a build from `main`. The released v0.2.1 binary answers `gc --collect` with
+> Needs v0.3.0 or later. The v0.2.1 binary answers `gc --collect` with
 > `error: unexpected argument '--collect' found`.
 
 A fork is a GC root until it is explicitly resolved — merged, or retired with `abandon`. That is
