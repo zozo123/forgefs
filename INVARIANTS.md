@@ -120,6 +120,18 @@ stated so it is not mistaken for covered:
 * **`Meta::commit_seal` performs no compare-and-swap against the ref it seals.**
   The snapshot is internally consistent, but `seal main v1` can publish a tag
   naming a commit `main` no longer held when the tag became visible.
+* **A read-write mount on a PROTECTED ref accepts writes nothing can publish.**
+  I20 requires a mount that accepts a write to have a verb that can publish it,
+  and it refuses a read-write `oid:` spec and a ref not holding a commit for
+  exactly that reason -- but a protected ref is still accepted at mount time.
+  `checkin` then denies it (`ref R is protected`), `abandon` without an explicit
+  discard refuses because work is staged, and the only exit destroys the work.
+  That is I20's own rule failing on the one shape it does not check, and I21's
+  liveness with it. `model_composition.rs` reproduces it as
+  `F4-SESSION-WEDGED-WITH-STAGED-WORK`, 11 occurrences in the default run, and
+  `liveness_session_with_staged_work_can_be_stranded` states it by hand. The fix
+  is the same shape as the other two: refuse the mount, since write authority
+  over a protected ref is authority checkin can never exercise.
 * **`serve` is outside the contract entirely (#332).** No invariant names it,
   `CLI_ABI.md` does not describe it, and `scripts/cli-abi-conformance.sh`
   exercises the CLI binary alone -- so the daemon's exit codes, error mapping
