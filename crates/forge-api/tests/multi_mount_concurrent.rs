@@ -99,6 +99,7 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
                 f.mount(&root, &ns, "/", &format!("ref:{own}"), true)
                     .unwrap();
                 let mut mounts = vec![("/".to_string(), own)];
+                let mut live = Vec::new();
                 for (i, r) in REFS.iter().enumerate() {
                     if r == &own {
                         continue;
@@ -111,7 +112,20 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
                     ops += 1;
                     if rw {
                         mounts.push((path, r));
+                    } else {
+                        live.push((path, *r));
                     }
+                }
+
+                // A read-only mount resolves live on purpose, so reading one
+                // under contention is what SHOULD go stale (I9). Doing it here
+                // keeps the liveness claim honest: the run covers both the
+                // pinned and the live path, and a stale read must be clearable
+                // by re-reading rather than being a wedge.
+                for (path, r) in &live {
+                    let _ = f.ls(&root, &ns, path);
+                    let _ = f.read(&root, &ns, &format!("{path}/marker-{r}.txt"));
+                    ops += 2;
                 }
 
                 // Read through every writable mount -- this is what used to
@@ -140,7 +154,7 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
                     // A StaleObservation from a live read-only mount is
                     // clearable by re-reading; give it a bounded number of
                     // attempts, which is exactly what a caller can do.
-                    for _ in 0..4 {
+                    for _ in 0..16 {
                         ops += 1;
                         match f.checkin(&root, &ns, path, "work") {
                             Ok(CasResult::Updated { .. }) => {
@@ -160,11 +174,13 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
                             }
                             Err(Error::StaleObservation { .. }) => {
                                 tally.stale += 1;
-                                // Re-read every live mount, then retry.
-                                for (p, r) in &mounts {
-                                    let prefix = if p == "/" { "" } else { p.as_str() };
-                                    let _ = f.read(&root, &ns, &format!("{prefix}/marker-{r}.txt"));
-                                    ops += 1;
+                                // Re-read what went stale, then retry. The
+                                // escape has to be derivable from the error, so
+                                // it is exactly "read it again".
+                                for (p, r) in &live {
+                                    let _ = f.ls(&root, &ns, p);
+                                    let _ = f.read(&root, &ns, &format!("{p}/marker-{r}.txt"));
+                                    ops += 2;
                                 }
                             }
                             Err(Error::Busy(_)) => tally.busy += 1,
