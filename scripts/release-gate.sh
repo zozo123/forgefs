@@ -43,8 +43,12 @@
 # gate-summary.json against a repository nothing was wrong with (issue #354).
 # The match it did is done in awk now, and scripts/prereq-lib.sh checks every
 # declared command before the first assertion runs, so an absent prerequisite
-# exits 3 naming itself, while an UNDECLARED command that this script reaches
-# for anyway is caught at the point of use and turned into the same exit 3.
+# exits 3 naming itself. That check is plain POSIX and holds on every shell.
+# On bash >= 4 only, prereq-lib.sh additionally installs a
+# `command_not_found_handle` backstop that gives the same exit 3 to an
+# UNDECLARED command this script reaches for anyway; bash 3.2 (macOS) has no
+# such hook and no substitute for it, so there the tool is named on stderr but
+# the run still exits 1. See scripts/prereq-lib.sh for why.
 #
 # Environment:
 #   FORGE_GATE_TAG   seal tag to use (default: v<forge --version>)

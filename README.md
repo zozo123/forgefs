@@ -445,13 +445,23 @@ shaped by `scripts/json-lib.sh` now, and a genuinely missing prerequisite exits 
 That sentence used to be a claim; it is now a check. It was also false: `grep` is its own package,
 not part of coreutils, and one `grep -Eq` in the gate turned a machine without it into
 `gate: FAIL gate/conflict-object` and `"ok": false` — a missing **tool** reported as a failing
-**product** (issue #354). The match is done in awk now, and
-[`scripts/prereq-lib.sh`](scripts/prereq-lib.sh) names every command the gates may run, verifies
-them before the first assertion, and converts an *undeclared* command that a script reaches for
-anyway into the same exit **3** at the point of use — so no absent tool can ever disprove anything
-about `forge`. The list is enforced by running both gates on a PATH built from it and nothing else
+**product** (issue #354). The match is done in awk now, so the dependency is *gone* rather than
+merely declared, and [`scripts/prereq-lib.sh`](scripts/prereq-lib.sh) names every command the gates
+may run and verifies all of them before the first assertion — a declared tool that is absent exits
+**3** naming itself, on every shell, before any gate row can misreport it. The list is enforced by
+running both gates on a PATH built from it and nothing else
 (`crates/forge-cli/tests/gate_scripts_need_no_interpreter.rs`), which is the only way to tell a true
 declaration from an aspirational one.
+
+On **bash 4.0 and newer** the same file adds a backstop for the case a list cannot cover — an
+*undeclared* command that some later diff reaches for anyway — by installing
+`command_not_found_handle` and converting that verdict into exit **3** too. This one is not
+portable, and the README will not pretend otherwise: macOS ships bash 3.2.57, where the hook does
+not exist and no POSIX construct replaces it (an `ERR` trap does not fire in a condition context,
+which is the shape the `grep` call had). On bash 3.2 an undeclared missing command is still **named
+on stderr** by the shell, but the run exits **1** with a `gate: FAIL` row. That is the pre-existing
+behaviour for a case outside the declared list; issue #354 concerned a declared-list tool and is
+fixed on every shell.
 
 ```bash
 bash scripts/release-gate.sh target/release/forge

@@ -26,11 +26,12 @@
 # corruption (issue #346). JSON is now shaped by scripts/json-lib.sh.
 #
 # The list is checked, not just claimed: scripts/prereq-lib.sh names every
-# command these scripts may run, verifies them before the first row, and turns
-# an undeclared command that a script reaches for anyway into the same exit 3
-# at the point of use. It was claimed and false until issue #354 -- `grep` is
-# its own package, and release-gate.sh used it while all three declarations
-# said otherwise.
+# command these scripts may run and verifies all of them before the first row,
+# on every shell. It was claimed and false until issue #354 -- `grep` is its
+# own package, and release-gate.sh used it while all three declarations said
+# otherwise. On bash >= 4 an undeclared command that a script reaches for
+# anyway is additionally turned into the same exit 3 at the point of use; that
+# backstop needs `command_not_found_handle` and so does not exist on bash 3.2.
 #
 # ---------------------------------------------------------------------------
 # What "expected" means here
