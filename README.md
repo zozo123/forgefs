@@ -408,10 +408,10 @@ current `main` gate against the shipped v0.2.1 tarball and it correctly fails on
 the gate evidence published with a release to check that release, and the in-tree gate to check the
 tree.
 
-At `2b46344`, on the box described below, the local gates produce: `cargo fmt --all -- --check`
-clean; `cargo clippy --workspace --all-targets --locked -- -D warnings` clean; **360 tests passed,
-0 failed** across 99 test binaries; `abi rows=46 blocking=45 known_failing=0 unexercised=1
-blocking_failures=0`; and the release-gate PASS above.
+At `507924f`, on a box of the class described below, the local gates produce:
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --locked -- -D warnings`
+clean; **368 tests passed, 0 failed**, 2 ignored, across 100 test binaries; `abi rows=46 blocking=45
+known_failing=0 unexercised=1 blocking_failures=0`; and the release-gate PASS above.
 
 ```bash
 cargo fmt --all -- --check
@@ -565,9 +565,11 @@ and throughput rises by half. The barriers were already overlapping. The obvious
 collapsing the nine directory barriers of an object publication down to two with I4 intact — has
 been measured under issue #177 and **lost 15–22% at W=2..16**: a barrier that follows other barriers
 costs about 49 µs against a 402 µs average, and jbd2 already merges concurrent fsyncs, so collapsing
-removes the cheap barriers and gives up the overlap. That measurement is still under review and has
-not landed; it is recorded here because it contradicts the naive model, not because anything shipped
-from it. Count device flushes, not `fsync` calls.
+removes the cheap barriers and gives up the overlap. That measurement landed in #341: the collapse
+is implemented and selectable as `FORGEFS_DIR_BARRIER=collapsed`, with a middle `deferred` setting
+between the two, and `per-directory` stays the shipped default precisely because collapsing is not a
+speedup. It is recorded here because it contradicts the naive model, not because the default moved.
+Count device flushes, not `fsync` calls.
 
 **Throughput and latency do not move together.** Going from 4 to 16 workers on 4 logical cores buys
 47% more throughput and costs 2.4x the p50; going on to 64 buys nothing measurable and costs another
