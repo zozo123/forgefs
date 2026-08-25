@@ -144,14 +144,15 @@ all.
 ## Input that is too large: `forge import`, `forge write`, `forge checkin`
 
 A VERSION 1 tree holds at most 100_000 entries and a VERSION 1 conflict object
-at most 100_000 paths (`MAX_TREE_ENTRIES` and `MAX_CONFLICT_ITEMS` in
+at most 100_000 in each of its paths, merge bases and causal ids
+(`MAX_TREE_ENTRIES` and `MAX_CONFLICT_ITEMS` in
 `crates/forge-core/src/object.rs`). No verb introduces an exit code:
 
 | Outcome | Exit |
 |---|---:|
 | a source directory with more than 100_000 entries; the refusal names the directory, its size and the limit | 1 |
 | an overlay fold that would give one directory more than 100_000 entries | 1 |
-| a merge whose conflict object would carry more than 100_000 paths | 1 |
+| a merge whose conflict object would carry more than 100_000 paths, merge bases or causal ids; the refusal names which of the three broke the limit | 1 |
 | a tree or conflict object READ BACK from the store whose fanout exceeds the same limit | 2 |
 
 The first three rows and the last are the same number and deliberately not the
