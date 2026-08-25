@@ -1034,18 +1034,22 @@ impl World {
     }
 
     /// Whether the session's own capability still covers the ref the mount at
-    /// `abs` names, i.e. whether a write or delete through it can be accepted.
+    /// `abs` names -- which decides whether ANY verb through it is accepted,
+    /// reads included.
     ///
     /// A losing CAS retargets the mount at `forks/<ref>/<agent>/<ulid>` (I18),
     /// and an agent capability scoped to `heads/agents/<id>/*` does not cover
-    /// `forks/**`. So an agent whose checkin lost a race can no longer write
-    /// through its own mount: the work I18 preserved is at a ref its own
-    /// capability cannot name. That is production behaviour and it is modelled
-    /// here rather than characterised, because a scoped capability genuinely
-    /// does not cover that pattern -- but see the commit message: whether I18's
-    /// "retargets the session to it" is meaningful when the session cannot then
-    /// act on it is a real question this harness raised and did not answer.
-    fn mount_ref_is_writable(&self, s: &SessionM, abs: &str) -> bool {
+    /// `forks/**`. So an agent whose checkin lost a race can no longer read or
+    /// write through its own mount -- including the session's own `/` -- and
+    /// the work I18 preserved sits at a ref its own capability cannot name.
+    /// Modelled rather than characterised, because a scoped capability
+    /// genuinely does not match that pattern and no invariant claims it should;
+    /// but see the commit message. Nothing is LOST -- the fork holds the work
+    /// and the overlay was cleared, so `abandon` still succeeds and this is not
+    /// F4 -- yet whether I18's "retargets the session to it" means anything
+    /// when the session cannot then act on it is a real question this harness
+    /// raised and does not answer.
+    fn mount_ref_is_reachable(&self, s: &SessionM, abs: &str) -> bool {
         let m = longest_mount(&s.mounts, abs).expect("mount");
         match &m.spec {
             SpecM::Ref(r) => self.caps[s.agent].0.allows_ref(r),
@@ -1064,7 +1068,7 @@ impl World {
         let content = format!("v{}", rng.below(6)).into_bytes();
         let exec = rng.chance(1, 5);
         let cap = self.agent_cap(s.agent);
-        let unwritable = !self.mount_ref_is_writable(&s, &abs);
+        let unwritable = !self.mount_ref_is_reachable(&s, &abs);
         let res = self.forge.write(&cap, &ns, &abs, &content, exec);
         self.say(format!(
             "write ns={ns} {abs} = {:?} exec={exec} -> {}",
@@ -1101,7 +1105,7 @@ impl World {
             return;
         };
         let cap = self.agent_cap(s.agent);
-        let unwritable = !self.mount_ref_is_writable(&s, &abs);
+        let unwritable = !self.mount_ref_is_reachable(&s, &abs);
         let res = self.forge.delete(&cap, &ns, &abs);
         self.say(format!(
             "delete ns={ns} {abs} -> {}",
@@ -1178,7 +1182,18 @@ impl World {
             return;
         };
         let cap = self.agent_cap(s.agent);
+        let unreachable = !self.mount_ref_is_reachable(&s, &abs);
         let real = self.forge.read(&cap, &ns, &abs);
+        if unreachable {
+            self.say(format!("read ns={ns} {abs} -> {real:?} (mount ref outside the cap)"));
+            match &real {
+                Err(Error::Denied(_)) => return,
+                _ => self.bail(&format!(
+                    "read {abs}: the mount names a ref this capability does not cover, \
+                     so the model expected a Denied; real {real:?}"
+                )),
+            }
+        }
         let m = longest_mount(&s.mounts, &abs).expect("mount").clone();
         let rel = rel_of(&m.path, &abs);
         let ov = s.ov(&m.path);
@@ -1241,7 +1256,18 @@ impl World {
             format!("{}/{dir}", m.path)
         };
         let cap = self.agent_cap(s.agent);
+        let unreachable = !self.mount_ref_is_reachable(&s, &abs);
         let real = self.forge.ls(&cap, &ns, &abs);
+        if unreachable {
+            self.say(format!("ls ns={ns} {abs} -> {real:?} (mount ref outside the cap)"));
+            match &real {
+                Err(Error::Denied(_)) => return,
+                _ => self.bail(&format!(
+                    "ls {abs}: the mount names a ref this capability does not cover, \
+                     so the model expected a Denied; real {real:?}"
+                )),
+            }
+        }
         let rel = rel_of(&m.path, &abs);
         let ov = s.ov(&m.path);
         let Some(tree) = model_mount_tree(&self.model, &s, &m).cloned() else {
