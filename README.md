@@ -6,33 +6,54 @@ ForgeFS is not another POSIX filesystem and not S3 copy-in/copy-out. Bytes are i
 
 **Immutable bytes. Explicit authority. Snapshot reasoning. Deterministic integration. Loud conflicts. Verifiable releases.**
 
+## Install
+
+```bash
+# Released binary (linux x86_64; four targets are published)
+V=0.2.1; T=x86_64-unknown-linux-gnu
+curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/forge-$V-$T.tar.gz
+curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS      # verify before you run it
+tar -xzf forge-$V-$T.tar.gz && sudo install forge-$V-$T/forge /usr/local/bin/
+forge --version
+```
+
+Every release asset is covered by `SHA256SUMS` — the binaries **and** the gate evidence beside them —
+and each build carries a SLSA provenance attestation you can check without trusting this page:
+
+```bash
+gh attestation verify forge-$V-$T.tar.gz -R zozo123/forgefs
+```
+
+From source instead: `cargo install --locked --git https://github.com/zozo123/forgefs forge-cli`,
+or clone and use `cargo run -p forge-cli --` in place of `forge` below.
+
 ## 60-second two-agent path
 
 ```bash
-cargo test --workspace --all-targets --locked
-cargo run -p forge-cli -- init ./demo
+forge init ./demo
 
 ROOT=./demo/.forge/keys/root.cap
 INT=./demo/.forge/keys/integrator.cap
 
-ALICE=$(cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT grant \
+ALICE=$(forge --dir ./demo --cap $ROOT grant \
   --ops read,write,branch --ref 'main,heads/agents/alice/*' --agent alice)
-BOB=$(cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT grant \
+BOB=$(forge --dir ./demo --cap $ROOT grant \
   --ops read,write,branch --ref 'main,heads/agents/bob/*' --agent bob)
 
-A=$(cargo run -q -p forge-cli -- --dir ./demo --cap "$ALICE" session open --from=main)
-B=$(cargo run -q -p forge-cli -- --dir ./demo --cap "$BOB" session open --from=main)
+A=$(forge --dir ./demo --cap "$ALICE" session open --from=main)
+B=$(forge --dir ./demo --cap "$BOB" session open --from=main)
 
-cargo run -q -p forge-cli -- --dir ./demo --cap "$ALICE" write --ns "$A" /a.txt --text alice
-cargo run -q -p forge-cli -- --dir ./demo --cap "$BOB"   write --ns "$B" /b.txt --text bob
-cargo run -q -p forge-cli -- --dir ./demo --cap "$ALICE" checkin --ns "$A" -m alice
-cargo run -q -p forge-cli -- --dir ./demo --cap "$BOB"   checkin --ns "$B" -m bob
+forge --dir ./demo --cap "$ALICE" write --ns "$A" /a.txt --text alice
+forge --dir ./demo --cap "$BOB"   write --ns "$B" /b.txt --text bob
+forge --dir ./demo --cap "$ALICE" checkin --ns "$A" -m alice
+forge --dir ./demo --cap "$BOB"   checkin --ns "$B" -m bob
 
-cargo run -q -p forge-cli -- --dir ./demo --cap $INT merge --into=main --from="heads/agents/alice/$A"
-cargo run -q -p forge-cli -- --dir ./demo --cap $INT merge --into=main --from="heads/agents/bob/$B"
-cargo run -q -p forge-cli -- --dir ./demo --cap $INT seal main --tag v1.0 --attest
-cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT verify v1.0
-cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full
+forge --dir ./demo --cap $INT merge --into=main --from="heads/agents/alice/$A"
+forge --dir ./demo --cap $INT merge --into=main --from="heads/agents/bob/$B"
+forge --dir ./demo --cap $INT seal main --tag v1.0 --attest
+forge --dir ./demo --cap $ROOT verify v1.0
+forge --dir ./demo --cap $ROOT fsck --full
 ```
 
 The last four lines print, on a clean run:
@@ -63,13 +84,13 @@ architecture and change rules, and [FORMAT.md](FORMAT.md) for the v1 object enco
 
 ```bash
 # refs, seals, namespaces, mounts, observations, and reachable typed object closure
-cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck
+forge --dir ./demo --cap $ROOT fsck
 
 # additionally prove SQLite structure/catalog relations and scan every object file
-cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full
+forge --dir ./demo --cap $ROOT fsck --full
 
 # machine-readable report for CI/agents
-cargo run -q -p forge-cli -- --dir ./demo --cap $ROOT fsck --full --json
+forge --dir ./demo --cap $ROOT fsck --full --json
 ```
 
 `fsck` is read-only. It bypasses hot object caches, rehashes durable bytes, verifies expected type on every graph edge, checks sealed tags against the trusted local seal key, validates namespace/live-ref/mount state, and bounds graph work. `fsck --full` also runs SQLite integrity checking from one coherent read transaction; proves the schema ledger, ref/reflog terminal state and chain, seal/tag/landmark closure, provenance rows, and namespace-owned relations; then scans unreachable object files. Findings are deterministic and detection-only: ForgeFS never silently repairs catalog rows — and never silently deletes objects either.
@@ -184,12 +205,13 @@ See [`docs/BENCH.md`](docs/BENCH.md) for the reproducible workload and reporting
 
 A README that names its limits is worth more than one that does not.
 
-- **No garbage collection.** `forge --help` lists no `gc` and no `prune`. Objects are write-once and nothing reclaims them. `fsck --full` *scans* unreachable object files and reports them; removal is not implemented, deliberately, because detection-only is the current contract. A crash between object publication and metadata CAS is designed to leave durable orphans — safe, and permanent. In one throwaway repository used while writing this page, `.forge/objects` held 1.4 GB across 10 files after sessions whose work was never checked in, and there was no command to reclaim it.
+- **Garbage collection plans but does not collect.** `forge gc --dry-run` computes the reclaimable set (roots = refs ∪ live session pins ∪ landmarks ∪ unresolved forks) and `forge abandon` retires a fork or session so it stops being a root — but `forge gc` without `--dry-run` exits 1: `gc supports --dry-run only; collection is not implemented`. Nothing reclaims bytes yet. A crash between object publication and metadata CAS is designed to leave durable orphans — safe, and currently permanent.
 - **No blob chunking, so one blob must fit in memory several times over.** `LocalBlobStore::put` takes `&[u8]`, `get` returns `Vec<u8>`, and a write also transiently holds the canonical encoding of the same bytes. Sampling `VmHWM` while writing single blobs measured peak RSS at **3.05x** the blob for 128 MiB, **3.02x** for 256 MiB and **3.01x** for 512 MiB; reading a 512 MiB blob back peaked at **3.01x** and returned byte-identical content. Treat **RAM/3** as the practical ceiling for a single blob. `forge write` already warns above 64 MiB (`forge: warning blob <n> bytes > 64MiB`).
 - **Single node.** `forge serve` binds a `UnixListener`. There is no replication, no remote transport and no multi-host consensus. ForgeFS is a substrate for many agents on one machine.
 - **Per-checkin cost attribution is unavailable**, as above. Do not redesign storage or concurrency on an incomplete attribution.
 - **W6 (large tree walk/update) and W7 (Git comparator) have no published results.** Do not infer tree scaling from W1/W2, and do not quote a ForgeFS-versus-Git ratio until the durability-equivalence gate in `docs/BENCH.md` is satisfied.
 - **Real process-kill crash evidence is still gated on #147.** A deterministic failpoint and an OS `SIGKILL` are different evidence classes, and `docs/BENCH.md` refuses to conflate them.
+- **A checkin can silently drop staged work in a non-root `--rw` mount (#326).** Writing through a mount at a path other than `/` is accepted and visible via `ls`, but `checkin` folds only the checkin mount, reports `noop` with exit 0, and publishes the entry nowhere — while `abandon` refuses the same session because it *can* see the staged entry. Until it is fixed, drive `checkin` against the mount you wrote through.
 
 ## Local validation
 
@@ -204,7 +226,7 @@ cargo run --release --locked -p forge-cli -- bench --agents 32 --shared 16
 
 At commit `63fa098` on the box above those produce: `cargo fmt` clean; clippy clean under
 `-D warnings`; **292 tests passed, 0 failed**;
-`release-gate: PASS - forge 0.1.0 sealed and verified itself as v0.1.0`; and
+`release-gate: PASS - forge 0.2.1 sealed and verified itself as v0.2.1`; and
 `abi rows=30 blocking=29 known_failing=0 unexercised=1 blocking_failures=0`.
 
 CI runs the workspace on the pinned current Rust toolchain, Rust 1.89 MSRV, and a concurrent-agent
