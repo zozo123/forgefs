@@ -406,6 +406,207 @@ uncontended latency is unchanged too. `txn_count` comes from SQLite's commit
 hook, so the ratio of catalog writes to `txn_count` is the achieved batch depth,
 and it is the counter to quote when attributing a change to this mechanism.
 
+## Directory barriers: the measured budget, and what collapsing it buys
+
+### The budget, verified before it was attacked
+
+Barrier reach was established first, by the procedure under *Precondition:
+barriers must reach the device* above. Every ext4 mount in the box shipped
+`nobarrier`; `sudo mount -o remount,barrier /workspace` cleared it and 200
+`fsync`s then moved field 19 of the matching `/proc/diskstats` row by 200 —
+**ratio 1.000**, re-checked before every campaign. `discard` was also cleared (`remount,nodiscard`) because TRIM storms
+from repeated fresh-repository setup were the largest source of run-to-run
+drift; that option affects neither barriers nor durability.
+
+`crates/forge-api/tests/dir_barrier_budget.rs` is the instrument. Unlike the
+process-lifetime counters it takes its deltas around the timed region only, so
+`Forge::init`, capability setup and the final `fsck` are outside the window and
+the per-checkin figures below are measurements, not divisions of a lifetime
+total. It reports the device flush delta beside them.
+
+For the W1 shape (one blob write plus one checkin, four new objects) the
+per-checkin budget on `main` reproduced exactly:
+
+```
+flushes/checkin = 4 file + (2 x new_objects + P(new first-level shard)) dir + 3 sqlite
+                = 4 + (2 x 4 + 1.01) + 3
+                = 16.01 issued,  16.07 completed by the device at W=1
+```
+
+The nine directory barriers are two per new object — `fsync` on the parent
+that just gained a shard entry, and `fsync` on the leaf that just gained the
+object entry — plus about one `objects/` barrier per checkin while first-level
+shards are still new. Content addressing scatters four objects across four
+distinct leaf directories, so within-batch deduplication almost never fires.
+
+### Three policies, same durable state
+
+`DirectoryBarrier` selects how a `PublishBatch` proves its edges.
+`FORGEFS_DIR_BARRIER=per-directory|deferred|collapsed` overrides the default,
+which is `per-directory`.
+
+| Policy | Barriers | Portable |
+|---|---|---|
+| `per-directory` (default) | one `fsync` per touched directory, taken as the batch touches it (the shape before #177) | yes |
+| `deferred` | one `fsync` per *distinct* touched directory, all of them in a single phase immediately before `finish` returns | yes |
+| `collapsed` | one `syncfs(2)` for the whole batch, shared with any concurrent batch also waiting for one | Linux only |
+
+All three publish the same durable state, and the argument is an ordering one.
+When `finish` returns, every object file the batch published or joined, every
+shard entry it created, and every leaf entry naming one of its objects is
+durable; the ref CAS runs strictly after that. Order *within* the barrier
+phase is unconstrained because nothing between `put_parts` and `finish` is
+observable: a crash at any point before the CAS leaves durable orphan objects
+and possibly half-proved shard directories that no ref names, which is what
+`fsck --full` walking from refs calls clean, and which a later batch re-proves
+from cold caches rather than trusting. `collapsed` is *stronger* than the set
+it replaces, not weaker: `syncfs` forces every dirty inode and page on the
+filesystem, a strict superset of this batch's bytes and edges.
+
+The load-bearing detail in `deferred` and `collapsed` is that the positive
+proof — the process-wide "this directory entry is durable" cache that lets a
+later batch skip a barrier — is published in `finish` and nowhere else, exactly
+as OID proofs already were. Recording it when the directory is *created*
+instead would let the next batch skip a barrier for an edge that was never
+durable, and then CAS a ref onto an object a crash can still lose.
+`deferred_unfinished_batch_publishes_no_directory_proof` and its collapsed twin
+are that regression.
+
+For `collapsed`, membership in a shared barrier is never inferred from a window
+or a timestamp. A batch reads the gate's generation counter after its own
+`link(2)` calls have returned and waits for the first generation that cannot
+have started before that read; `completed` advances by exactly one per
+successful barrier, so being released proves that generation ran to completion
+after this batch's work was already in the kernel. A failed barrier advances
+nothing, so no waiter inherits a proof that does not exist.
+
+### Measured
+
+Box: islo sandbox, AMD EPYC 9454, 4 logical cores, 7.8 GiB RAM, Debian 12,
+kernel 6.16.9, virtio block device `/dev/vdd` at `/workspace`, ext4
+`rw,relatime` (barriers on, verified 1.000). ForgeFS `c81f63d` plus this
+change, release profile, rustc 1.98.0, `forge 0.2.1`. SQLite `journal_mode=WAL`,
+`synchronous=FULL`, Linux `fsync` path. Cold run class, fresh repository per
+repetition. 240 checkins per run, 5 repetitions per point, policies interleaved
+back-to-back at each point so device drift cancels. Medians are run-level
+`median_low`. `fsck --full` clean in every run.
+
+```bash
+FORGEFS_DIR_BARRIER=<policy> FORGEFS_BB_DEV=vdd FORGEFS_BB_N=240 FORGEFS_BB_W=<W> \
+  FORGEFS_BB_DIR=<fresh path> \
+  cargo test --release --locked -p forge-api --test dir_barrier_budget -- --ignored --nocapture
+```
+
+| W | policy | ops/s | p50 ms | p99 ms | dir barriers/checkin | issued flushes/checkin | device flushes/checkin |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | per-directory | 154.7 | 6.33 | 10.44 | 9.00 | 16.00 | 16.07 |
+| 1 | deferred | 165.7 | 5.87 | 9.12 | 8.68 | 15.68 | 15.75 |
+| 1 | collapsed | 163.3 | 5.95 | 11.10 | 2.00 | 9.00 | 9.07 |
+| 2 | per-directory | 291.7 | 6.27 | 14.92 | 9.02 | 16.02 | 16.09 |
+| 2 | deferred | 292.2 | 6.42 | 13.39 | 8.70 | 15.70 | 15.77 |
+| 2 | collapsed | 248.5 | 7.29 | 13.34 | 2.00 | 9.00 | 9.07 |
+| 4 | per-directory | 439.2 | 8.48 | 15.60 | 9.01 | 16.01 | 13.30 |
+| 4 | deferred | 449.3 | 8.56 | 13.22 | 8.73 | 15.73 | 13.28 |
+| 4 | collapsed | 354.9 | 10.71 | 17.55 | 1.83 | 8.83 | 8.11 |
+| 8 | per-directory | 516.7 | 14.13 | 28.97 | 9.01 | 16.01 | 10.53 |
+| 8 | deferred | 513.9 | 14.37 | 29.87 | 8.72 | 15.72 | 11.00 |
+| 8 | collapsed | 401.9 | 18.08 | 33.53 | 1.58 | 8.59 | 7.19 |
+| 16 | per-directory | 503.9 | 29.36 | 51.16 | 9.01 | 16.01 | 10.71 |
+| 16 | deferred | 546.2 | 28.11 | 45.75 | 8.72 | 15.72 | 10.73 |
+| 16 | collapsed | 411.9 | 36.10 | 61.91 | 1.51 | 8.52 | 7.09 |
+
+The cost model matches the counters at every point. `per-directory` and
+`deferred` issue `4 + dir + 3`; `collapsed` issues `4 + barrier_fs + 3`, where
+`barrier_fs` falls from 2.00 per checkin at W=1 to 1.51 at W=16 as concurrent
+batches share barriers (`barrier_fs_batches / barrier_fs` is the achieved
+sharing depth). At W=1 the device completes what was issued to within 0.5%.
+
+### What the numbers say, without decoration
+
+**The nine directory barriers collapse to two, and that is not a speedup.**
+`collapsed` removes 7.0 of 16.1 device flushes per checkin — a 1.77x reduction
+in barrier count with I4 unchanged — and buys **+5.6% at W=1 and loses 15% to
+22% at every higher concurrency**. It is not the default and this table is why.
+
+Two measurements explain it, and both refute the linear model that made nine
+directory barriers look like nine sixteenths of the cost:
+
+- **A flush's marginal cost is not its average cost.** At W=1, `collapsed`
+  eliminates 7.0 device flushes per checkin and saves 0.34 ms of a 6.46 ms
+  checkin: **49 us per eliminated directory flush**, against an average of
+  402 us across all sixteen. A directory `fsync` that follows other barriers
+  finds the journal already committed and costs a bare device flush, which
+  this virtio device answers in tens of microseconds. Dividing a checkin's
+  wall time by its flush count assigns that cost to the wrong barriers.
+- **The kernel already amortises them.** At W=16 `per-directory` issues 16.01
+  barriers per checkin and the device completes 10.71: jbd2 merges concurrent
+  fsyncs into shared journal commits, recovering a third of the budget for
+  free. `syncfs`, by contrast, is a whole-filesystem writeback and a global
+  serialisation point — one at a time, each paying for every dirty inode on
+  the filesystem, including the peers' — so trading ten cheap merged barriers
+  for seven expensive serialised ones loses.
+
+`per-directory` stays the default, and the same table is why. `deferred` is
+the tidier shape — it proves the same edges with the same primitive,
+deduplicates them, and takes them all in one phase immediately before the ref
+CAS — but it measures *within noise* of `per-directory` at every point (+7.1%
+at W=1, +8.4% at W=16, -0.5% at W=8), so no throughput claim is made for it.
+The rule in *Interpretation rules* below applies to a default as much as to a
+new knob: a change that does not materially improve is not worth its risk, and
+this one lands in the durability-critical path, where the shape that has been
+exercised the longest is worth more than a delta the instrument cannot
+distinguish from drift. `deferred` remains selectable, and is the setting to
+reach for on a filesystem whose journal commit dominates its device flush.
+
+`collapsed` remains available and is the right setting where a barrier is
+genuinely expensive relative to filesystem writeback — a device whose flush
+costs milliseconds rather than the ~49 us marginal cost measured here, or a
+repository on a filesystem it does not share with a busy writer. That crossover
+was not measured; this box cannot produce it, and no claim is made about it.
+
+**Do not use `collapsed` on a filesystem shared with an unrelated heavy
+writer.** Every checkin then waits for that writer's dirty data.
+
+### Crash evidence and its exact boundary
+
+`scripts/dir-barrier-sigkill.sh` is the harness: `kill -9` under sustained
+concurrent load, eight writer loops of `session open` / `write` / `checkin` as
+separate processes, each appending `updated <ref> <oid>` to a tmpfs log **only
+after** its checkin process exited 0 with that line. The log is kernel memory,
+so a SIGKILL of the writers cannot lose an acknowledgement the repository must
+then account for. The repository is then reopened cold, `fsck --full` must
+pass, and every acknowledged ref must resolve to exactly its acknowledged oid.
+
+| policy | runs | acknowledged checkins | fsck | lost |
+|---|---:|---:|---|---:|
+| deferred | 6 | 3223 | clean | 0 |
+| collapsed | 4 | 2308 | clean | 0 |
+
+**This proves process-crash durability and not power loss.** SIGKILL leaves the
+page cache intact, so every byte the killed processes wrote is still in memory
+and reaches the platter afterwards. The proof is worth stating precisely
+because it is easy to overclaim: the same harness was run against a build
+carrying a deliberate I4 violation — the deferred directory proof recorded when
+the directory is created rather than after its barrier — and it passed
+**1960 acknowledged checkins over 3 runs with a clean `fsck --full` and zero
+losses**. A process-kill test cannot see this class of defect. What catches it
+is `deferred_unfinished_batch_publishes_no_directory_proof`, which fails on
+that build with
+
+```
+assertion `left == right` failed: objects->aa, aa->bb and bb->OID must all be
+proved by the batch that is about to let a ref name the object
+  left: 1
+ right: 3
+```
+
+The power-loss half of the argument therefore rests entirely on the device
+flush counts in the table above and on the verified 1.000 barrier-reach ratio.
+Closing the gap needs a device whose volatile cache can be discarded —
+`dm-log-writes` replay or `dm-flakey drop_writes`. Neither is available in this
+sandbox: it ships no `dmsetup`, no `losetup`, and no loadable kernel modules.
+That evidence is owed, and is not claimed here.
+
 ## Interpretation rules
 
 - Optimize a measured bottleneck, not an assumed one.

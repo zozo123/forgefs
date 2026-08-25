@@ -25,6 +25,9 @@ const TOP_KEYS: &[&str] = &[
 ];
 const DURABILITY_KEYS: &[&str] = &["fullfsync", "journal_mode", "read_only", "synchronous"];
 const STORE_KEYS: &[&str] = &[
+    "barrier_fs",
+    "barrier_fs_batches",
+    "barrier_fs_us",
     "barrier_us",
     "dedup_hits",
     "fsync_dir",

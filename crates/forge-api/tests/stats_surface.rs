@@ -95,8 +95,12 @@ fn counters_move_for_sessions_dedup_noop_checkin_and_merge() {
     );
     assert_eq!(
         after.store.barrier_us,
-        after.store.fsync_file_us + after.store.fsync_dir_us,
-        "barrier_us is the sum of its two components, never wall time"
+        after.store.fsync_file_us + after.store.fsync_dir_us + after.store.barrier_fs_us,
+        "barrier_us is the sum of its three components, never wall time"
+    );
+    assert!(
+        after.store.barrier_fs_batches >= after.store.barrier_fs,
+        "a filesystem-wide barrier is shared by at least the batch that ran it"
     );
 }
 

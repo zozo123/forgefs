@@ -204,7 +204,7 @@ fn new_publication_pays_object_and_naming_barriers<F: ObjectStoreFixture>(f: &F,
         "{who}: a new object must pay an object-bytes barrier"
     );
     assert!(
-        after.fsync_dir > before.fsync_dir,
+        after.directory_barriers() > before.directory_barriers(),
         "{who}: a new object must pay a naming barrier by finish"
     );
     assert_eq!(s.get(id).unwrap(), b"a brand new durable object");
@@ -235,7 +235,8 @@ fn dedup_of_a_proven_object_pays_no_barrier<F: ObjectStoreFixture>(f: &F, who: &
         "{who}: an already-proven object must not re-pay the bytes barrier"
     );
     assert_eq!(
-        after.fsync_dir, before.fsync_dir,
+        after.directory_barriers(),
+        before.directory_barriers(),
         "{who}: an already-proven name must not re-pay the naming barrier"
     );
 }
@@ -276,7 +277,7 @@ fn join_of_an_unfinished_peer_reproves_the_whole_path<F: ObjectStoreFixture>(f: 
         "{who}: a joiner must re-prove the bytes of an unproven visible object"
     );
     assert!(
-        after.fsync_dir > before.fsync_dir,
+        after.directory_barriers() > before.directory_barriers(),
         "{who}: a joiner must re-prove the name of an unproven visible object"
     );
     assert_eq!(s.get(id).unwrap(), bytes);
