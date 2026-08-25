@@ -4,6 +4,7 @@
 //! regression was authored in #245; Forge::session_mount_tree owns that fix.
 //!
 use forge_api::Forge;
+use forge_store::Store;
 use forge_types::{CasResult, Error};
 use tempfile::tempdir;
 
@@ -52,25 +53,69 @@ fn rw_mount_reads_pinned_base_then_lost_race_forks() {
     assert_eq!(f.read(&root, &a, "/b.txt").unwrap(), b"mine");
 }
 
+/// I18, on the one shape that can still produce a Denied checkin: a catalog
+/// row written BEFORE I20 refused a read-write mount of a protected ref.
+///
+/// `Forge::mount` no longer creates this row (#328), and no verb can protect a
+/// ref after a mount of it was taken -- `mount_protection.rs` pins that closure
+/// property -- so the only way to hold one is to have opened the session on an
+/// older build. The refusal deep in `cas_ref_session` is kept as the
+/// fail-closed floor for exactly that case, and this test is what keeps the
+/// floor honest: it builds the legacy row directly in the catalog, through a
+/// cold reopen so nothing is served out of the live `Forge`'s caches.
+///
+/// This is also the half of #328 the mount-time refusal does NOT close, stated
+/// rather than implied: such a session still has no exit but
+/// `--discard-staged`. What I18 guarantees for it is only that the work stays
+/// READABLE until someone chooses to destroy it.
 #[test]
-fn refused_checkin_keeps_staged_work() {
+fn a_pre_i20_mount_of_a_protected_ref_still_fails_closed_without_losing_work() {
     let d = tempdir().unwrap();
     let f = Forge::init(d.path()).unwrap();
     let root = f.root_cap().unwrap();
+    f.branch(&root, "main", "writable").unwrap();
 
-    let session = f.session_open(&root, "main").unwrap();
-    f.mount(&root, &session, "/", "ref:main", true).unwrap();
-    f.write(&root, &session, "/kept.txt", b"still staged", false)
+    let session = f.session_open(&root, "writable").unwrap();
+    f.mount(&root, &session, "/w", "ref:writable", true)
         .unwrap();
+    f.write(&root, &session, "/w/kept.txt", b"still staged", false)
+        .unwrap();
+    let (main_oid, _) = f.peel_commit("main").unwrap();
+    drop(f);
 
+    // The row an older build would have written: read-write, pinned, naming a
+    // protected ref. `Forge::mount` refuses to produce it now.
+    {
+        let store = Store::open(&d.path().join(".forge")).unwrap();
+        store
+            .meta
+            .insert_mount(&session, "/w", "ref:main", "rw", Some(main_oid))
+            .unwrap();
+    }
+
+    let f = Forge::open(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
     let error = f
-        .checkin(&root, &session, "/", "protected ref must refuse")
+        .checkin(&root, &session, "/w", "protected ref must refuse")
         .unwrap_err();
-    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert!(
+        matches!(error, Error::Denied(_)),
+        "I5: a protected ref denies the session CAS, and that floor must stay \
+         reachable for a row `mount` can no longer create: {error:?}"
+    );
     assert_eq!(
-        f.read(&root, &session, "/kept.txt").unwrap(),
+        f.read(&root, &session, "/w/kept.txt").unwrap(),
         b"still staged",
-        "a refused checkin discarded the overlay"
+        "I18: a refused checkin discarded the overlay"
+    );
+    // And this is the residual #328 does not close: the work survives, but the
+    // only exit still destroys it.
+    assert!(f.abandon_session(&root, &session, false).is_err());
+    assert_eq!(
+        f.abandon_session(&root, &session, true)
+            .unwrap()
+            .discarded_overlay,
+        1
     );
 }
 

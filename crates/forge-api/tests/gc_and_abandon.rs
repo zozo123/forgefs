@@ -259,13 +259,17 @@ fn every_read_write_mount_pin_is_a_reported_gc_root() {
     let (fx, root) = seeded();
     let f = &fx.forge;
     f.branch(&root, "main", "side").unwrap();
+    // Not `main`: I20 refuses a read-write mount of a protected ref, because
+    // `checkin` could never advance it (#328). Any unprotected commit ref
+    // exercises the root accounting identically.
+    f.branch(&root, "main", "other").unwrap();
 
     let before = f.gc(&root, true, 0).unwrap().roots;
     let ns = f.session_open(&root, "main").unwrap();
     // The default session opens `/` read-write on its own live ref and `/main`
     // read-only, so this session ends with three read-write mounts and two
     // read-only ones.
-    f.mount(&root, &ns, "/w", "ref:main", true).unwrap();
+    f.mount(&root, &ns, "/w", "ref:other", true).unwrap();
     f.mount(&root, &ns, "/s", "ref:side", true).unwrap();
     f.mount(&root, &ns, "/ro", "ref:side", false).unwrap();
 

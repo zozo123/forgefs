@@ -57,7 +57,7 @@ Neither verb introduces an exit code. Both map onto the table above.
 | Outcome | Exit |
 |---|---:|
 | mount taken; a `--rw` mount is pinned to the commit its ref holds now (I19) | 0 |
-| `--rw` with an `oid:` spec, or a ref that does not hold a commit: refused, because checkin would have nothing to advance (I20) | 1 |
+| `--rw` with an `oid:` spec, a ref that does not hold a commit, or a PROTECTED ref: refused, because checkin could never advance it (I20) | 1 |
 | spec names a ref or object that does not resolve | 1 |
 | re-mounting a path at a different spec, or demoting it to read-only, while it holds staged overlay (I19) | 1 |
 | the capability may not read the spec, or may not write the ref for `--rw` | 1 |
@@ -65,7 +65,7 @@ Neither verb introduces an exit code. Both map onto the table above.
 | `checkin --mount <path>` had nothing to publish and the session holds nothing anywhere (`noop`) | 0 |
 | `checkin --mount <path>` had nothing to publish while another mount holds staged entries (I22) | 1 |
 | `checkin` on a read-only mount, or on a ref the capability may not write | 1 |
-| `checkin` of a mount whose ref is protected | 1 |
+| `checkin` of a mount whose ref is protected (unreachable through `mount` since I20 refuses that mount; the fail-closed floor for a pre-I20 catalog row) | 1 |
 | `checkin` refused for a stale observation | 4 |
 
 `forge checkin --mount` defaults to `/`. Checkin folds exactly the named mount
@@ -97,7 +97,7 @@ Neither verb introduces an exit code. Both map onto the table above:
 |---|---:|
 | `abandon fork` retired the ref; `abandon session` retired the namespace | 0 |
 | ref or namespace does not exist | 1 |
-| ref is outside `forks/`, already abandoned, still mounted, still a session's live ref, or the session holds staged work without the explicit discard flag | 1 |
+| ref is not a fork (`forks/*`, or `heads/agents/<agent>/forks/*` for a session fork), already abandoned, still mounted, still a session's live ref, or the session holds staged work without the explicit discard flag | 1 |
 | ref is protected, or the capability may not write it | 1 |
 | ref is sealed | 2 |
 | `gc --dry-run` produced a report | 0 |

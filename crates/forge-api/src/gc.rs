@@ -1,6 +1,7 @@
 //! Explicit retirement (`abandon`) and the reachability plan behind `gc`.
 //!
-//! Issues #12 and #309. A contended round mints one `forks/<ref>/<agent>/<ulid>`
+//! Issues #12 and #309. A contended round mints one
+//! `heads/agents/<agent>/forks/<ref>/<ulid>` (#343)
 //! ref per losing CAS (I18), each pinning a whole object closure, and nothing
 //! retired them: unbounded growth on the steady-state path. The tension is that
 //! a naive reachability sweep would resolve it in exactly the wrong direction --
@@ -78,7 +79,8 @@ pub const GC_SAMPLE_LIMIT: usize = 256;
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct GcRootCounts {
     pub refs: usize,
-    /// Refs under `forks/`, i.e. unresolved forked contributions.
+    /// Unresolved forked contributions: `forks/*` (merge and import) plus
+    /// `heads/agents/<agent>/forks/*` (session checkin, #343).
     pub unresolved_forks: usize,
     pub session_pins: usize,
     pub session_live_refs: usize,
@@ -555,7 +557,10 @@ fn schedule_catalog_roots(
 ) -> Result<()> {
     for (name, _kind, oid) in &catalog.refs {
         counts.refs += 1;
-        if name.starts_with(forge_store::meta::ABANDONABLE_PREFIX) {
+        // Both fork spellings: a session fork lives under the agent's own
+        // subtree so its author can act through the retargeted mount (#343),
+        // and it is exactly as unresolved as a merge fork under `forks/`.
+        if forge_store::meta::is_fork_ref(name) {
             counts.unresolved_forks += 1;
         }
         schedule_root(queue, *oid, GraphExpectation::Any, format!("ref:{name}"))?;

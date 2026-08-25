@@ -7,7 +7,10 @@ Issues #12 and #309. #309 argues that garbage collection and the missing
 ## The problem
 
 I18 says a refused checkin never destroys staged work, so a losing CAS mints
-`forks/<ref>/<agent>/<ulid>` and repoints the losing session at it. One measured
+`heads/agents/<agent>/forks/<ref>/<ulid>` and repoints the losing session at it -- inside the
+losing agent's own capability scope, so it can read, continue and retire its own
+fork (#343). `merge` and `import` retarget no session and still fork to
+`forks/<ref>/<agent>/<ulid>`. One measured
 512-writer contended round produced 1546 refs, 511 of them forks. Every fork
 pins an object closure and nothing ever reaped one. That is unbounded growth on
 the steady-state path, which is the path ForgeFS exists to serve.
@@ -32,7 +35,7 @@ ref is a root".
 ## The root set
 
 ```
-refs                       every row in `refs`, including unresolved forks/*
+refs                       every row in `refs`, including unresolved forks
 live session pins          namespaces.pinned_oid
 mount pins                 mounts.base_oid -- every read-write mount's own base
                            (I19). The refs pass roots what a ref holds NOW; once
@@ -51,7 +54,7 @@ seals                      snapshot, commit and tree of every sealed tag
 ## `abandon`
 
 ```
-forge abandon fork  forks/<ref>/<agent>/<ulid>
+forge abandon fork  heads/agents/<agent>/forks/<ref>/<ulid>   (or forks/<ref>/<agent>/<ulid>)
 forge abandon session <ns> [--discard-staged]
 ```
 

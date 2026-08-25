@@ -15,6 +15,8 @@ use forge_ns::{
 };
 use forge_store::{sanitize_agent, Observed, Store};
 use forge_types::{CasResult, EntryKind, Error, ObjectId, ObjectType, Result};
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 impl Forge {
@@ -55,7 +57,10 @@ impl Forge {
         let mode = if rw { "rw" } else { "ro" };
         if rw {
             match parse_spec(spec)? {
-                Spec::Ref(n) => self.check(cap, Op::Write, Some(&n))?,
+                Spec::Ref(n) => {
+                    self.check(cap, Op::Write, Some(&n))?;
+                    self.refuse_rw_mount_of_protected_ref(&n, spec, &path)?;
+                }
                 // An `oid:` spec names immutable bytes: there is no ref for
                 // `checkin` to advance, and it refused such a mount
                 // unconditionally, so a write through one was staged where no
@@ -99,6 +104,54 @@ impl Forge {
         let base = if rw { Some(oid) } else { None };
         self.store.meta.insert_mount(ns, &path, spec, mode, base)?;
         Ok(())
+    }
+
+    /// I20: refuse a read-write mount of a PROTECTED ref, at mount time.
+    ///
+    /// The third and last shape of "a write path with no publish path". I5
+    /// makes a protected ref deny every session CAS -- `cas_ref_session`
+    /// answers `ref R is protected; session checkin cannot advance it` -- so
+    /// write authority over one is authority `checkin` can never exercise.
+    /// Accepting the mount staged writes into an overlay that `checkin` then
+    /// denied and that `abandon` refused to retire, leaving `--discard-staged`
+    /// -- which destroys the work -- as the only exit (#328). That is I20's own
+    /// rule failing on the one shape it did not check, and I21's liveness with
+    /// it.
+    ///
+    /// Refused with the same error and the same exit code as the read-write
+    /// `oid:` spec and the non-commit ref above, because it is the same defect:
+    /// knowably unpublishable when the mount is created, so the honest place to
+    /// fail is the mount, not the checkin that discovers it later.
+    ///
+    /// A mount-time check closes this shape COMPLETELY, which is not obvious
+    /// and is the reason it is enough on its own. `refs.protected` is
+    /// write-once: the only statements that ever write a 1 into it are
+    /// `insert_ref`, `insert_ref_with_intros` and `commit_seal`. The first two
+    /// refuse a name that already exists, so neither can protect a ref a mount
+    /// already names; `commit_seal` writes `tags/*` alone, which `insert_ref`
+    /// forbids any commit ref from being called and which a read-write mount is
+    /// already refused for holding a snapshot. Every fork path writes the
+    /// literal 0, and the ref-advancing `UPDATE` does not mention the column at
+    /// all. So protection cannot be added to a ref underneath a live mount, and
+    /// this check is not a first line of defence but the whole line.
+    /// `mount_protection.rs` holds that closure property against the public
+    /// API, so a future verb that protects an existing ref fails there and is
+    /// forced to decide what happens to the mounts already on it.
+    ///
+    /// A ref that does not exist is left to `resolve_spec_oid` below, so a
+    /// missing spec keeps answering `NotFound` rather than "protected".
+    fn refuse_rw_mount_of_protected_ref(&self, name: &str, spec: &str, path: &str) -> Result<()> {
+        let Some(row) = self.store.meta.get_ref(name)? else {
+            return Ok(());
+        };
+        if !row.protected {
+            return Ok(());
+        }
+        Err(Error::Denied(format!(
+            "cannot mount {spec} read-write at {path}: ref {name} is protected, so session \
+             checkin can never advance it and a write through this mount could never be \
+             published; mount it read-only, or branch it and mount the branch"
+        )))
     }
 
     /// Refuse a re-mount that would change where already-staged work lands.
@@ -373,7 +426,7 @@ impl Forge {
         let ov_rows = self.store.meta.overlay_list(ns, &m.path)?;
         let observations = self.store.meta.observations(ns)?;
         let ov = overlay_map(&ov_rows);
-        self.check_observations(ns, &m.path, &ov, &mounts)?;
+        self.check_observations(ns, &mounts)?;
         let batch = self.store.begin_publish_batch();
         let new_tree = apply_overlay(Some(base_commit.tree), &ov, &batch)?;
         if new_tree == base_commit.tree && pin == row.oid {
@@ -560,20 +613,43 @@ impl Forge {
     /// against its LIVE ref was the wedge: the two could never agree, and the
     /// diagnostic named the observation rather than the mount, so the escape was
     /// not derivable from it.
-    fn check_observations(
-        &self,
-        ns: &str,
-        checkin_mount: &str,
-        ov: &forge_core::Overlay,
-        mounts: &[Mount],
-    ) -> Result<()> {
+    fn check_observations(&self, ns: &str, mounts: &[Mount]) -> Result<()> {
+        // Each observing mount's OWN staged overlay, loaded at most once.
+        let mut overlays: BTreeMap<String, forge_core::Overlay> = BTreeMap::new();
         for obs in self.store.meta.observations(ns)? {
-            if obs.mount == checkin_mount && overlay_shadows(ov, &obs.path) {
-                continue;
-            }
             let Some(om) = mounts.iter().find(|m| m.path == obs.mount) else {
                 continue;
             };
+            let mount_ov = match overlays.entry(om.path.clone()) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => {
+                    let rows = self.store.meta.overlay_list(ns, &om.path)?;
+                    e.insert(overlay_map(&rows))
+                }
+            };
+            // The session's own staged write decides this path. It is not a
+            // foreign read, `apply_overlay` validates it against this mount's
+            // pin at fold time, and the recorded observation is a reading of
+            // the overlay as it stood at read time -- so comparing it against
+            // the base tree, or against a LATER overlay, compares two different
+            // trees and can never converge.
+            //
+            // The skip is per OBSERVING MOUNT. It used to apply only when the
+            // observation belonged to the mount being checked in, so a session
+            // holding two writable mounts wedged itself with one authorised
+            // read: `write /a.txt` then `read /a.txt` recorded the overlay's
+            // blob under `/`, and `checkin /w1` compared that against `/`'s
+            // pinned tree, which does not have it. Every checkin of every other
+            // mount then refused `StaleObservation` forever, no re-read could
+            // clear it -- re-reading records the overlay's blob again -- and
+            // `abandon` refused over the staged work, leaving `--discard-staged`
+            // as the only exit. That is I21's "an authorised read can never make
+            // the session's work unpublishable" failing exactly as #233 did, one
+            // mount over. `model_composition.rs` found it; the regression test is
+            // `observation_scope.rs`.
+            if overlay_shadows(mount_ov, &obs.path) {
+                continue;
+            }
             let tree = self.session_mount_tree(om)?;
             let now = current_at(&self.store, tree, &obs.path)?;
             if now != obs.seen {
@@ -686,7 +762,11 @@ mod tests {
         let forge = Forge::init(dir.path()).unwrap();
         let root = forge.root_cap().unwrap();
         let ns = forge.session_open(&root, "main").unwrap();
-        forge.mount(&root, &ns, "/", "ref:main", true).unwrap();
+        // `session_open` already mounts `/` read-write on the session's own
+        // live head, pinned to the commit `main` holds. This used to re-mount
+        // it at `ref:main`, which I20 now refuses: `main` is protected, so no
+        // checkin could ever advance it (#328). The session's own head is the
+        // shape a real agent writes through anyway.
         forge.write(&root, &ns, "/a.txt", b"v0", false).unwrap();
 
         let before = forge.store.meta.row_mutations();

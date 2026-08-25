@@ -215,8 +215,9 @@ enum SessionCmd {
 
 #[derive(Subcommand)]
 enum AbandonCmd {
-    /// Retire a `forks/*` ref. The commit stays addressable by OID and the
-    /// reflog keeps the record; only the root goes away.
+    /// Retire a fork ref -- `heads/agents/<agent>/forks/*` for a session
+    /// fork, `forks/*` for a merge or import one. The commit stays addressable
+    /// by OID and the reflog keeps the record; only the root goes away.
     Fork { r#ref: String },
     /// Retire a session's pin, mounts, overlay and observations.
     Session {

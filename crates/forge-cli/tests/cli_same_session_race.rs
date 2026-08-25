@@ -139,8 +139,14 @@ fn cli_two_processes_checking_in_one_session_have_one_live_ref_winner() {
     );
 
     let fork = &forks[0];
+    // #343: the fork lands inside the losing agent's own scope, so the mount
+    // it retargets stays reachable by the capability that took it.
+    let agent = live_ref
+        .strip_prefix("heads/agents/")
+        .and_then(|rest| rest.split('/').next())
+        .expect("a session live ref is heads/agents/<agent>/<ulid>");
     assert!(
-        fork.starts_with(&format!("forks/{live_ref}/")),
+        fork.starts_with(&format!("heads/agents/{agent}/forks/{live_ref}/")),
         "checkin reported an unexpected fork namespace: {fork}"
     );
     let reopened = Forge::open(d.path()).unwrap();

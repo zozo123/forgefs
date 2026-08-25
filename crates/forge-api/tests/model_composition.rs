@@ -54,16 +54,16 @@ use tempfile::TempDir;
 /// Each entry must still be observed by the default run. When one is fixed the
 /// "every known defect was observed" assertion fails and names it, which is the
 /// signal to delete the row rather than to relax the check.
-const KNOWN: &[(&str, &str)] = &[(
-    "F4-SESSION-WEDGED-WITH-STAGED-WORK",
-    "I20/I21 liveness, NOT closed: a read-write mount on a PROTECTED ref \
-         accepts writes that `checkin` then denies (`ref R is protected`), and \
-         `abandon` without an explicit discard refuses because work is staged. \
-         Neither publish nor explicit abandon is possible. I20 refuses a \
-         read-write `oid:` mount and a ref not holding a commit, which closed \
-         the other two shapes of this; a protected ref is still accepted at \
-         mount time and is still unpublishable.",
-)];
+/// Empty, and that is the assertion. `F4-SESSION-WEDGED-WITH-STAGED-WORK` was
+/// the last row: a read-write mount on a PROTECTED ref accepted writes
+/// `checkin` then denied while `abandon` refused to retire the session over
+/// them, so `--discard-staged` was the only exit. I20 refuses that mount at
+/// mount time now (#328), the same as it already refused a read-write `oid:`
+/// spec and a ref not holding a commit, so the finding stopped reproducing and
+/// its row was deleted rather than relaxed. `record` rejects any kind not
+/// listed here, so if a wedge reappears this harness fails naming it instead of
+/// filing it as expected.
+const KNOWN: &[(&str, &str)] = &[];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {
@@ -433,6 +433,12 @@ impl World {
         cid
     }
 
+    /// File a characterised defect. Unused while `KNOWN` is empty, and kept
+    /// deliberately: characterising a newly found composition defect, running
+    /// it to a stable occurrence count and deleting the row when it is fixed is
+    /// this harness's whole workflow, and deleting the machinery with the last
+    /// row would mean rebuilding it for the next one.
+    #[allow(dead_code)]
     fn record(&mut self, kind: &'static str, detail: String) {
         assert!(
             KNOWN.iter().any(|(k, _)| *k == kind),
@@ -584,10 +590,21 @@ impl World {
             // of sequence;
             // this one exists so a wedge is reported at the step that created
             // it, with the trace that led there.
-            let publishable = s
-                .overlay
-                .iter()
-                .any(|(mp, entries)| !entries.is_empty() && self.predict_checkin(&ns, mp).is_ok());
+            // I21 distinguishes a refusal a re-read cannot clear from one it
+            // can. `StaleObservation` is the second kind: it is exit 4, it
+            // names the mount and path that moved, and re-reading that path
+            // re-records the observation so the retry succeeds. Treating it as
+            // a wedge is what made this predicate report sessions that were
+            // never stuck -- `drain` below performs the re-read for real, so
+            // this is a claim the harness proves rather than assumes.
+            let publishable = s.overlay.iter().any(|(mp, entries)| {
+                !entries.is_empty()
+                    && !matches!(self.predict_checkin(&ns, mp), Err(Refusal::RoMount))
+                    && !matches!(self.predict_checkin(&ns, mp), Err(Refusal::OidMount))
+                    && !matches!(self.predict_checkin(&ns, mp), Err(Refusal::Denied))
+                    && !matches!(self.predict_checkin(&ns, mp), Err(Refusal::Sealed))
+                    && !matches!(self.predict_checkin(&ns, mp), Err(Refusal::StagedElsewhere))
+            });
             if !publishable {
                 let why: Vec<String> = s
                     .overlay
@@ -601,15 +618,20 @@ impl World {
                         )
                     })
                     .collect();
-                self.record(
-                    "F4-SESSION-WEDGED-WITH-STAGED-WORK",
-                    format!(
-                        "session {ns} holds {} staged entries; abandon without \
-                         --discard refuses and no mount can be checked in: {}",
-                        s.staged_total(),
-                        why.join("; ")
-                    ),
-                );
+                // I21, asserted rather than characterised. Every mount that
+                // accepts a write is now refused at mount time unless a verb
+                // can publish it (I20), so a session that holds staged work
+                // and cannot publish any of it is a real defect, not a known
+                // one.
+                self.bail(&format!(
+                    "session {ns} holds {} staged entries; abandon without \
+                     --discard refuses over them and no mount can be checked \
+                     in: {}.\n    I20/I21: a mount that accepts a write must \
+                     have a verb that can publish it, and every unpublishable \
+                     spec must be refused when the mount is taken (#328).",
+                    s.staged_total(),
+                    why.join("; ")
+                ));
             }
         }
     }
@@ -771,7 +793,18 @@ impl World {
         // session unpublishable (I21); a read-only mount against its live ref,
         // which is exactly the cross-mount staleness I9 exists for.
         for ((obs_mount, rel), seen) in &s.obs {
-            if obs_mount == &m.path && overlay_shadows(&ov, rel) {
+            // The OBSERVING mount's own staged overlay decides this path, so
+            // the read was of the session's own write, not a foreign one, and
+            // `apply_overlay` validates it against that mount's pin at fold
+            // time. This used to skip only observations belonging to the mount
+            // being checked in, which wedged any session holding two writable
+            // mounts: `write /a.txt` then `read /a.txt` recorded the overlay's
+            // blob under `/`, and every checkin of every OTHER mount compared
+            // it against `/`'s pinned tree, which does not hold it. No re-read
+            // could clear that -- re-reading records the overlay's blob again
+            // -- and `abandon` refused over the staged work. I21: an authorised
+            // read may never make the session's work unpublishable.
+            if overlay_shadows(&s.ov(obs_mount), rel) {
                 continue;
             }
             let tree = if obs_mount == &m.path {
@@ -967,6 +1000,10 @@ impl World {
         // checkin to advance, so it is refused at mount time rather than
         // accepting a write that no verb and no capability could ever publish.
         let rw_oid = rw && matches!(spec, SpecM::Oid(..));
+        // I20, the third shape (#328): a PROTECTED ref denies every session
+        // CAS, so write authority over it is authority checkin can never
+        // exercise. Refused when the mount is taken, exactly as the two above.
+        let rw_protected = rw && matches!(&spec, SpecM::Ref(r) if self.model.protected.contains(r));
         // I19: re-mounting a path at a different spec, or demoting one to
         // read-only, while it holds staged work would send that work to a ref
         // it was never written against. Refused, never silently retargeted.
@@ -983,9 +1020,10 @@ impl World {
             if rw { "rw" } else { "ro" },
             if res.is_ok() { "ok" } else { "err" }
         ));
-        match (&res, rw_oid, moves_staged_work) {
+        let unpublishable = rw_oid || rw_protected;
+        match (&res, unpublishable, moves_staged_work) {
             (Ok(()), false, false) => {}
-            // The rw-`oid:` refusal is checked first in production too.
+            // Both I20 refusals are checked before the I19 one in production.
             (Err(Error::Denied(_)), true, _) => return,
             (Err(Error::Invalid(_)), false, true) => return,
             _ => self.bail(&format!(
@@ -994,6 +1032,8 @@ impl World {
                 a.id,
                 if rw_oid {
                     "a Denied for a read-write oid: spec (I20)"
+                } else if rw_protected {
+                    "a Denied for a read-write mount of a protected ref (I20, #328)"
                 } else if moves_staged_work {
                     "an Invalid over staged work this re-mount would move (I19)"
                 } else {
@@ -1680,6 +1720,43 @@ fn model_ls(tree: &FlatTree, ov: &OverlayM, rel: &str) -> Option<Vec<(String, St
 // ---------------------------------------------------------------------------
 
 impl World {
+    /// Re-read the path a `StaleObservation` names, through the real API, so
+    /// the observation is re-recorded against what the mount shows NOW.
+    ///
+    /// This is the escape `CLI_ABI.md` documents for exit 4 and the one I21
+    /// requires to exist, performed rather than assumed. The error formats the
+    /// location as `<mount>:/<rel>`; `<rel>` is empty for a directory
+    /// observation on the mount root. Returns whether anything was re-read, so
+    /// a path that cannot be re-read at all is still reported as a wedge.
+    fn reread(&mut self, ns: &str, location: &str) -> bool {
+        let Some((mount, rel)) = location.split_once(":/") else {
+            return false;
+        };
+        let abs = if rel.is_empty() {
+            mount.to_string()
+        } else if mount == "/" {
+            format!("/{rel}")
+        } else {
+            format!("{mount}/{rel}")
+        };
+        let agent = self.model.sessions[ns].agent;
+        let cap = self.agent_cap(agent);
+        self.say(format!("reread ns={ns} {abs} (was stale)"));
+        // Both verbs record the observation BEFORE they can fail on
+        // resolution: `read` and `ls` call `observe` and only then look the
+        // path up, so `NotFound` still re-records the path as absent, which is
+        // exactly the update a vanished path needs. Only a refusal that never
+        // reached the path -- the capability does not cover the mount's spec --
+        // leaves the observation untouched, and that is a genuine wedge rather
+        // than a re-read away.
+        fn reached<T>(r: &Result<T, Error>) -> bool {
+            !matches!(r, Err(Error::Denied(_)) | Err(Error::Cap(_)))
+        }
+        let listed = self.forge.ls(&cap, ns, &abs);
+        let got = self.forge.read(&cap, ns, &abs);
+        reached(&listed) || reached(&got)
+    }
+
     /// Every live session must be able to finish: publish its staged work, or
     /// explicitly abandon it without a discard. Run at the end of a sequence,
     /// because it is necessarily destructive.
@@ -1689,6 +1766,9 @@ impl World {
             let s = self.model.sessions[&ns].clone();
             let cap = self.agent_cap(s.agent);
             let mut errors: Vec<String> = Vec::new();
+            // Each stale path is re-read at most once, so a path that goes
+            // stale again immediately cannot spin this loop forever.
+            let mut recovered: BTreeSet<String> = BTreeSet::new();
             loop {
                 let mut progressed = false;
                 let mounts: Vec<String> = self.model.sessions[&ns]
@@ -1721,6 +1801,18 @@ impl World {
                             progressed = true;
                             self.resync_after_unmodelled_checkin(&ns, &mp, &outcome);
                         }
+                        // I21: a stale observation is a refusal a RE-READ
+                        // clears, and the error names exactly what to re-read.
+                        // Take that escape for real rather than declaring the
+                        // session stuck: if the retry still fails, the loop
+                        // records it below and the session is genuinely wedged.
+                        Err(Error::StaleObservation { path, .. }) => {
+                            if recovered.insert(path.clone()) && self.reread(&ns, path) {
+                                progressed = true;
+                            } else {
+                                errors.push(format!("checkin {mp} -> stale at {path}"));
+                            }
+                        }
                         Err(e) => errors.push(format!("checkin {mp} -> {e:?}")),
                     }
                 }
@@ -1734,18 +1826,15 @@ impl World {
                 }
                 Err(e) => {
                     let staged = self.model.sessions[&ns].staged_total();
-                    self.record(
-                        "F4-SESSION-WEDGED-WITH-STAGED-WORK",
-                        format!(
-                            "session {ns} could not finish: abandon without --discard \
-                             gave {e:?} and every checkin failed [{}]. {staged} entries \
-                             staged; the only remaining exit destroys them.",
-                            errors.join("; ")
-                        ),
-                    );
-                    // Force it open so the next session's verification is clean.
-                    let _ = self.forge.abandon_session(&cap, &ns, true);
-                    self.model.sessions.remove(&ns);
+                    // I21, asserted. Every mount this session holds was either
+                    // refused when it was taken or is publishable (I20), so
+                    // reaching here means one of those two is false.
+                    self.bail(&format!(
+                        "session {ns} could not finish: abandon without --discard \
+                         gave {e:?} and every checkin failed [{}]. {staged} entries \
+                         staged; the only remaining exit destroys them (#328).",
+                        errors.join("; ")
+                    ));
                 }
             }
         }
@@ -1817,6 +1906,12 @@ fn model_based_composition() {
 
     println!("\n=== model-based composition report ===");
     println!("sequences = {}, steps each = {}", seeds.len(), steps);
+    if KNOWN.is_empty() {
+        println!(
+            "\nKNOWN is empty: every composition defect this harness has found is \
+             fixed, and the model asserts the correct behaviour for all of them."
+        );
+    }
     for (kind, why) in KNOWN {
         let hits = all.get(kind).map(|v| v.len()).unwrap_or(0);
         println!("\n[{kind}] {hits} occurrence(s)\n  {why}");
@@ -1893,34 +1988,34 @@ fn i22_checkin_refuses_a_noop_over_work_it_did_not_fold() {
         .expect("a session whose work is published retires without discarding anything");
 }
 
-/// The liveness hole. `main` is protected, so a read-write mount on it can be
-/// written but never checked in, and `abandon` refuses over staged work: the
-/// session can neither publish nor explicitly abandon.
+/// The liveness hole, closed, written out by hand.
+///
+/// This test used to characterise the defect: `main` is protected, so a
+/// read-write mount on it could be written but never checked in, `abandon`
+/// refused over the staged work, and the only exit destroyed it. That was
+/// `F4-SESSION-WEDGED-WITH-STAGED-WORK`, the last row of this file's `KNOWN`
+/// table. I20 refuses the mount now, so the session never acquires work it
+/// cannot publish, and the assertion is the property rather than the hole.
 #[test]
-fn liveness_session_with_staged_work_can_be_stranded() {
+fn liveness_a_session_can_no_longer_acquire_staged_work_it_cannot_publish() {
     let dir = tempfile::tempdir().unwrap();
     let forge = Forge::init(dir.path()).unwrap();
     let root = forge.root_cap().unwrap();
     let ns = forge.session_open(&root, "main").unwrap();
-    forge.mount(&root, &ns, "/w", "ref:main", true).unwrap();
-    forge
-        .write(&root, &ns, "/w/x.txt", b"staged", false)
-        .unwrap();
 
-    let publish = forge.checkin(&root, &ns, "/w", "publish").unwrap_err();
-    let abandon = forge.abandon_session(&root, &ns, false).unwrap_err();
+    let refusal = forge
+        .mount(&root, &ns, "/w", "ref:main", true)
+        .expect_err("I20: a protected ref has no publish path, so the mount is refused");
     assert!(
-        matches!(publish, Error::Denied(_)) && matches!(abandon, Error::Invalid(_)),
-        "characterising the liveness hole: publish={publish:?} abandon={abandon:?}"
+        matches!(&refusal, Error::Denied(m) if m.contains("protected")),
+        "{refusal:?}"
     );
-    // Nothing but an explicit discard, which destroys the work, gets out.
-    assert_eq!(
-        forge
-            .abandon_session(&root, &ns, true)
-            .unwrap()
-            .discarded_overlay,
-        1
-    );
+
+    // Nothing staged, so nothing to strand: the session reaches a terminal
+    // state with no discard at all (I21).
+    forge
+        .abandon_session(&root, &ns, false)
+        .expect("a session that was never allowed to stage unpublishable work retires cleanly");
 }
 
 /// I19, the assertion that replaced this file's I8 characterisation: a

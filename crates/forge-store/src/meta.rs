@@ -129,15 +129,65 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 /// Reflog `reason` that retires a ref name for good. See `ref_retired`.
 pub const REFLOG_ABANDON: &str = "abandon";
 
-/// The only ref namespace `abandon_ref` will retire.
-///
-/// A fork name is `forks/<ref>/<agent>/<ulid>`: it is minted once by a losing
-/// CAS and never recomputed, so retiring it cannot collide with a later ref of
-/// the same name. Every other namespace -- `main`, `heads/`, `tags/`,
-/// `conflicts/`, `inbox/` -- is published history, a live session head, or
-/// sealed, and none of them is the unbounded steady-state growth this verb
-/// exists to bound.
+/// Where a fork minted by a losing CAS that retargets no session lives:
+/// `forks/<ref>/<agent>/<ulid>`, minted once and never recomputed, so retiring
+/// it cannot collide with a later ref of the same name. `merge` and `import`
+/// fork here; they hand the loser nothing to act through, so nothing about
+/// their reachability matters to a session.
 pub const ABANDONABLE_PREFIX: &str = "forks/";
+
+/// Where a SESSION fork lives: `heads/agents/<agent>/forks/<ref>/<ulid>`.
+///
+/// I5 forks a losing checkin and I18 retargets that session's mount at the
+/// result -- so unlike a merge fork, this ref is one the losing agent is
+/// immediately expected to act through. Minting it under the flat `forks/`
+/// tree put it outside the scope an agent capability is written with
+/// (`heads/agents/<id>/*`), so the retargeted mount answered `Denied` to
+/// reads and writes alike, including the session's own `/`: I18 preserved the
+/// work at a name its own author could not open (#343). Nothing was lost --
+/// `abandon` still succeeded -- but "retargets the session to it" meant
+/// nothing when the session could not then act on it.
+///
+/// Minting it INSIDE the agent's own subtree fixes that without touching a
+/// single capability, which is what makes it compatible with I13: attenuation
+/// stays monotone because no token is re-issued, re-signed or widened; the
+/// ref is simply created somewhere the loser's existing authority already
+/// reached. The alternative -- granting the session coverage of `forks/**` at
+/// session open -- would have to mint authority the caller's own capability
+/// does not carry, which is the ambient root I14 forbids.
+///
+/// A supervisor loses nothing: `mint_integrator` already reads
+/// `heads/agents/*`, so forks stay as visible as they were, and merging one
+/// into `main` is unchanged.
+pub const SESSION_FORK_SEGMENT: &str = "forks/";
+
+/// The name a losing session checkin forks to.
+pub fn session_fork_name(ref_name: &str, fork_agent: &str) -> String {
+    format!(
+        "heads/agents/{}/{SESSION_FORK_SEGMENT}{}/{}",
+        sanitize_agent(fork_agent),
+        ref_name,
+        ulid::Ulid::new()
+    )
+}
+
+/// Is `name` a fork -- the one ref shape `abandon` may retire?
+///
+/// Both spellings count. A live session head is `heads/agents/<agent>/<ulid>`
+/// and a ULID is never the literal `forks`, so no live head is mistaken for a
+/// fork and made retirable.
+pub fn is_fork_ref(name: &str) -> bool {
+    if name.starts_with(ABANDONABLE_PREFIX) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("heads/agents/") else {
+        return false;
+    };
+    let Some((_agent, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    tail.starts_with(SESSION_FORK_SEGMENT) && tail.len() > SESSION_FORK_SEGMENT.len()
+}
 
 const REFS_COLUMNS: &[&str] = &["name", "oid", "kind", "protected", "sealed", "updated_ms"];
 const REFS_VALUES: &str = "typeof(name)='text' AND typeof(oid)='blob' \
@@ -3383,12 +3433,10 @@ impl Meta {
                     oid: new,
                 }
             } else {
-                let fork = format!(
-                    "forks/{}/{}/{}",
-                    name,
-                    sanitize_agent(fork_agent),
-                    ulid::Ulid::new()
-                );
+                // I18 retargets this session's mount at the fork below, so the
+                // fork must land where the losing agent's own capability can
+                // reach it (#343).
+                let fork = session_fork_name(name, fork_agent);
                 validate_ref_kind(&fork, "commit")?;
                 tx.execute(
                     "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
@@ -4081,9 +4129,14 @@ impl Meta {
     /// mount or live_ref is the corruption `fsck` reports as exit 2.
     pub fn abandon_ref(&self, name: &str, agent_id: &str) -> Result<RetiredRef> {
         validate_ref_name(name)?;
-        if !name.starts_with(ABANDONABLE_PREFIX) {
+        // I18: a fork stays a reclamation root until it is explicitly resolved,
+        // and `abandon` is what retires it. Both fork spellings are retirable;
+        // nothing else is, because every other namespace is published history,
+        // a live session head, or sealed.
+        if !is_fork_ref(name) {
             return Err(Error::Invalid(format!(
-                "only {ABANDONABLE_PREFIX}* refs may be abandoned, not {name}"
+                "only fork refs may be abandoned ({ABANDONABLE_PREFIX}* or \
+                 heads/agents/<agent>/{SESSION_FORK_SEGMENT}*), not {name}"
             )));
         }
         let mut conn = self.write.lock();
