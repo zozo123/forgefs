@@ -50,6 +50,45 @@ writer half-updated. Refusing to enter the band is the only safe answer.
 `scripts/enospc-sigbus-probe.sh` reproduces and asserts this contract. It needs
 Linux, root and `mkfs.ext4`, so it is not part of `scripts/release-gate.sh`.
 
+## Mounts and checkin: `forge mount`, `forge checkin`
+
+Neither verb introduces an exit code. Both map onto the table above.
+
+| Outcome | Exit |
+|---|---:|
+| mount taken; a `--rw` mount is pinned to the commit its ref holds now (I19) | 0 |
+| `--rw` with an `oid:` spec, or a ref that does not hold a commit: refused, because checkin would have nothing to advance (I20) | 1 |
+| spec names a ref or object that does not resolve | 1 |
+| re-mounting a path at a different spec, or demoting it to read-only, while it holds staged overlay (I19) | 1 |
+| the capability may not read the spec, or may not write the ref for `--rw` | 1 |
+| `checkin --mount <path>` published (`updated`) or lost the CAS and forked (`forked`) | 0 |
+| `checkin --mount <path>` had nothing to publish and the session holds nothing anywhere (`noop`) | 0 |
+| `checkin --mount <path>` had nothing to publish while another mount holds staged entries (I22) | 1 |
+| `checkin` on a read-only mount, or on a ref the capability may not write | 1 |
+| `checkin` of a mount whose ref is protected | 1 |
+| `checkin` refused for a stale observation | 4 |
+
+`forge checkin --mount` defaults to `/`. Checkin folds exactly the named mount
+and CASes the ref THAT MOUNT names, using that mount's own pinned base as the
+expected value; a lost CAS forks (I5/I18) and retargets that mount at the fork.
+A session holding read-write mounts on several refs therefore publishes them one
+`checkin --mount` at a time, and publishing one never moves what another mount
+reads.
+
+A `noop` is therefore a strong statement and callers may rely on it: it means the
+session holds no staged work anywhere, not merely that the named mount staged
+nothing. Staged work is a property of the namespace, not of one mount -- `forge
+abandon session` counts overlay rows across all of them -- so a checkin that
+folded only `/` used to answer `noop` with exit 0 for a session whose work sat
+under some other read-write mount, and `abandon` then refused the same session as
+holding work (#326). A checkin with nothing of its own to publish now refuses
+instead, exit 1, naming each other mount and its entry count, because the request
+as stated -- "tell me there was nothing to do" -- is unsatisfiable and no retry of
+it can succeed (I22). A checkin that DOES publish is unaffected: `updated` and
+`forked` are progress and may leave another mount staged, which is exactly how a
+session with several writable mounts drains them one `--mount` at a time.
+Automation that gets exit 1 from `checkin` re-runs it once per named mount.
+
 ## Reclamation: `forge abandon` and `forge gc`
 
 Neither verb introduces an exit code. Both map onto the table above:
@@ -62,13 +101,21 @@ Neither verb introduces an exit code. Both map onto the table above:
 | ref is protected, or the capability may not write it | 1 |
 | ref is sealed | 2 |
 | `gc --dry-run` produced a report | 0 |
-| `gc` without `--dry-run`, or `gc` under a ref-scoped capability | 1 |
+| `gc --collect` reclaimed (possibly zero) objects | 0 |
+| `gc` with neither `--dry-run` nor `--collect`, or with both | 1 |
+| `gc --collect --min-age-secs` below the hard floor | 1 |
+| `gc` under a ref-scoped capability | 1 |
 | `gc` could not prove reachability because an object is unreadable or does not decode | 2 |
 
-`forge gc` **never deletes**. Collection is unimplemented and `--dry-run` is
-mandatory, so automation can call it on a schedule today and get a plan, not a
-mutation. `docs/GC.md` states the root set and what a safe collector still
-needs.
+`forge gc --dry-run` **never deletes** and is the reporting half. `forge gc
+--collect` is the reclaiming half: it unlinks unreachable objects and removes
+the catalog rows that named them. Exactly one of the two flags is required, so
+a bare `forge gc` still exits 1 with the diagnostic pointing at `docs/GC.md`,
+and no invocation deletes anything by default. `--min-age-secs` is refused
+below its hard floor rather than quietly raised, because that floor is the only
+bound ForgeFS has on the window between a writer's put and the transaction that
+names it. `docs/GC.md` states the root set, the invariant collection preserves
+(I23) and the one precondition it cannot prove for itself.
 
 `forge gc --json` writes one JSON object to stdout. It is not part of the
 `forge stats --json` contract above and carries no `schema_version`; consumers

@@ -20,7 +20,10 @@ pub use bench::{
 };
 pub use export::ExportOptions;
 pub use fsck::{FsckFinding, FsckReport};
-pub use gc::{GcReport, GcRootCounts, DEFAULT_MIN_AGE_SECS, GC_SAMPLE_LIMIT};
+pub use gc::{
+    GcReport, GcRootCounts, DEFAULT_MIN_AGE_SECS, GC_COLLECT_MIN_AGE_FLOOR, GC_SAMPLE_LIMIT,
+};
+pub use import::ImportOptions;
 pub use repository::find_forge;
 pub use serve::{dispatch as dispatch_request, serve, unix_worker_count};
 pub use soak::{private_checkins_bounded, run_bench_with_workers, shared_stampede_bounded};
