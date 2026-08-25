@@ -126,6 +126,24 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
+/// Whether this binary can audit the catalog's schema at all, as read from the
+/// migration ledger. See `Meta::ledger_standing`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerStanding {
+    /// The ledger is exactly `1..=CURRENT_SCHEMA_VERSION`.
+    Current,
+    /// The ledger is `1..=v` with `v < CURRENT_SCHEMA_VERSION`: an intact
+    /// repository from an older release that has not been migrated yet.
+    NeedsMigration(i64),
+    /// The ledger is `1..=v` with `v > CURRENT_SCHEMA_VERSION`: an intact
+    /// repository written by a newer release than this binary.
+    Newer(i64),
+    /// Anything else: a hole, a duplicate, an empty ledger, or a missing or
+    /// reshaped `schema_migrations` table. This is the catalog audit's case,
+    /// and it reports it as a `SCHEMA_LEDGER` finding.
+    Damaged,
+}
+
 /// Reflog `reason` that retires a ref name for good. See `ref_retired`.
 pub const REFLOG_ABANDON: &str = "abandon";
 
@@ -1764,6 +1782,66 @@ impl Meta {
     /// transaction. Row mutations cannot be fooled that way.
     pub fn row_mutations(&self) -> u64 {
         self.write.lock().total_changes()
+    }
+
+    /// What this binary can do with the catalog it just opened, decided from
+    /// the migration ledger alone and without writing a byte.
+    ///
+    /// `fsck --full` opens through `open_read_only_for_fsck`, which defers
+    /// ledger compatibility so a genuinely damaged ledger can be *reported*
+    /// rather than refused. That deferral used to reach one state it was never
+    /// meant to judge: an intact repository from an older release. Its ledger
+    /// is short and its tables are the shape that release wrote, so the audit
+    /// -- which knows only the current shape -- emitted `SCHEMA_LEDGER` and
+    /// `CATALOG_SCHEMA` findings and the CLI turned them into exit 2, the code
+    /// reserved for corruption (issue #348). Age is not damage, so the two
+    /// cases have to be told apart before the audit runs.
+    ///
+    /// The distinction is purely structural: a ledger that is exactly
+    /// `1..=v` for some `v >= 1` is a supported release's ledger, whatever `v`
+    /// is, while a hole, a duplicate, an empty ledger or a missing/reshaped
+    /// `schema_migrations` table is not, and stays the catalog audit's to
+    /// report. This says nothing about the health of the rest of the catalog:
+    /// it answers only "can this binary audit this schema", which is the
+    /// question `fsck` has to settle before its findings mean anything.
+    pub fn ledger_standing(&self) -> Result<LedgerStanding> {
+        let conn = self.read_conn();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                params!["table", "schema_migrations"],
+                |row| row.get(0),
+            )
+            .map_err(map_sql)?;
+        if exists == 0 {
+            return Ok(LedgerStanding::Damaged);
+        }
+        // A reshaped ledger cannot be read as one; that is a finding, not an
+        // error, so hand it to the audit instead of failing the command.
+        let Ok(mut stmt) = conn.prepare("SELECT version FROM schema_migrations ORDER BY version")
+        else {
+            return Ok(LedgerStanding::Damaged);
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) else {
+            return Ok(LedgerStanding::Damaged);
+        };
+        let mut versions = Vec::new();
+        for row in rows {
+            match row {
+                Ok(version) => versions.push(version),
+                Err(_) => return Ok(LedgerStanding::Damaged),
+            }
+        }
+        let contiguous: Vec<i64> = (1..=versions.len() as i64).collect();
+        if versions.is_empty() || versions != contiguous {
+            return Ok(LedgerStanding::Damaged);
+        }
+        let top = versions[versions.len() - 1];
+        Ok(match top.cmp(&CURRENT_SCHEMA_VERSION) {
+            std::cmp::Ordering::Less => LedgerStanding::NeedsMigration(top),
+            std::cmp::Ordering::Equal => LedgerStanding::Current,
+            std::cmp::Ordering::Greater => LedgerStanding::Newer(top),
+        })
     }
 
     /// True when this catalog was opened read-only. Every write path is

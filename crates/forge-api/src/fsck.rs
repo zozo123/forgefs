@@ -4,7 +4,7 @@ use forge_core::decode_object_type;
 use forge_ns::{parse_spec, Spec};
 use forge_store::{
     decode_graph_object, CatalogAudit, CatalogObjectExpectation, GraphEdge, GraphExpectation,
-    GraphWorkQueue, Observed,
+    GraphWorkQueue, LedgerStanding, Observed, CURRENT_SCHEMA_VERSION,
 };
 use forge_types::{Error, ObjectId, ObjectType, Result};
 use serde::Serialize;
@@ -354,6 +354,46 @@ impl Forge {
         let mut roots = Vec::new();
 
         if full {
+            // A schema this binary cannot audit is not a verdict about the
+            // repository. `fsck --full` alone opens through the ledger-deferred
+            // path so it can REPORT a damaged ledger, and that deferral let an
+            // intact repository from an older release reach an auditor that
+            // knows only the current shape: it found a short ledger and a
+            // `mounts` table without the column v3 added, called both defects,
+            // and the CLI rendered them as exit 2 -- the code CLI_ABI.md
+            // reserves for corruption -- on bytes that were entirely healthy
+            // (issue #348).
+            //
+            // Refusing is deliberate, and it is the same answer the read-only
+            // path already gives: `verify` and reachable `fsck` exit 1 here,
+            // naming the version. Migrating first would be friendlier and is
+            // the wrong instinct -- `fsck` is what an operator reaches for when
+            // they are already worried, most often before deciding whether to
+            // trust an upgrade, and a diagnostic tool must not silently rewrite
+            // the catalog it was called to diagnose. So exit 2 keeps meaning
+            // corruption, and this keeps meaning "not yet migrated".
+            match self.store.meta.ledger_standing()? {
+                LedgerStanding::NeedsMigration(version) => {
+                    return Err(Error::Invalid(format!(
+                        "metadata schema version {version} needs migration to \
+                         {CURRENT_SCHEMA_VERSION}, which a read-only check cannot perform; \
+                         fsck will not migrate a repository it was asked to diagnose. \
+                         Open the repository once for writing to migrate it (for example \
+                         `forge --dir <repo> --cap <cap> refs`), then re-run `forge fsck --full`"
+                    )))
+                }
+                LedgerStanding::Newer(version) => {
+                    return Err(Error::Invalid(format!(
+                        "metadata schema version {version} is newer than supported \
+                         {CURRENT_SCHEMA_VERSION}; this binary does not know that catalog's \
+                         invariants and cannot audit it. Upgrade forge, then re-run \
+                         `forge fsck --full`"
+                    )))
+                }
+                // Damaged is the case the deferral exists for: let the audit
+                // run and report SCHEMA_LEDGER as the corruption it is.
+                LedgerStanding::Current | LedgerStanding::Damaged => {}
+            }
             let catalog = self.store.meta.audit_catalog()?;
             self.collect_full_catalog(catalog, &mut report, &mut roots);
             scan_all_object_paths(&self.store.root(), &mut roots, &mut report)?;

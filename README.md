@@ -127,12 +127,13 @@ byte-identical, `.forge/VERSION` still `1`, the pre-existing seal still `verify`
 Two things to know before you run anything:
 
 - **Run a read-write command first.** `forge fsck --full` on a repository that has *not* been
-  migrated yet reports `FAILED` and exits **2**, naming the v3 shape it did not find
-  (`[CATALOG_SCHEMA] catalog:mounts: expected columns [… "base_oid"], found […]` and
-  `[SCHEMA_LEDGER] … expected contiguous supported versions [1, 2, 3], found [1, 2]`). That is the
-  un-migrated catalog, not corruption: one read-write open and `fsck --full` returns `ok`. Read-only
-  verbs likewise refuse rather than migrate behind your back — `forge verify` exits 1 with
-  `metadata schema version 2 needs migration to 3, which a read-only open cannot perform`.
+  migrated yet refuses, exit **1**, naming the version it found, the version it needs and the
+  remedy: `metadata schema version 2 needs migration to 3, which a read-only check cannot perform;
+  fsck will not migrate a repository it was asked to diagnose.` It will not migrate behind your
+  back, and it will not call an intact old repository corrupt — exit 2 is reserved for corruption
+  ([`CLI_ABI.md`](CLI_ABI.md)), and a healthy v0.2.1 repository is not corrupt (issue #348). One
+  read-write open and `fsck --full` returns `ok`. `forge verify` and `forge fsck` without `--full`
+  refuse the same way, and always did.
 - **The migration is one-way.** A v0.2.1 binary pointed at a migrated repository fails closed with
   `forge: invalid: metadata schema version 3 is newer than supported 2`, exit 1. Objects stay
   readable by any VERSION 1 reader, but the catalog does not go back. Copy the repository first if
@@ -434,9 +435,12 @@ Conflict object, a stale-observation refusal, seal + attest + verify, `fsck --fu
 CLI ABI table — and it runs on all four targets during the release, from the packaged binary rather
 than a rebuild. Its evidence is published beside the tarballs and covered by `SHA256SUMS`.
 
-Both gate scripts need `python3` on `$PATH` in addition to the built binary. Without it they refuse
-up front and exit **2** — `release-gate: harness error: python3 is required`, or
-`abi-conformance: python3 is required` — which is a harness failure, not a contract failure.
+Both gate scripts need nothing but **bash, coreutils, sed and awk** — the tools any POSIX box
+already has — plus the built binary. No interpreter, no `sqlite3`, no `jq`: they run wherever
+`forge` runs, which is the only prerequisite list a self-verification story can honestly have. They
+used to demand `python3` for JSON shaping alone and refuse up front with exit **2**, the code
+[`CLI_ABI.md`](CLI_ABI.md) reserves for corruption, on a base Debian image (issue #346). JSON is
+shaped by `scripts/json-lib.sh` now, and a genuinely missing prerequisite exits **3**, naming it.
 
 ```bash
 bash scripts/release-gate.sh target/release/forge

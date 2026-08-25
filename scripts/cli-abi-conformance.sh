@@ -15,6 +15,15 @@
 #   0  every BLOCKING row matched the contract
 #   1  at least one BLOCKING row did not match the contract
 #   2  harness failure (bad usage, fixture could not be built)
+#   3  a prerequisite this harness needs is missing; the message names it
+#
+# Prerequisites, in full: bash, coreutils, sed, awk, and the `forge` binary
+# under test. That is the whole list, and it is deliberate: this script and
+# scripts/release-gate.sh are what a cautious user runs before trusting a
+# release, so they must have FEWER prerequisites than the product, not more.
+# They used to demand `python3` -- for JSON shaping and one byte-fill -- and
+# refused to start without it with exit 2, the code CLI_ABI.md reserves for
+# corruption (issue #346). JSON is now shaped by scripts/json-lib.sh.
 #
 # ---------------------------------------------------------------------------
 # What "expected" means here
@@ -48,7 +57,13 @@ die() {
 
 [ -n "$FORGE" ] || die "usage: $0 <path-to-forge-binary> [OUTDIR]"
 [ -x "$FORGE" ] || die "not an executable forge binary: $FORGE"
-command -v python3 >/dev/null 2>&1 || die "python3 is required"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -r "$SCRIPT_DIR/json-lib.sh" ] || {
+	printf 'abi-conformance: missing %s\n' "$SCRIPT_DIR/json-lib.sh" >&2
+	exit 3
+}
+# shellcheck source=scripts/json-lib.sh
+. "$SCRIPT_DIR/json-lib.sh"
 FORGE="$(cd "$(dirname "$FORGE")" && pwd)/$(basename "$FORGE")"
 
 mkdir -p "$OUTDIR"
@@ -63,12 +78,18 @@ trap 'rm -rf "$WORK"' EXIT
 # `forge` walks parents looking for .forge, so no fixture may be created at
 # $WORK itself - otherwise the "no repository here" row would find a parent.
 
-RECORDS="$WORK/records"
-: >"$RECORDS"
-US=$'\x1f'
+ROWS_JSON="$WORK/rows.json"
+KNOWN_FAILING_JSON="$WORK/known-failing.json"
+: >"$ROWS_JSON"
+: >"$KNOWN_FAILING_JSON"
 
 blocking_fail=0
 row_count=0
+rows_blocking=0
+rows_known_failing=0
+rows_unexercised=0
+rows_first=1
+known_failing_first=1
 
 # Capability tokens ARE authority (INVARIANTS I13/I14). Even fixture tokens are
 # never written to a log line or a CI artifact.
@@ -77,11 +98,63 @@ redact() {
 }
 
 # record <id> <class> <expected> <observed> <argv-string> <note> <output>
+#
+# Appends this row to the report as it happens, rather than buffering a
+# delimited record for a second pass to re-parse. The verdict is recomputed
+# here from class/expected/observed, so the artifact says what the row DID,
+# independently of how the console line above chose to describe it.
 record() {
 	local id="$1" class="$2" expected="$3" observed="$4" argv="$5" note="$6" out="$7"
-	local b64
-	b64="$(printf '%s' "$out" | base64 | tr -d '\n')"
-	printf '%s\n' "${id}${US}${class}${US}${expected}${US}${observed}${US}${argv}${US}${note}${US}${b64}" >>"$RECORDS"
+	local verdict observed_json
+
+	if [ "$class" = unexercised ]; then
+		verdict=unexercised
+		observed_json=null
+		rows_unexercised=$((rows_unexercised + 1))
+	else
+		observed_json="$observed"
+		if [ "$observed" -eq "$expected" ]; then
+			verdict=match
+		else
+			verdict=mismatch
+		fi
+		if [ "$class" = blocking ]; then
+			rows_blocking=$((rows_blocking + 1))
+		else
+			rows_known_failing=$((rows_known_failing + 1))
+		fi
+	fi
+
+	{
+		[ "$rows_first" -eq 1 ] || printf ',\n'
+		printf '    {\n'
+		json_field 6 argv "$argv" ,
+		json_field 6 class "$class" ,
+		json_raw_field 6 contract_exit "$expected" ,
+		json_field 6 id "$id" ,
+		json_field 6 note "$note" ,
+		json_raw_field 6 observed_exit "$observed_json" ,
+		json_field 6 output "$out" ,
+		json_field 6 verdict "$verdict"
+		printf '    }'
+	} >>"$ROWS_JSON"
+	rows_first=0
+
+	# scripts/release-gate.sh reprints the known_failing rows in its own
+	# summary. Handing it a ready-made fragment is what keeps either script
+	# from having to parse the other's JSON back in.
+	if [ "$class" = known_failing ]; then
+		{
+			[ "$known_failing_first" -eq 1 ] || printf ',\n'
+			printf '      {\n'
+			json_raw_field 8 contract_exit "$expected" ,
+			json_field 8 id "$id" ,
+			json_field 8 note "$note" ,
+			json_raw_field 8 observed_exit "$observed_json"
+			printf '      }'
+		} >>"$KNOWN_FAILING_JSON"
+		known_failing_first=0
+	fi
 }
 
 # check <id> <class:blocking|known_failing> <expected-exit> <note> -- <forge argv...>
@@ -222,16 +295,16 @@ D_BLOB="$(capture --dir "$D" --cap "$D_ROOT" write --ns "$D_NS" /rot.txt --text 
 run --dir "$D" --cap "$D_ROOT" checkin --ns "$D_NS" -m rot
 D_OBJ="$D/.forge/objects/${D_BLOB:0:2}/${D_BLOB:2:2}/$D_BLOB"
 [ -f "$D_OBJ" ] || die "blob object missing at $D_OBJ"
-python3 - "$D_OBJ" <<'PY'
-import os
-import sys
-
-path = sys.argv[1]
-size = max(os.path.getsize(path), 1)
-os.chmod(path, 0o644)
-with open(path, "wb") as handle:
-    handle.write(b"\x00" * size)
-PY
+# Overwrite the object's bytes in place, keeping its length, so the ObjectId in
+# its path no longer describes its content. `head -c` from /dev/zero is the
+# whole trick, and it is why this fixture no longer needs an interpreter
+# (issue #346). Objects are stored read-only, so make it writable first.
+D_SIZE="$(wc -c <"$D_OBJ" | tr -d ' ')"
+[ "$D_SIZE" -gt 0 ] || die "blob object is empty at $D_OBJ"
+chmod u+w "$D_OBJ" || die "could not make $D_OBJ writable"
+head -c "$D_SIZE" /dev/zero >"$D_OBJ" || die "could not overwrite $D_OBJ"
+[ "$(wc -c <"$D_OBJ" | tr -d ' ')" -eq "$D_SIZE" ] ||
+	die "bitrot fixture must not change the object's length"
 
 # ---------------------------------------------------------------------------
 # Fixture E: a directory that is not a repository and has no repository above.
@@ -364,6 +437,15 @@ check abi/1-gc-attenuated-cap blocking 1 "" -- \
 # --- exit 2: corruption or sealed-state violation -------------------------
 check abi/2-bitrot-fails-closed blocking 2 "" -- --dir "$D" --cap "$D_ROOT" fsck --full
 
+# Issue #348: `fsck --full` on an intact repository whose catalog is still at an
+# older metadata schema version is exit 1, not exit 2. Age is not damage, and
+# exit 2 is reserved for corruption -- the row above is what corruption looks
+# like. Declared rather than faked, per this script's own rule: building an
+# un-migrated catalog needs either a previous release's binary or a SQL client,
+# and this harness deliberately requires neither (issue #346).
+declare_unexercised abi/1-fsck-unmigrated-catalog 1 \
+	"needs a catalog at an older metadata schema version; exercised against this same binary by an_unmigrated_catalog_is_an_input_error_not_corruption in crates/forge-cli/tests/cli_abi_exit_codes.rs - see #348"
+
 # --- exit 3: transient busy / contention ----------------------------------
 declare_unexercised abi/3-busy 3 \
 	"needs a second process holding a SQLite write txn past busy_timeout; not deterministic in a single-process script - see #147 / docs/BENCH.md W5"
@@ -435,69 +517,61 @@ check abi/1-mount-unknown-ref blocking 1 \
 echo
 
 ABI_OUT="$OUTDIR/abi-conformance.json"
-ABI_RECORDS="$RECORDS" \
-	ABI_OUT="$ABI_OUT" \
-	ABI_BINARY="$FORGE" \
-	ABI_BLOCKING_FAILURES="$blocking_fail" \
-	ABI_ROWS="$row_count" \
-	python3 - <<'PY'
-import base64
-import json
-import os
+if [ "$blocking_fail" -eq 0 ]; then
+	abi_ok=true
+else
+	abi_ok=false
+fi
 
-sep = "\x1f"
-rows = []
-with open(os.environ["ABI_RECORDS"], "r", encoding="utf-8") as handle:
-    for line in handle:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        rid, cls, expected, observed, argv, note, blob = line.split(sep, 6)
-        observed_int = int(observed)
-        rows.append(
-            {
-                "id": rid,
-                "class": cls,
-                "contract_exit": int(expected),
-                "observed_exit": None if observed_int < 0 else observed_int,
-                "argv": argv,
-                "note": note,
-                "verdict": (
-                    "unexercised"
-                    if cls == "unexercised"
-                    else "match" if observed_int == int(expected) else "mismatch"
-                ),
-                "output": base64.b64decode(blob).decode("utf-8", "replace"),
-            }
-        )
+{
+	printf '{\n'
+	json_field 2 binary "$FORGE" ,
+	json_raw_field 2 blocking_failures "$blocking_fail" ,
+	json_field 2 contract CLI_ABI.md ,
+	json_field 2 known_failing_reference \
+		"https://github.com/zozo123/forgefs/issues/237" ,
+	json_raw_field 2 ok "$abi_ok" ,
+	printf '  "rows": [\n'
+	if [ -s "$ROWS_JSON" ]; then
+		cat "$ROWS_JSON"
+		printf '\n'
+	fi
+	printf '  ],\n'
+	json_raw_field 2 rows_blocking "$rows_blocking" ,
+	json_raw_field 2 rows_known_failing "$rows_known_failing" ,
+	json_raw_field 2 rows_total "$row_count" ,
+	json_raw_field 2 rows_unexercised "$rows_unexercised"
+	printf '}\n'
+} >"$ABI_OUT"
 
-summary = {
-    "contract": "CLI_ABI.md",
-    "binary": os.environ["ABI_BINARY"],
-    "rows_total": int(os.environ["ABI_ROWS"]),
-    "rows_blocking": sum(1 for r in rows if r["class"] == "blocking"),
-    "rows_known_failing": sum(1 for r in rows if r["class"] == "known_failing"),
-    "rows_unexercised": sum(1 for r in rows if r["class"] == "unexercised"),
-    "blocking_failures": int(os.environ["ABI_BLOCKING_FAILURES"]),
-    "known_failing_reference": "https://github.com/zozo123/forgefs/issues/237",
-    "ok": int(os.environ["ABI_BLOCKING_FAILURES"]) == 0,
-    "rows": rows,
-}
-with open(os.environ["ABI_OUT"], "w", encoding="utf-8") as handle:
-    json.dump(summary, handle, indent=2, sort_keys=True)
-    handle.write("\n")
+# scripts/release-gate.sh reprints these numbers inside its own summary. It
+# asks for them here, as the ready-made `cli_abi` block, so that neither script
+# ever has to read the other's JSON back in. The path is deliberately the
+# caller's and not $OUTDIR: this is a channel between two scripts, not a
+# release artifact, and a direct run leaves the variable unset and writes
+# nothing.
+if [ -n "${ABI_GATE_FRAGMENT:-}" ]; then
+	{
+		printf '{\n'
+		json_raw_field 4 blocking_failures "$blocking_fail" ,
+		printf '    "known_failing": [\n'
+		if [ -s "$KNOWN_FAILING_JSON" ]; then
+			cat "$KNOWN_FAILING_JSON"
+			printf '\n'
+		fi
+		printf '    ],\n'
+		json_raw_field 4 ok "$abi_ok" ,
+		json_raw_field 4 rows_blocking "$rows_blocking" ,
+		json_raw_field 4 rows_known_failing "$rows_known_failing" ,
+		json_raw_field 4 rows_total "$row_count" ,
+		json_raw_field 4 rows_unexercised "$rows_unexercised"
+		printf '  }\n'
+	} >"$ABI_GATE_FRAGMENT"
+fi
 
-print(
-    "abi rows=%d blocking=%d known_failing=%d unexercised=%d blocking_failures=%d"
-    % (
-        summary["rows_total"],
-        summary["rows_blocking"],
-        summary["rows_known_failing"],
-        summary["rows_unexercised"],
-        summary["blocking_failures"],
-    )
-)
-PY
+printf 'abi rows=%d blocking=%d known_failing=%d unexercised=%d blocking_failures=%d\n' \
+	"$row_count" "$rows_blocking" "$rows_known_failing" "$rows_unexercised" \
+	"$blocking_fail"
 
 echo "abi report: $ABI_OUT"
 

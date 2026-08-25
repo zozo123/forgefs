@@ -24,7 +24,18 @@
 # Exit status:
 #   0  every gate assertion held
 #   1  at least one gate assertion failed (see gate-summary.json)
-#   2  harness failure: bad usage, missing binary, missing python3
+#   2  harness failure: bad usage, or a missing/unusable forge binary
+#   3  a prerequisite this harness needs is missing; the message names it
+#
+# Prerequisites, in full: bash, coreutils, sed, awk, and the `forge` binary
+# under test. That is the whole list, and it is the point: this gate is what a
+# cautious user runs before trusting a release, so it must have FEWER
+# prerequisites than the product it verifies, not more. It used to demand
+# `python3` for JSON shaping alone and refuse to start without it with exit 2 --
+# the code CLI_ABI.md reserves for corruption -- on any machine without it, a
+# base Debian image included (issue #346). JSON is shaped by
+# scripts/json-lib.sh now, and a missing prerequisite has an exit code of its
+# own.
 #
 # Environment:
 #   FORGE_GATE_TAG   seal tag to use (default: v<forge --version>)
@@ -43,7 +54,12 @@ harness_die() {
 
 [ -n "$FORGE" ] || harness_die "usage: $0 <path-to-forge-binary> [OUTDIR]"
 [ -x "$FORGE" ] || harness_die "not an executable forge binary: $FORGE"
-command -v python3 >/dev/null 2>&1 || harness_die "python3 is required"
+[ -r "$SCRIPT_DIR/json-lib.sh" ] || {
+	printf 'release-gate: missing %s\n' "$SCRIPT_DIR/json-lib.sh" >&2
+	exit 3
+}
+# shellcheck source=scripts/json-lib.sh
+. "$SCRIPT_DIR/json-lib.sh"
 [ -x "$SCRIPT_DIR/cli-abi-conformance.sh" ] ||
 	harness_die "missing $SCRIPT_DIR/cli-abi-conformance.sh"
 [ -x "$SCRIPT_DIR/forge-env-line.sh" ] ||
@@ -69,6 +85,12 @@ FAILURES="$WORK/failures"
 US=$'\x1f'
 START_EPOCH="$(date +%s)"
 
+# scripts/cli-abi-conformance.sh writes the summary's `cli_abi` block here,
+# outside OUTDIR: it is a channel between the two scripts, not a release
+# artifact, and it is what keeps this gate from having to read the conformance
+# report's JSON back in.
+export ABI_GATE_FRAGMENT="$WORK/cli-abi-fragment.json"
+
 # Capability tokens ARE authority (I13/I14) and must never reach a log line or
 # a CI artifact, not even a throwaway fixture's token.
 redact() {
@@ -88,128 +110,130 @@ fail() {
 	printf 'gate: FAIL  %-38s %s\n' "$id" "$(printf '%s' "$detail" | redact | tr '\n' ' ')" >&2
 }
 
+# Everything the gate summary needs about phase 7, filled in there. Declared
+# here because `finish` runs as an EXIT trap and must be able to say "the fsck
+# phase never ran" -- which is what an empty FSCK_OK means -- for a gate that
+# died earlier.
+FSCK_OK=""
+FSCK_FULL=""
+FSCK_REFS=""
+FSCK_OBJECTS=""
+FSCK_NAMESPACES=""
+FSCK_FINDINGS=""
+
+# One JSON array of {detail, id} objects from a US-separated record file.
+gate_record_array() {
+	local file="$1" indent="$2" first=1 line id detail
+	if [ ! -s "$file" ]; then
+		printf '[]'
+		return 0
+	fi
+	printf '[\n'
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		id="${line%%"$US"*}"
+		detail="${line#*"$US"}"
+		[ "$first" -eq 1 ] || printf ',\n'
+		first=0
+		printf '%*s{\n' "$((indent + 2))" ""
+		json_field "$((indent + 4))" detail "$detail" ,
+		json_field "$((indent + 4))" id "$id"
+		printf '%*s}' "$((indent + 2))" ""
+	done <"$file"
+	printf '\n%*s]' "$indent" ""
+}
+
+# The list of artifacts this run was supposed to leave behind, each marked
+# present or not. Deliberately reported for a failed gate too: which artifacts
+# exist is itself the first diagnostic.
+gate_artifact_array() {
+	local indent="$1" first=1 name present
+	shift
+	printf '[\n'
+	for name in "$@"; do
+		if [ -e "$OUTDIR/$name" ]; then present=true; else present=false; fi
+		[ "$first" -eq 1 ] || printf ',\n'
+		first=0
+		printf '%*s{\n' "$((indent + 2))" ""
+		json_field "$((indent + 4))" file "$name" ,
+		json_raw_field "$((indent + 4))" present "$present"
+		printf '%*s}' "$((indent + 2))" ""
+	done
+	printf '\n%*s]' "$indent" ""
+}
+
 # Always emit the summary, including on failure, so the artifact is diagnosable.
 finish() {
 	local status=$?
-	local failed
+	local failed ok fsck_block cli_abi_block environment_block
 	failed="$(wc -l <"$FAILURES" | tr -d ' ')"
-	GATE_PHASES="$PHASES" \
-		GATE_FAILURES="$FAILURES" \
-		GATE_OUT="$OUTDIR/gate-summary.json" \
-		GATE_FORGE="$FORGE" \
-		GATE_FORGE_VERSION="$FORGE_VERSION" \
-		GATE_TAG="$TAG" \
-		GATE_STATUS="$status" \
-		GATE_FAILED_COUNT="$failed" \
-		GATE_STARTED="$START_EPOCH" \
-		GATE_OUTDIR="$OUTDIR" \
-		python3 - <<'PY' || true
-import json
-import os
-import time
 
-sep = "\x1f"
+	if [ "$failed" -eq 0 ] && [ "$status" -eq 0 ]; then ok=true; else ok=false; fi
 
+	# Phase 7 hands these over as it validates them, rather than the summary
+	# reading fsck-full.json back: the values are already in this shell, and
+	# re-reading a file to learn what this process just decided is how a
+	# summary drifts from the check it claims to report.
+	if [ -n "$FSCK_OK" ]; then
+		fsck_block="$(
+			printf '{\n'
+			json_raw_field 6 checked_namespaces "$FSCK_NAMESPACES" ,
+			json_raw_field 6 checked_objects "$FSCK_OBJECTS" ,
+			json_raw_field 6 checked_refs "$FSCK_REFS" ,
+			json_raw_field 6 findings "$FSCK_FINDINGS" ,
+			json_raw_field 6 full "$FSCK_FULL" ,
+			json_raw_field 6 ok "$FSCK_OK"
+			printf '    }'
+		)"
+	else
+		fsck_block=null
+	fi
 
-def load(path):
-    rows = []
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                name, _, detail = line.partition(sep)
-                rows.append({"id": name, "detail": detail})
-    except FileNotFoundError:
-        pass
-    return rows
+	if [ -s "$ABI_GATE_FRAGMENT" ]; then
+		cli_abi_block="$(cat "$ABI_GATE_FRAGMENT")"
+	else
+		cli_abi_block=null
+	fi
 
+	# env-line.json is already a JSON object; it is spliced whole rather than
+	# taken apart and put back together.
+	if [ -s "$OUTDIR/env-line.json" ]; then
+		environment_block="$(sed -e '2,$s/^/  /' "$OUTDIR/env-line.json")"
+	else
+		environment_block=null
+	fi
 
-outdir = os.environ["GATE_OUTDIR"]
+	{
+		printf '{\n'
+		printf '  "artifacts": '
+		gate_artifact_array 2 \
+			fsck-full.json \
+			seal-attestation.txt \
+			abi-conformance.json \
+			env-line.txt \
+			env-line.json \
+			conflict-object.txt
+		printf ',\n'
+		printf '  "cli_abi": %s,\n' "$cli_abi_block"
+		json_raw_field 2 duration_seconds "$(($(date +%s) - START_EPOCH))" ,
+		printf '  "environment": %s,\n' "$environment_block"
+		printf '  "failures": '
+		gate_record_array "$FAILURES" 2
+		printf ',\n'
+		json_field 2 forge_binary "$FORGE" ,
+		json_field 2 forge_version "$FORGE_VERSION" ,
+		printf '  "fsck": %s,\n' "$fsck_block"
+		json_raw_field 2 ok "$ok" ,
+		printf '  "phases_passed": '
+		gate_record_array "$PHASES" 2
+		printf ',\n'
+		json_field 2 schema forgefs.release-gate/1 ,
+		json_raw_field 2 script_exit_status "$status" ,
+		json_field 2 seal_tag "$TAG" ,
+		json_raw_field 2 started_unix "$START_EPOCH"
+		printf '}\n'
+	} >"$OUTDIR/gate-summary.json" || true
 
-
-def artifact(name):
-    path = os.path.join(outdir, name)
-    return {"file": name, "present": os.path.exists(path)}
-
-
-def read_json(name):
-    try:
-        with open(os.path.join(outdir, name), "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except Exception:
-        return None
-
-
-fsck = read_json("fsck-full.json")
-abi = read_json("abi-conformance.json")
-env = read_json("env-line.json")
-failed = int(os.environ["GATE_FAILED_COUNT"])
-status = int(os.environ["GATE_STATUS"])
-
-summary = {
-    "schema": "forgefs.release-gate/1",
-    "ok": failed == 0 and status == 0,
-    "script_exit_status": status,
-    "forge_binary": os.environ["GATE_FORGE"],
-    "forge_version": os.environ["GATE_FORGE_VERSION"],
-    "seal_tag": os.environ["GATE_TAG"],
-    "started_unix": int(os.environ["GATE_STARTED"]),
-    "duration_seconds": int(time.time()) - int(os.environ["GATE_STARTED"]),
-    "phases_passed": load(os.environ["GATE_PHASES"]),
-    "failures": load(os.environ["GATE_FAILURES"]),
-    "fsck": (
-        None
-        if fsck is None
-        else {
-            "ok": fsck.get("ok"),
-            "full": fsck.get("full"),
-            "checked_refs": fsck.get("checked_refs"),
-            "checked_objects": fsck.get("checked_objects"),
-            "checked_namespaces": fsck.get("checked_namespaces"),
-            "findings": fsck.get("findings"),
-        }
-    ),
-    "cli_abi": (
-        None
-        if abi is None
-        else {
-            "ok": abi.get("ok"),
-            "rows_total": abi.get("rows_total"),
-            "rows_blocking": abi.get("rows_blocking"),
-            "rows_known_failing": abi.get("rows_known_failing"),
-            "rows_unexercised": abi.get("rows_unexercised"),
-            "blocking_failures": abi.get("blocking_failures"),
-            "known_failing": [
-                {
-                    "id": r["id"],
-                    "contract_exit": r["contract_exit"],
-                    "observed_exit": r["observed_exit"],
-                    "note": r["note"],
-                }
-                for r in abi.get("rows", [])
-                if r.get("class") == "known_failing"
-            ],
-        }
-    ),
-    "environment": env,
-    "artifacts": [
-        artifact(n)
-        for n in (
-            "fsck-full.json",
-            "seal-attestation.txt",
-            "abi-conformance.json",
-            "env-line.txt",
-            "env-line.json",
-            "conflict-object.txt",
-        )
-    ],
-}
-with open(os.environ["GATE_OUT"], "w", encoding="utf-8") as handle:
-    json.dump(summary, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
 	rm -rf "$WORK"
 	if [ "$status" -eq 0 ] && [ "$failed" -ne 0 ]; then
 		printf 'release-gate: %s assertion(s) failed\n' "$failed" >&2
@@ -544,49 +568,60 @@ fi
 phase gate/seal-verify "sealed tags/$TAG -> $SNAP_OID, --attest ok, verify ok, flags $TAG_FLAGS"
 
 # ---------------------------------------------------------------------------
-# Phase 7 - fsck --full --json, parsed as JSON (never grepped as prose)
+# Phase 7 - fsck --full --json, scanned as JSON (never grepped as prose)
 # ---------------------------------------------------------------------------
 must gate/fsck --dir "$DEMO" --cap "$ROOT" fsck --full --json
 printf '%s\n' "$LAST_OUT" >"$OUTDIR/fsck-full.json"
-FSCK_SUMMARY="$(FSCK_PATH="$OUTDIR/fsck-full.json" python3 - <<'PY'
-import json
-import os
-import sys
 
-with open(os.environ["FSCK_PATH"], "r", encoding="utf-8") as handle:
-    report = json.load(handle)
+# Scanned rather than pattern-matched: json_top_level tracks string state and
+# bracket depth, so a brace, colon or comma inside a finding's own text cannot
+# be mistaken for document structure.
+fsck_members=""
+fsck_problems=""
+if ! fsck_members="$(json_top_level <"$OUTDIR/fsck-full.json")"; then
+	fsck_problems=" fsck-full.json is not a JSON object;"
+fi
 
-problems = []
-if report.get("ok") is not True:
-    problems.append("ok is %r, expected True" % (report.get("ok"),))
-if report.get("full") is not True:
-    problems.append("full is %r, expected True" % (report.get("full"),))
-findings = report.get("findings")
-if findings:
-    problems.append("findings is non-empty: %s" % json.dumps(findings))
-for key in ("checked_refs", "checked_objects", "checked_namespaces"):
-    value = report.get(key)
-    if not isinstance(value, int) or value <= 0:
-        problems.append("%s is %r, expected a positive integer" % (key, value))
+fsck_value() { json_member "$fsck_members" "$1" || printf 'absent'; }
 
-if problems:
-    sys.stderr.write("; ".join(problems) + "\n")
-    sys.exit(1)
+if [ -z "$fsck_problems" ]; then
+	fsck_ok="$(fsck_value ok)"
+	fsck_full="$(fsck_value full)"
+	fsck_findings="$(fsck_value findings)"
+	fsck_refs="$(fsck_value checked_refs)"
+	fsck_objects="$(fsck_value checked_objects)"
+	fsck_namespaces="$(fsck_value checked_namespaces)"
 
-print(
-    "refs=%d objects=%d namespaces=%d findings=0"
-    % (
-        report["checked_refs"],
-        report["checked_objects"],
-        report["checked_namespaces"],
-    )
-)
-PY
-)" || {
-	fail gate/fsck "fsck --full --json report is not clean (see fsck-full.json)"
+	[ "$fsck_ok" = true ] ||
+		fsck_problems="$fsck_problems ok is $fsck_ok, expected true;"
+	[ "$fsck_full" = true ] ||
+		fsck_problems="$fsck_problems full is $fsck_full, expected true;"
+	[ "$fsck_findings" = "[]" ] ||
+		fsck_problems="$fsck_problems findings is non-empty: $fsck_findings;"
+	for counted in "checked_refs=$fsck_refs" "checked_objects=$fsck_objects" \
+		"checked_namespaces=$fsck_namespaces"; do
+		case "${counted#*=}" in
+		'' | 0 | *[!0-9]*)
+			fsck_problems="$fsck_problems ${counted%%=*} is ${counted#*=}, expected a positive integer;"
+			;;
+		esac
+	done
+fi
+
+if [ -n "$fsck_problems" ]; then
+	fail gate/fsck "fsck --full --json report is not clean:$fsck_problems (see fsck-full.json)"
 	exit 1
-}
-phase gate/fsck "fsck --full --json ok: $FSCK_SUMMARY"
+fi
+
+# Only now do the summary's own fields exist: an unset FSCK_OK is what makes
+# `finish` report "fsck": null for a gate that never got this far.
+FSCK_OK="$fsck_ok"
+FSCK_FULL="$fsck_full"
+FSCK_FINDINGS="$fsck_findings"
+FSCK_REFS="$fsck_refs"
+FSCK_OBJECTS="$fsck_objects"
+FSCK_NAMESPACES="$fsck_namespaces"
+phase gate/fsck "fsck --full --json ok: refs=$FSCK_REFS objects=$FSCK_OBJECTS namespaces=$FSCK_NAMESPACES findings=0"
 
 # ---------------------------------------------------------------------------
 # Phase 8 - CLI exit-code ABI conformance (CLI_ABI.md, issue #237)
