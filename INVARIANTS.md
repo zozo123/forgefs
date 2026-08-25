@@ -95,7 +95,15 @@ covered:
   `checkin` and `abandon` can still disagree about whether a session holds work.
   That is #326's remaining half and belongs to `fix/checkin-noop-drops-staged-work`.
   `multi_mount_shape.rs::checkin_reports_noop_while_another_mount_holds_unpublished_work`
-  pins it.
+  pins it. That branch and this one are independent in mechanism but NOT
+  compatible as written: it refuses **every** checkin -- not only a `noop` --
+  while any other mount holds staged work, which under I19 deadlocks a session
+  holding two writable mounts, because publishing either one is refused on
+  account of the other and its own advice ("check each mount in on its own")
+  can never be followed. `multi_mount_concurrent.rs` reproduces that on the
+  merge of the two. The reconciliation is to scope the refusal to the `noop`
+  outcome: `updated` and `forked` are progress and may leave other mounts
+  staged, and only "there was nothing to do" may never be said over work.
 * **The observation epoch is per-session while the overlay epoch is per-mount.**
   `Meta::cas_ref_session` deletes observations for the whole namespace while
   deleting overlay for the published mount alone, so a foreign-mount read stops
