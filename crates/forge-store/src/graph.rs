@@ -244,7 +244,7 @@ pub fn decode_graph_object(id: ObjectId, bytes: &[u8]) -> Result<DecodedGraphObj
     Ok(DecodedGraphObject { object_type, edges })
 }
 
-impl Store {
+impl<O: crate::ObjectStore> Store<O> {
     /// Rehash and canonically decode a complete typed object graph.
     pub fn reachable_graph_verified(
         &self,

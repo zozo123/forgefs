@@ -4,6 +4,7 @@ pub mod blob;
 mod graph;
 pub mod meta;
 mod metrics;
+pub mod objectstore;
 
 pub use blob::{LocalBlobStore, PublishBatch};
 pub use graph::{
@@ -15,6 +16,7 @@ pub use meta::{
     CatalogObjectExpectation, CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow,
     Observed, OverlayRow, RetiredRef, ABANDONABLE_PREFIX, CURRENT_SCHEMA_VERSION, REFLOG_ABANDON,
 };
+pub use objectstore::{DurabilityClass, ObjectBatch, ObjectStore};
 
 use forge_core::object::{decode_object_type, Blob, Commit, Conflict, Snapshot};
 use forge_core::tree::{Tree, TreeStore};
@@ -196,19 +198,28 @@ pub fn durable_sync_dir_at(path: &Path, point: DurabilityBarrier) -> Result<()> 
     Ok(())
 }
 
-pub struct Store {
-    pub blobs: LocalBlobStore,
+/// The object plane is a type parameter, not a file layout. `Store` is written
+/// against [`ObjectStore`] and defaults to the only production implementation,
+/// so the bare name `Store` still means `Store<LocalBlobStore>` everywhere it
+/// did before -- while the compiler now proves this type uses nothing but the
+/// trait.
+pub struct Store<O: ObjectStore = LocalBlobStore> {
+    pub blobs: O,
     pub meta: Meta,
+    /// The repository root. It belongs to the repository, not to the object
+    /// plane: `meta.sqlite`, `VERSION` and `keys/` live here whatever backend
+    /// holds the objects.
+    root: PathBuf,
     trees: Mutex<LruCache<ObjectId, Arc<Tree>>>,
     blob_cache: Mutex<LruCache<ObjectId, Arc<[u8]>>>,
 }
 
-pub struct StorePublishBatch<'a> {
-    store: &'a Store,
-    objects: Mutex<PublishBatch<'a>>,
+pub struct StorePublishBatch<'a, O: ObjectStore = LocalBlobStore> {
+    store: &'a Store<O>,
+    objects: Mutex<Box<dyn ObjectBatch + 'a>>,
 }
 
-impl StorePublishBatch<'_> {
+impl<O: ObjectStore> StorePublishBatch<'_, O> {
     pub fn put_commit(&self, commit: &Commit) -> Result<ObjectId> {
         self.objects.lock().put(&commit.encode())
     }
@@ -223,7 +234,7 @@ impl StorePublishBatch<'_> {
     }
 }
 
-impl TreeStore for StorePublishBatch<'_> {
+impl<O: ObjectStore> TreeStore for StorePublishBatch<'_, O> {
     fn get_tree(&self, id: ObjectId) -> Result<Tree> {
         self.store.get_tree(id)
     }
@@ -236,23 +247,35 @@ impl TreeStore for StorePublishBatch<'_> {
     }
 }
 
-impl Store {
-    pub fn begin_publish_batch(&self) -> StorePublishBatch<'_> {
+impl<O: ObjectStore> Store<O> {
+    /// Build a `Store` over any object plane. This is the seam's entry point:
+    /// the catalog stays local while the caller chooses the object backend.
+    /// Only a [`DurabilityClass::CrashDurable`] backend may back a repository
+    /// that publishes refs -- see `objectstore.rs` for why that is a review
+    /// obligation and not a compile error.
+    pub fn with_object_store(root: PathBuf, blobs: O, meta: Meta) -> Self {
+        Self {
+            blobs,
+            meta,
+            root,
+            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
+            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        }
+    }
+
+    pub fn begin_publish_batch(&self) -> StorePublishBatch<'_, O> {
         StorePublishBatch {
             store: self,
             objects: Mutex::new(self.blobs.begin_batch()),
         }
     }
+}
 
+impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         let blobs = LocalBlobStore::new(root.to_path_buf())?;
         let meta = Meta::open(&root.join("meta.sqlite"))?;
-        Ok(Self {
-            blobs,
-            meta,
-            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
-            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
-        })
+        Ok(Self::with_object_store(root.to_path_buf(), blobs, meta))
     }
 
     /// Open both halves of the store without writing to either. Object and
@@ -261,12 +284,7 @@ impl Store {
     pub fn open_read_only(root: &Path) -> Result<Self> {
         let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
         let meta = Meta::open_read_only(&root.join("meta.sqlite"))?;
-        Ok(Self {
-            blobs,
-            meta,
-            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
-            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
-        })
+        Ok(Self::with_object_store(root.to_path_buf(), blobs, meta))
     }
 
     /// Detection-only open used by fsck. It is byte-for-byte read-only like
@@ -275,14 +293,11 @@ impl Store {
     pub fn open_read_only_for_fsck(root: &Path) -> Result<Self> {
         let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
         let meta = Meta::open_read_only_for_fsck(&root.join("meta.sqlite"))?;
-        Ok(Self {
-            blobs,
-            meta,
-            trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
-            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
-        })
+        Ok(Self::with_object_store(root.to_path_buf(), blobs, meta))
     }
+}
 
+impl<O: ObjectStore> Store<O> {
     pub fn read_only(&self) -> bool {
         self.meta.read_only()
     }
@@ -394,7 +409,7 @@ impl Store {
     }
 
     pub fn root(&self) -> PathBuf {
-        self.blobs.root().to_path_buf()
+        self.root.clone()
     }
 
     /// First-intro walk: record every oid in `new` that is not in `old`.
@@ -495,11 +510,11 @@ impl Store {
     }
 }
 
-impl TreeStore for Store {
+impl<O: ObjectStore> TreeStore for Store<O> {
     fn get_tree(&self, id: ObjectId) -> Result<Tree> {
-        Store::get_tree(self, id)
+        Store::<O>::get_tree(self, id)
     }
     fn put_tree(&self, tree: &Tree) -> Result<ObjectId> {
-        Store::put_tree(self, tree)
+        Store::<O>::put_tree(self, tree)
     }
 }

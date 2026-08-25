@@ -14,6 +14,7 @@ Each fact has one owner. Link to it instead of copying it:
 | `FORMAT.md` | Frozen VERSION 1 object framing and canonical encodings |
 | `CLI_ABI.md` | Stable CLI output, error, and exit-code contract |
 | `docs/RECOVERY.md` | Crash-durability and recovery contract |
+| `docs/OBJECTSTORE.md` | The `ObjectStore` seam and the durability a backend must prove itself |
 | `docs/BENCH.md` | Reproducible benchmark protocol and claim boundaries |
 | `docs/CHUNKING.md` | Measured object-size ceiling and the chunked-file design decision |
 | `docs/RELEASING.md` | Release, artifact, and verification procedure |
