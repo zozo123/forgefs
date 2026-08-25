@@ -86,18 +86,29 @@ fn i5_protected_refs_fail_closed() {
     let fixture = Fixture::new();
     let agent = fixture.agent("writer");
     let ns = fixture.session(&agent, "main");
-    fixture
-        .forge
-        .mount(&agent, &ns, "/", "ref:main", true)
-        .unwrap();
-    fixture
-        .forge
-        .write(&agent, &ns, "/forbidden.txt", b"no", false)
-        .unwrap();
 
+    // I5 denies every session CAS on a protected ref, so I20 refuses the
+    // read-write mount that would rely on one. This case used to take the
+    // mount, stage a write and assert the CHECKIN denial -- which was the
+    // denial happening in the wrong place: the work was already staged by
+    // then, `abandon` refused to retire the session over it, and
+    // `--discard-staged` was the only exit (#328). Failing closed still means
+    // failing closed; it now happens before anything can be stranded.
     let error = fixture
         .forge
-        .checkin(&agent, &ns, "/", "must not publish")
+        .mount(&agent, &ns, "/", "ref:main", true)
+        .unwrap_err();
+    assert!(matches!(error, Error::Denied(_)), "{error}");
+
+    // And nothing was staged, so the session is not holding anything it cannot
+    // publish (I21). A read-only mount of the same ref is still available.
+    fixture
+        .forge
+        .mount(&agent, &ns, "/", "ref:main", false)
+        .unwrap();
+    let error = fixture
+        .forge
+        .write(&agent, &ns, "/forbidden.txt", b"no", false)
         .unwrap_err();
     assert!(matches!(error, Error::Denied(_)), "{error}");
 }

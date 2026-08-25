@@ -166,7 +166,13 @@ fn a_lost_race_on_a_non_root_mount_forks_and_keeps_the_work() {
         panic!("a stale non-root mount must fork, not overwrite the winner");
     };
     assert_eq!(requested, "other");
-    assert!(fork.starts_with("forks/other/"), "{fork}");
+    // #343: a session fork lands inside the losing agent's own scope, so the
+    // capability that took the mount still covers the ref the mount is
+    // retargeted at.
+    assert_eq!(
+        fork,
+        "heads/agents/anon/forks/other/".to_string() + fork.rsplit('/').next().unwrap()
+    );
 
     // The winner is intact and did NOT acquire this session's entry.
     assert_eq!(read_ref(&f, &root, "other", "/theirs.txt"), b"theirs");
@@ -438,7 +444,10 @@ fn i19_every_read_write_mount_resolves_against_its_own_base() {
             panic!("{mount}: expected a fork, got {result:?}");
         };
         assert_eq!(&requested, expected);
-        assert!(fork.starts_with(&format!("forks/{expected}/")), "{fork}");
+        assert!(
+            fork.starts_with(&format!("heads/agents/anon/forks/{expected}/")),
+            "#343: the fork must land in the losing agent's own scope: {fork}"
+        );
     }
     assert_eq!(read_ref(&f, &root, "base", "/a.txt"), b"BASE-MOVED");
     assert_eq!(read_ref(&f, &root, "other", "/a.txt"), b"OTHER-MOVED");

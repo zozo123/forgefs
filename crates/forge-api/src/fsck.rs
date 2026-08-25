@@ -63,7 +63,7 @@ impl Forge {
     ///
     /// fsck reads refs, then namespaces, then each namespace's mounts, as
     /// separate queries. A concurrent forking checkin commits a new
-    /// `forks/<ref>/<agent>/<ulid>` and repoints the losing session's mount at
+    /// `heads/agents/<agent>/forks/<ref>/<ulid>` and repoints the losing session's mount at
     /// it atomically, so an fsck that snapshotted refs *before* that commit and
     /// read mounts *after* it would see a mount naming a ref it never loaded
     /// and report MOUNT_REF corruption -- exit 2 on a repository whose bytes

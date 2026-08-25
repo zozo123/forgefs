@@ -22,7 +22,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I2 | One logical object ⇒ one byte string ⇒ one ObjectId. |
 | I3 | Put is idempotent iff bytes match; never overwrite. |
 | I4 | A committed ref implies fsynced object bytes and every directory edge needed to reach them; visibility alone is never a durability proof. |
-| I5 | Refs move only expected→new. Lost CAS forks or denies. Protected refs deny. A `seal` is a claim ABOUT a ref, so it publishes only while that ref still holds the commit the snapshot names, and refuses a moved head (exit 4) rather than naming a commit the ref no longer holds. |
+| I5 | Refs move only expected→new. Lost CAS forks or denies. Protected refs deny. A lost SESSION checkin forks to `heads/agents/<agent>/forks/<ref>/<ulid>` -- inside the losing agent's own scope, because I18 retargets that session's mount at the fork and a ref the session cannot open is not a place work can be preserved to (#343). `merge` and `import` retarget no session and still fork to `forks/<ref>/<agent>/<ulid>`. A `seal` is a claim ABOUT a ref, so it publishes only while that ref still holds the commit the snapshot names, and refuses a moved head (exit 4) rather than naming a commit the ref no longer holds. |
 | I6 | Ref + reflog (+ seal) commit together. |
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Reads through a session resolve against a pinned base -- per mount, see I19 -- and its overlay, never a live ref another agent can move. Checkin CASes that oid, never a moving head. |
@@ -37,8 +37,8 @@ cap         (operation, resource); attenuation ⊆ parent
 | I17 | Repository VERSION gates immutable decoding and is independent of SQLite schema version. Unknown future values fail closed; metadata migrations never rewrite objects or ObjectIds. |
 | I18 | A refused checkin never destroys staged work. A losing CAS forks the completed contribution and retargets the session to it; no failure path silently discards work. A fork stays a reclamation root until it is explicitly resolved -- merged, or retired by `abandon`, which is a deliberate act and not a failure path. |
 | I19 | Every read-write mount carries its OWN pinned base, recorded when the mount is taken. Reads, `ls`, observation checks and checkin through a mount all resolve against that mount's pin, so the mount MODE never decides which ref you read and a mount of one ref never answers out of another's tree. Checkin folds one mount's overlay onto that mount's pin and CASes the ref THAT MOUNT names, from that pin, re-pinning only that mount. A read-only mount carries no pin and resolves live on purpose: that is what makes cross-mount staleness detectable (I9). Re-mounting a path whose overlay was staged against a different spec, or demoting one that holds staged work, is refused, never silently retargeted. |
-| I20 | A mount that accepts a write has a verb that can publish it. A read-write mount must name a ref holding a commit, so an immutable `oid:` spec and a non-commit ref are refused at mount time rather than accepting writes no capability and no verb could ever publish. |
-| I21 | A session holding write authority over a mount's base can always reach a terminal state for it: publish, fork, or `abandon`. No sequence of authorised reads may leave every checkin refused. A read-write mount is validated against the same pin its own reads came from, so an authorised read can never make the session's work unpublishable; a refusal a re-read cannot clear must name the mount that caused it, not only the observation. |
+| I20 | A mount that accepts a write has a verb that can publish it. A read-write mount must name an UNPROTECTED ref holding a commit, so an immutable `oid:` spec, a non-commit ref, and a protected ref are all refused at mount time rather than accepting writes no capability and no verb could ever publish. Protected is decidable once and for all at mount time because `refs.protected` is write-once: only ref CREATION and `seal` ever set it, neither can apply it to a name that already exists, and no CAS touches the column -- so protection can never arrive underneath a live mount. |
+| I21 | A session holding write authority over a mount's base can always reach a terminal state for it: publish, fork, or `abandon`. No sequence of authorised reads may leave every checkin refused. A read-write mount is validated against the same pin its own reads came from, and an observation is validated against the OBSERVING mount's own staged overlay -- the same tree the read resolved through -- so an authorised read can never make the session's work unpublishable; a refusal a re-read cannot clear must name the mount that caused it, not only the observation. |
 | I22 | `Noop` is the one checkin outcome that may never be said over work that exists. A checkin that folds its mount and finds nothing to publish refuses -- exit 1 -- and names every other mount holding staged entries, instead of answering "there was nothing to do" for a session that plainly has something to do. `updated` and `forked` are progress and may legitimately leave another mount staged: under I19 a session holds a pin per writable mount and publishes them one `checkin --mount` at a time, so refusing those too would deny the very escape the refusal advises (I21). I18 forbids the failure path that destroys staged work; I22 forbids the success path that denies it exists, so `checkin` and `abandon` can never disagree about whether a session still holds work. |
 | I23 | Collection unlinks only bytes nothing can reach. A sweep reads the root set and unlinks inside the one catalog write transaction every root publication commits under, so mark and publish cannot interleave; it re-reads each candidate's age under the object plane's exclusive lock, the same lock a deduplicating put refreshes an age under, so content addressing cannot hide a live object behind an old timestamp; it spares everything any surviving object can reach, because `fsck --full` roots object files and not merely catalog roots; and every catalog row naming a swept object is removed in the same transaction. Collection is sound while no single put-to-publish interval exceeds the grace floor, which is why the floor has a hard minimum and no session lease is required: a pin is a catalog row, so it is a root. |
 
@@ -57,12 +57,12 @@ not diluted into a mock:
 | I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `group_commit.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `forge-store/objectstore/conformance.rs`, `docs/RECOVERY.md`, `docs/OBJECTSTORE.md` |
 | I5, I7, I8 | `forge-store/meta.rs` (`cas_ref*`, `commit_seal`), `forge-api/workspace.rs`, `refs.rs`, `integration.rs` (`seal`) | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `multi_mount_shape.rs`, `model_composition.rs`, `cli_seal_head_moves.rs`, `fuzz/ref_name` |
 | I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs`, `multi_mount_shape.rs`, `model_composition.rs` |
-| I18 | `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs` | `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `model_composition.rs`, `docs/GC.md` |
-| I19, I20, I21 | `forge-api/workspace.rs` (`mount`, `session_mount_tree`, `check_observations`, `checkin`), `forge-store/meta.rs` (`mounts.base_oid`, `insert_mount`, `cas_ref_session`, `MIGRATE_2_TO_3`), `forge-api/gc.rs`, `fsck.rs` | `multi_mount_shape.rs`, `multi_mount_concurrent.rs`, `cli_mount_pin.rs`, `schema_migration_fixtures.rs`, `testdata/schema/v2_pre_mount_pin.sql`, `session_atomicity.rs`, `model_composition.rs`, `docs/GC.md` |
+| I18 | `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs` (`session_fork_name`, `is_fork_ref`) | `pinned_rw_session_reads.rs`, `fork_reachability.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `model_composition.rs`, `docs/GC.md` |
+| I19, I20, I21 | `forge-api/workspace.rs` (`mount`, `refuse_rw_mount_of_protected_ref`, `session_mount_tree`, `check_observations`, `checkin`), `forge-store/meta.rs` (`mounts.base_oid`, `insert_mount`, `cas_ref_session`, `MIGRATE_2_TO_3`), `forge-api/gc.rs`, `fsck.rs` | `mount_protection.rs`, `observation_scope.rs`, `multi_mount_shape.rs`, `multi_mount_concurrent.rs`, `cli_mount_pin.rs`, `schema_migration_fixtures.rs`, `testdata/schema/v2_pre_mount_pin.sql`, `session_atomicity.rs`, `model_composition.rs`, `docs/GC.md` |
 | I22 | `forge-api/workspace.rs` (`checkin`), `forge-store/meta.rs` (`overlay_mounts_outside`), `forge-cli/main.rs` | `checkin_staged_work.rs`, `cli_checkin_staged_work.rs`, `multi_mount_shape.rs`, `model_composition.rs`, `gc_and_abandon.rs`, `CLI_ABI.md` |
 | I23 | `forge-api/gc.rs` (`gc_collect`, `schedule_catalog_roots`), `forge-store/meta.rs` (`gc_sweep`, `GcCatalogRoots`), `forge-store/blob.rs` (`refresh_dedup_mtime`) | `gc_collect_concurrent.rs`, `gc_collect.rs`, `gc_and_abandon.rs`, `cache_trust.rs`, `docs/GC.md` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs`, `rename_characterisation.rs`, `property_merge_symmetry.rs` |
-| I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs`, `property_attenuation.rs`, `fuzz/cap_token` |
+| I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `fork_reachability.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs`, `property_attenuation.rs`, `fuzz/cap_token` |
 | I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs`, `fsck_unmigrated_catalog.rs`, `cli_seal_head_moves.rs`, `cli_seal_race.rs` |
 | I16 | `forge-core/tree.rs`, `forge-api/export.rs` | `path_identity.rs`, `export_long_names.rs`, `export_name_collisions.rs`, `fuzz/tar_roundtrip` |
 
@@ -93,7 +93,15 @@ single-operation test can see it. Defects the harness reproduces on the current
 tree are listed in its `KNOWN` table with the invariant each one breaks; the
 table is asserted to be exactly what the default run observes, so fixing one
 fails the test until its row is removed and the model is allowed to assert the
-correct behaviour instead.
+correct behaviour instead. `KNOWN` is now EMPTY: its last row,
+`F4-SESSION-WEDGED-WITH-STAGED-WORK`, went away with I20's protected-ref
+refusal, and the liveness check that filed it now fails the run outright
+instead. That row had been counting two distinct wedges under one name -- the
+protected mount, and a read-back of the session's own staged write that made
+every OTHER mount's checkin permanently stale (I21). Both are fixed; the
+remaining soak divergence is the row-versus-work disagreement recorded under
+"Shape gaps that remain", which reproduces identically on the tree before
+these changes.
 
 ## Shape gaps that remain
 
@@ -117,18 +125,18 @@ stated so it is not mistaken for covered:
   the way `DELETE FROM overlay` is.
   `multi_mount_shape.rs::a_checkin_of_one_mount_forgets_every_other_mounts_observations`
   pins it.
-* **A read-write mount on a PROTECTED ref accepts writes nothing can publish.**
-  I20 requires a mount that accepts a write to have a verb that can publish it,
-  and it refuses a read-write `oid:` spec and a ref not holding a commit for
-  exactly that reason -- but a protected ref is still accepted at mount time.
-  `checkin` then denies it (`ref R is protected`), `abandon` without an explicit
-  discard refuses because work is staged, and the only exit destroys the work.
-  That is I20's own rule failing on the one shape it does not check, and I21's
-  liveness with it. `model_composition.rs` reproduces it as
-  `F4-SESSION-WEDGED-WITH-STAGED-WORK`, 11 occurrences in the default run, and
-  `liveness_session_with_staged_work_can_be_stranded` states it by hand. The fix
-  is the same shape as the other two: refuse the mount, since write authority
-  over a protected ref is authority checkin can never exercise.
+* **A no-op checkin leaves other mounts' overlay ROWS staged, and `abandon`
+  counts rows.** `#342` scoped I22 to WORK rather than rows, so a `Noop` is
+  legitimate over an overlay that folds to its own mount's base -- but
+  `complete_noop_session` clears only the published mount's rows, while
+  `abandon_session` counts rows across the namespace. So `checkin` can say
+  "nothing to do" and `abandon` can still refuse the same session, which is the
+  disagreement I22's last sentence says cannot happen. Nothing is stranded --
+  checking the other mount in noops it and clears its rows, so the session
+  always finishes -- but the two verbs do disagree, and `model_composition.rs`
+  reproduces it above roughly 20 sequences of 200 steps
+  (`FORGEFS_MODEL_SEQUENCES=20 FORGEFS_MODEL_STEPS=200`). Either `Noop` clears
+  every row it accounted for, or `abandon` counts work the way `checkin` does.
 
 ### Which operations an invariant actually constrains
 
@@ -140,7 +148,7 @@ an operation no rule names is a bug class nothing prevents. As of I23:
 | Operation | Constrained by |
 |---|---|
 | `session open` | I8 (pins a base), I19 (the root mount is pinned with it) |
-| `mount` | I19 (a read-write mount carries its own pin), I20 (it must be publishable) |
+| `mount` | I19 (a read-write mount carries its own pin), I20 (it must be publishable: not `oid:`, not a non-commit ref, not a protected ref) |
 | `read`, `ls` | I8, I9 (every read is recorded), I19 (resolved against the mount's pin) |
 | `checkin` | I5, I8, I9, I10, I18, I19, I21, I22 |
 | `abandon` | I18 (a fork stays a root until deliberately retired) |

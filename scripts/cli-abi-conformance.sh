@@ -350,8 +350,11 @@ run --dir "$G" --cap "$G_ROOT" checkin --ns "$G_WIN" -m w
 # "forked <requested> -> <fork> ours=<oid> theirs=<oid>"
 G_FORKLINE="$(capture --dir "$G" --cap "$G_ROOT" checkin --ns "$G_LOSE" -m l | tr -d '\r')"
 G_FORK="$(printf '%s\n' "$G_FORKLINE" | awk '/^forked /{print $4; exit}')"
+# #343: a SESSION fork lands inside the losing agent's own capability scope,
+# because I18 retargets that session's mount at it. A merge or import fork,
+# which retargets no session, still lands under the flat forks/ tree.
 case "$G_FORK" in
-forks/shared/*) ;;
+heads/agents/*/forks/shared/*) ;;
 *) die "expected the losing checkin to fork, got: $G_FORKLINE" ;;
 esac
 # A session that wrote but never checked in: staged work abandon must protect.
@@ -396,6 +399,12 @@ check abi/1-abandon-non-fork-ref blocking 1 "" -- \
 	--dir "$G" --cap "$G_ROOT" abandon fork main
 check abi/1-abandon-missing-fork blocking 1 "" -- \
 	--dir "$G" --cap "$G_ROOT" abandon fork forks/shared/anon/01ARZ3NDEKTSV4RRFFQ69G5FAV
+check abi/1-abandon-missing-session-fork blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork heads/agents/anon/forks/shared/01ARZ3NDEKTSV4RRFFQ69G5FAV
+# A live session head shares the heads/ prefix with every session fork and is
+# still not a fork: abandon must keep refusing it (I18).
+check abi/1-abandon-live-session-head blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork "heads/agents/anon/$G_STAGED"
 check abi/1-abandon-mounted-fork blocking 1 "" -- \
 	--dir "$G" --cap "$G_ROOT" abandon fork "$G_FORK"
 check abi/1-abandon-session-with-staged-work blocking 1 "" -- \

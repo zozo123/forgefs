@@ -260,10 +260,20 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
 
     // Forks are the I18/I5 loser path and are refs like any other, so they are
     // held to the same rule.
+    let mut forks_seen = 0usize;
     for row in f.refs(&root).unwrap() {
-        let Some(rest) = row.name.strip_prefix("forks/") else {
+        // #343: a session fork is `heads/agents/<agent>/forks/<ref>/<ulid>`.
+        // The ref it forked from is what names the owner, exactly as the flat
+        // `forks/<ref>/...` spelling did.
+        let Some(rest) = row
+            .name
+            .strip_prefix("heads/agents/")
+            .and_then(|r| r.split_once('/'))
+            .and_then(|(_agent, tail)| tail.strip_prefix("forks/"))
+        else {
             continue;
         };
+        forks_seen += 1;
         let owner = rest.split('/').next().unwrap().to_string();
         let ns = f.session_open(&root, &row.name).unwrap();
         f.mount(&root, &ns, "/", &format!("ref:{}", row.name), false)
@@ -285,6 +295,13 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
             );
         }
     }
+    // The loop above is the whole point of this section, and renaming the fork
+    // namespace is exactly how it could quietly stop matching anything.
+    assert!(
+        forks_seen > 0,
+        "a contended concurrent run must produce at least one fork for this \
+         section to check; if it matched nothing, the fork namespace moved"
+    );
 
     let report = f.fsck(&root, true).unwrap();
     assert!(
