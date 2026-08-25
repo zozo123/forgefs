@@ -97,7 +97,8 @@ fn a_committed_write_is_visible_to_the_next_read_connection_query() {
     );
 
     meta.insert_namespace("ns", "agent", b, "heads/x").unwrap();
-    meta.insert_mount("ns", "/", "ref:heads/x", "rw").unwrap();
+    meta.insert_mount("ns", "/", "ref:heads/x", "rw", Some(b))
+        .unwrap();
     assert_eq!(meta.list_mounts("ns").unwrap().len(), 1);
     meta.observe("ns", "/", "a.txt", Observed::Blob(a)).unwrap();
     assert_eq!(meta.observations("ns").unwrap().len(), 1);

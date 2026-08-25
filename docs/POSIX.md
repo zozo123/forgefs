@@ -17,9 +17,25 @@ feared silent-data-loss case for issue #20 -- import dereferences a link, stores
 the target as a regular file, and export then produces a tree that is not the
 tree that was imported -- **does not happen**. I2 is intact at this boundary.
 
-The price is that ForgeFS cannot import *any* source tree that contains a
-symlink, which is most real ones, and there is no opt-out flag. That is a
-usability problem, not a correctness one, and it is the right way round.
+The price was that ForgeFS could not import *any* source tree that contains a
+symlink, which is most real ones, and there was no opt-out flag. That is a
+usability problem, not a correctness one, and it is the right way round -- but
+it was still an adoption blocker, so this pass added the opt-out **without**
+touching the frozen format:
+
+* the default is unchanged and still refuses, but one run now names **every**
+  symlink in the tree instead of failing on the first;
+* `forge import --follow-symlinks` (API: `import_dir_with` with
+  `ImportOptions { follow_symlinks: true }`) materialises each link as the
+  **content** of its target -- a file link becomes a regular Blob under the
+  link's name, a directory link becomes a Tree. It is lossy, it is opt-in, and
+  the refusal says so;
+* **containment is not optional.** A followed target that resolves outside the
+  canonical import root is refused, naming the link and where it pointed. This
+  is the security half: a source tree is untrusted input, and without the rule
+  a link inside it could name `/etc/passwd` or `../../` and copy host bytes
+  into a content-addressed, shareable, sealable store. Dangling links and every
+  loop shape are refused too, so no input can hang or unbound the recursion.
 
 ## Measured behaviour
 
@@ -33,7 +49,31 @@ ext4-backed overlay, non-root.
 | Absolute symlink | exit 1, same message | none | **REFUSED, loudly** |
 | Dangling symlink | exit 1, same message | none | **REFUSED, loudly** |
 | Symlink to a directory | exit 1, same message | none | **REFUSED, loudly** |
-| Import root *is* a symlink | exit 0, dereferenced | contents of the target | **SILENTLY FOLLOWED** (asymmetry) |
+| Symlink cycle `a -> b -> a` | exit 1, same message; no hang, no unbounded recursion | none | **REFUSED, loudly** |
+| Symlink to `../` outside the root | exit 1, same message | none | **REFUSED, loudly** |
+| Import root *is* a symlink | exit 0, dereferenced | contents of the target | **FOLLOWED** (the operator named that path; see below) |
+
+The six shapes above were re-measured at `v0.2.1` before any design work, on
+the shipped binary, precisely because the answer decides the task: had import
+*followed* links, the absolute and `../` cases would have been a path escape
+rather than a missing feature. They are refused, so this is a feature gap.
+
+With `--follow-symlinks`, the same fixtures behave like this:
+
+| Host input under `--follow-symlinks` | `forge import` | Result |
+|---|---|---|
+| Relative link to a sibling file | exit 0 | regular Blob under the link's name, target's bytes |
+| Link to a directory inside the root | exit 0 | Tree under the link's name, target's subtree |
+| Absolute link to `/etc/passwd` | exit 1 `... target /etc/passwd is outside the import root ...` | nothing published |
+| Link to `../outside` (dir or file) | exit 1, same shape | nothing published |
+| Link chain that hops inside then leaves | exit 1, same shape | nothing published |
+| Sibling root sharing a textual path prefix | exit 1, same shape (containment is component-wise) | nothing published |
+| Dangling link | exit 1 `... target does not exist` | nothing published |
+| `a -> b -> a` | exit 1 (ELOOP, surfaced as an input error) | nothing published |
+| `link -> .`, or mutual `x/toy -> ../y`, `y/tox -> ../x` | exit 1 `... re-enters a directory already being imported (symlink loop)` | nothing published |
+
+Every one of those is `Error::Invalid`, i.e. exit 1. A source tree is
+caller-controlled input and must never reach the internal-failure exit code.
 | FIFO | exit 1 `import refuses unsupported file type <path>` | none | **REFUSED, loudly** |
 | Unix socket | exit 1, same message | none | **REFUSED, loudly** |
 | Non-UTF-8 name | exit 1 `non-utf8 name in <dir>` | none | **REFUSED, loudly** |
@@ -105,30 +145,88 @@ its import, which is exactly the silent violation I2 exists to prevent. When a
 future VERSION represents symlinks, the refusal becomes a representation; until
 then it must not become a conversion.
 
-### Open items this measurement raises
+### Open items this measurement raised
 
-1. **The root-symlink asymmetry.** `forge import ./link-to-tree` dereferences;
-   `forge import ./parent` refuses because `parent/link-to-tree` is a symlink.
-   Both are defensible in isolation, but they disagree about the same link.
-   Deciding this is cheap and needs no format change.
-2. **Directory descent has no symlink re-verification.** `read_import_file`
-   opens with `O_NOFOLLOW` and re-checks `dev`/`ino` after reading, matching the
-   stated "bounded TOCTOU detection". Directory descent has no equivalent:
-   `import_walk` trusts the dirent file type and then calls `fs::read_dir` on
-   the path, which follows symlinks. A directory replaced by a symlink between
-   those two steps would be walked, so content outside the import root could
-   enter the tree despite the symlink refusal. Closing this properly wants an
-   `openat`-style descent (an fd opened `O_DIRECTORY|O_NOFOLLOW`, read through
-   that fd), which is a larger change than this one.
-3. **One symlink per attempt.** Import fails on the first unsupported entry, so
-   preparing a real tree is a fix-one-rerun loop. Reporting every unsupported
-   entry in a single pass would cost nothing in format terms.
-4. **No bound on materialised sparse content.** Nothing sits between a host
-   file apparent length and the object store.
+1. **The root-symlink asymmetry.** CLOSED. `import_dir` now canonicalises the
+   import root before walking it, so `forge import ./link-to-tree` and
+   `forge import ./real-tree` produce identical content, and the resolved real
+   path is what containment is measured against -- a symlinked root does not
+   widen the sandbox. The root is still followed, because it is the operator's
+   own argument rather than untrusted tree content.
+2. **Directory descent has no symlink re-verification.** NARROWED. Each
+   directory is now opened `O_DIRECTORY|O_NOFOLLOW` before enumeration, so a
+   dirent that says "directory" but has become a symlink is refused outright
+   (`ELOOP`/`ENOTDIR` map to `source path changed type during import`), and the
+   directory's `(dev, ino)` is re-checked against the pathname after the
+   children are processed. That is detection at both endpoints, in the same
+   spirit as `read_import_file`; it is not a host snapshot primitive, and a
+   swap that races strictly between the open and the `read_dir` is still
+   theoretically possible. Full `openat`-relative descent remains the complete
+   fix and remains a larger change.
+3. **One symlink per attempt.** CLOSED. The refusal sweeps the tree
+   (lstat-only, and only on the already-failing path, so a successful import
+   pays nothing) and names up to 32 symlinks in one diagnostic.
+4. **No bound on materialised sparse content.** STILL OPEN. Nothing sits
+   between a host file's apparent length and the object store.
+
+## Why `--follow-symlinks` and not a format change
+
+Three options were on the table and only one of them can land under a frozen
+VERSION 1.
+
+**(a) Encode a symlink inside v1 without changing how existing readers parse
+bytes -- impossible.** A `TreeEntry` is `{name, oid, kind, exec}` with `kind` in
+`{Blob, Tree}`. There is no spare field and no spare bit. Reusing `exec` is
+worse than useless: a v0.2.1 reader would materialise the link's target *path
+text* as an executable regular file, which is silent corruption and strictly
+worse than today's refusal. Adding a third `kind` changes Tree header bytes, and
+FORMAT.md's typed decoder rejects unknown values, so an existing reader fails
+closed on the new object.
+
+**(b) Propose VERSION 2 -- real, but not this PR.** FORMAT.md's release
+boundary is explicit: after a VERSION 1 binary is released, a change that makes
+that released reader unable to interpret newly written objects "requires a new
+repository VERSION". `v0.2.1` is a release tag, so a symlink entry kind is a
+VERSION bump, and a VERSION bump is not a local change to `import.rs`. It
+touches the `.forge/VERSION` gate, every typed decoder, export, mount, merge and
+diff, the frozen canonical fixtures in `testdata/canonical/`, GC reachability,
+and -- the part that makes it a maintainer decision rather than a contributor
+one -- `verify` and the ed25519 sealed releases, because a v1 binary cannot
+verify a v2 repository's snapshots at all. The smallest honest shape is still
+the Git `120000` model: a VERSION 2 Tree entry with an explicit kind byte
+carrying `Symlink`, target held as the Blob payload. This document proposes it;
+this change does not implement it and does not touch FORMAT.md.
+
+**(c) Make import SAFE and EXPLICIT under v1 -- shipped.** Refuse by default,
+name every offending path, and offer an opt-in that materialises contained
+targets with escape prevention. No object bytes change, no ObjectId moves, no
+reader is affected, and CLI_ABI exit codes are unchanged: every new refusal is
+`Error::Invalid`, which was already exit 1.
+
+What this deliberately does NOT claim: `--follow-symlinks` is not symlink
+support. It is a lossy conversion that the operator asks for by name, and a
+tree imported that way does not round-trip to the source it came from. When a
+future VERSION can represent a link, the refusal becomes a representation and
+this flag becomes a compatibility shim.
 
 ## What changed in this pass
 
-Only the diagnostic. `crates/forge-api/src/import.rs` now names the path in
-every host I/O error it raises (`io_at`), keeping `Error::Io` so the CLI_ABI
-exit code for a host I/O failure is unchanged. No object format, no tree
-encoding, and no accept-or-refuse decision was altered.
+`crates/forge-api/src/import.rs`:
+
+* `ImportOptions { follow_symlinks }` and `Forge::import_dir_with`;
+  `import_dir` keeps its signature and its refusing default.
+* The import root is canonicalised once and becomes the containment root.
+* Directory descent opens `O_DIRECTORY|O_NOFOLLOW` and re-verifies
+  `(dev, ino)` against the pathname after enumeration.
+* A `(dev, ino)` stack of the directories on the current recursion path detects
+  symlink loops; `MAX_IMPORT_DEPTH` is a backstop for pathological real trees.
+* The default refusal sweeps the tree once, on the failing path only, so one
+  run names every symlink.
+
+`crates/forge-cli/src/main.rs` gains `forge import --follow-symlinks`.
+
+No object format, no tree encoding, no ObjectId, and no exit code changed.
+FORMAT.md is untouched. `crates/forge-api/tests/import_symlinks.rs` pins the
+containment rule, the loop and dangling refusals, the one-pass report, and the
+root/target agreement; the pre-existing characterisation tests in
+`posix_adapter_characterisation.rs` still pass unmodified.

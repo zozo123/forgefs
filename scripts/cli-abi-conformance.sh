@@ -344,8 +344,19 @@ check abi/0-gc-dry-run blocking 0 "" -- \
 check abi/0-gc-dry-run-json blocking 0 "" -- \
 	--dir "$G" --cap "$G_ROOT" gc --dry-run --min-age-secs 0 --json
 # Collection is not implemented, so omitting --dry-run is an input error.
-check abi/1-gc-refuses-to-collect blocking 1 "" -- \
+check abi/1-gc-neither-flag blocking 1 "" -- \
 	--dir "$G" --cap "$G_ROOT" gc
+
+check abi/1-gc-both-flags blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" gc --dry-run --collect
+
+# The floor is the only bound on the put-to-publish window, so it is refused
+# rather than quietly raised.
+check abi/1-gc-collect-under-the-floor blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" gc --collect --min-age-secs 1
+
+check abi/0-gc-collect blocking 0 "" -- \
+	--dir "$G" --cap "$G_ROOT" gc --collect
 # A filtered ref view is not a root set (I13/I14).
 check abi/1-gc-attenuated-cap blocking 1 "" -- \
 	--dir "$A" --cap "$A_ALICE" gc --dry-run

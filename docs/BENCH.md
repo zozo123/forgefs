@@ -344,6 +344,68 @@ A performance PR attaches or links the exact command and unedited machine-readab
 9. the mechanism believed to explain the change;
 10. for W7, the comparator metadata and durability-equivalence verdict.
 
+## Precondition: barriers must reach the device
+
+A durability measurement taken on a filesystem that discards write barriers is
+not a measurement, and no amount of repetition fixes it. Establish barrier reach
+*before* the first run and publish the check with the numbers:
+
+```sh
+grep -w /workspace /proc/mounts        # must not contain `nobarrier`
+```
+
+Then confirm empirically that an `fsync` becomes a device flush. Field 19 of the
+matching `/proc/diskstats` row is "flush requests completed"; N fsyncs to a file
+on that filesystem must move it by about N:
+
+```sh
+awk '$3=="vdd"{print $19}' /proc/diskstats   # before
+# ... N fsyncs ...
+awk '$3=="vdd"{print $19}' /proc/diskstats   # after
+```
+
+A ratio near zero means the barriers stop before the platter. Report the
+environment as barrier-less, do not publish durability numbers from it, and move
+to a path where the ratio is near one. `nobarrier` can sometimes be cleared with
+`mount -o remount,barrier <mountpoint>`; verify with the flush count afterwards
+rather than trusting the mount line alone.
+
+Report the device-flush delta alongside throughput at every concurrency point.
+That is what separates "we issue fewer barriers" and "our barriers overlap"
+from "we got a faster number", and it is the only way a durability-preserving
+speedup can be told apart from a durability-weakening one.
+
+## Group commit on the metadata catalog
+
+Every catalog write is `BEGIN IMMEDIATE ... COMMIT` under `synchronous=FULL`,
+so SQLite's WAL fsync happens inside `COMMIT`, and `COMMIT` runs while the
+process-wide write mutex is held. The mutex, not the fsync, was the ceiling:
+concurrent fsyncs are cheap because the kernel already group-commits them, but
+a serialised critical section never lets two of them overlap.
+
+`Meta::run_grouped` queues a write and then competes for the write connection
+as before. The winner drains the queue and runs every waiting job in one
+`BEGIN IMMEDIATE ... COMMIT`, each inside its own `SAVEPOINT` so one caller's
+rejection is not the batch's. N waiting writers therefore pay one WAL fsync
+instead of N, and the per-write barrier cost falls as concurrency rises instead
+of staying flat.
+
+Durability is unchanged, and the reason is structural rather than statistical:
+`synchronous=FULL` is untouched, and a waiter is told it succeeded only after
+the leader's `COMMIT` -- the same fsyncing commit -- has returned. A waiter
+knows its own transaction was in that fsync because the leader owns both the
+job and the reply channel: it executes the job in the transaction it is about
+to commit and sends on that channel only afterwards. Membership is never
+inferred from a sequence number, a timestamp, or a batching window. There is no
+window: a job not yet executed is still in the queue with its caller still
+blocked, so no acknowledgement can outrun its own barrier.
+
+With a single writer a batch holds one job and the emitted SQL is what it
+always was, which is why `txn_count` is unchanged at W=1 and why the
+uncontended latency is unchanged too. `txn_count` comes from SQLite's commit
+hook, so the ratio of catalog writes to `txn_count` is the achieved batch depth,
+and it is the counter to quote when attributing a change to this mechanism.
+
 ## Interpretation rules
 
 - Optimize a measured bottleneck, not an assumed one.

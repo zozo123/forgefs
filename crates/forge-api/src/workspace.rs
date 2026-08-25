@@ -1,4 +1,9 @@
-//! I8/I9 pinned workspaces, mounts, observations, overlays, and checkin.
+//! I8/I9/I19-I21 pinned workspaces, mounts, observations, overlays, and checkin.
+//!
+//! The pin belongs to the MOUNT, not the session. `session_mount_tree` is the
+//! single place that answers "which tree does this mount show", and `read`,
+//! `ls`, `check_observations` and `checkin` all go through it, so a read and its
+//! later validation can never consult different trees.
 
 use crate::Forge;
 use forge_cap::{Cap, Op};
@@ -30,19 +35,44 @@ impl Forge {
         Ok(ns_id)
     }
 
+    /// Take a mount, pinning a read-write one to the base it names (I19).
+    ///
+    /// A read-write mount records the commit its ref holds right now, and every
+    /// later read, observation check and checkin through that mount resolves
+    /// against THAT commit. Pinning per mount rather than per session is what
+    /// lets a session hold read-write mounts on several refs at once: the pin
+    /// belongs to the ref the mount actually names, so no read hits a live ref
+    /// another agent can move (#233) and no read answers out of some other
+    /// ref's tree.
+    ///
+    /// Read-only mounts deliberately stay live and take no pin. That is what
+    /// makes cross-mount stale detection work: a read through one is meant to
+    /// go stale when the ref moves, and `check_observations` validates it
+    /// against the same live tree the read saw.
     pub fn mount(&self, cap: &Cap, ns: &str, path: &str, spec: &str, rw: bool) -> Result<()> {
         self.require_ns(cap, ns)?;
         let path = normalize_abs(path)?;
         let mode = if rw { "rw" } else { "ro" };
         if rw {
-            if let Spec::Ref(n) = parse_spec(spec)? {
-                self.check(cap, Op::Write, Some(&n))?;
-            } else if cap.has_unrestricted_ref_scope() {
-                self.check(cap, Op::Write, None)?;
-            } else {
-                return Err(Error::Denied(
-                    "ref-scoped caps cannot mount raw oids read-write".into(),
-                ));
+            match parse_spec(spec)? {
+                Spec::Ref(n) => self.check(cap, Op::Write, Some(&n))?,
+                // An `oid:` spec names immutable bytes: there is no ref for
+                // `checkin` to advance, and it refused such a mount
+                // unconditionally, so a write through one was staged where no
+                // verb and no capability could ever publish it while `abandon`
+                // demanded a checkin the CLI could not perform. `fsck` already
+                // reports the row as MOUNT_RW_OID corruption, so accepting the
+                // mount also let a holder of write authority manufacture a
+                // corruption finding on entirely intact bytes. Refusing the
+                // mount is the honest end of that: no write path without a
+                // publish path (I20).
+                Spec::Oid(_) => {
+                    return Err(Error::Denied(format!(
+                        "cannot mount {spec} read-write at {path}: an oid: spec names immutable \
+                         bytes with no ref to advance, so a write through it could never be \
+                         published; mount it read-only, or mount the ref that carries it"
+                    )))
+                }
             }
         } else {
             self.check_spec_read(cap, spec)?;
@@ -51,9 +81,71 @@ impl Forge {
         // durable state. Persisting one made `fsck --full` report MOUNT_REF
         // corruption (exit 2) on a repository whose bytes were entirely intact,
         // which any holder of read authority could trigger at will.
-        self.resolve_spec_oid(spec)?;
-        self.store.meta.insert_mount(ns, &path, spec, mode)?;
+        let oid = self.resolve_spec_oid(spec)?;
+        let object_type = self.store.object_type(oid)?;
+        if rw && object_type != ObjectType::Commit {
+            // The same rule as the `oid:` case, one step out: `checkin` CASes a
+            // ref of kind `commit`, so a read-write mount of a ref holding a
+            // snapshot or a bare tree is another write with no publish path.
+            return Err(Error::Denied(format!(
+                "cannot mount {spec} read-write at {path}: it names a {}, and only a commit ref \
+                 can be advanced by checkin",
+                object_type.as_str()
+            )));
+        }
+        self.refuse_retargeting_staged_work(ns, &path, spec, rw)?;
+        // I19: a read-write mount carries its own base; a read-only one takes
+        // none, because resolving live is precisely what it is for.
+        let base = if rw { Some(oid) } else { None };
+        self.store.meta.insert_mount(ns, &path, spec, mode, base)?;
         Ok(())
+    }
+
+    /// Refuse a re-mount that would change where already-staged work lands.
+    ///
+    /// `insert_mount` is `INSERT OR REPLACE` on (ns, path) while the overlay is
+    /// keyed on (ns, mount path), so before I19 re-mounting a path at a
+    /// different ref silently re-aimed everything staged under it at that other
+    /// ref: no refusal, no warning, no discard. The mount row now records the
+    /// spec and the pin the overlay was staged against, which is what makes the
+    /// collision detectable at all.
+    ///
+    /// Only a change that moves the work is refused. Re-mounting the same spec
+    /// read-write is idempotent and stays legal; demoting a read-write mount
+    /// that holds staged work to read-only is refused for the same reason as a
+    /// spec change, because `checkin` refuses a read-only mount and the work
+    /// would be stranded -- I18 keeps it readable, but nothing could publish it.
+    fn refuse_retargeting_staged_work(
+        &self,
+        ns: &str,
+        path: &str,
+        spec: &str,
+        rw: bool,
+    ) -> Result<()> {
+        let Some(existing) = self.store.meta.get_mount(ns, path)? else {
+            return Ok(());
+        };
+        let retarget = existing.spec != spec;
+        let demote = existing.mode == "rw" && !rw;
+        if !retarget && !demote {
+            return Ok(());
+        }
+        let staged = self.store.meta.overlay_list(ns, path)?.len();
+        if staged == 0 {
+            return Ok(());
+        }
+        let noun = if staged == 1 { "entry" } else { "entries" };
+        let change = if retarget {
+            format!("re-mounting it at {spec}")
+        } else {
+            "demoting it to read-only".to_string()
+        };
+        Err(Error::Invalid(format!(
+            "mount {path} holds {staged} staged {noun} written against {}; {change} would send \
+             that work somewhere it was never written for. Check the mount in, or discard it \
+             with abandon session --discard-staged, before changing it",
+            existing.spec
+        )))
     }
 
     fn mounts(&self, ns: &str) -> Result<Vec<Mount>> {
@@ -68,33 +160,40 @@ impl Forge {
 
     /// The tree a session actually sees through one of its mounts.
     ///
-    /// I8 pins a session to one base OID, so a read through a read-write
-    /// `ref:` mount must come from that base and never from the live ref,
-    /// which other agents can move. Reading the live ref recorded an
-    /// observation that `check_observations` then compared against the pinned
-    /// tree, so the two could never agree: the session failed checkin with
-    /// StaleObservation forever, no re-read or re-mount could clear it, and its
-    /// staged work was published to no ref at all -- unlike the pure-writer
-    /// path, which forks and preserves it.
+    /// I19: a read-write mount carries its OWN pinned base, so a read through it
+    /// comes from that base and never from the live ref other agents can move.
+    /// That is what #233 needed -- a read through a read-write mount recorded an
+    /// observation against the live ref that `check_observations` then compared
+    /// against the pinned tree, so the two could never agree and the session
+    /// failed checkin with StaleObservation forever -- and the pin is now the
+    /// one belonging to the ref THIS mount names, which is what a single
+    /// session-wide pin got wrong: it served `ref:base`'s tree through a mount
+    /// of `ref:other`, so a file present only in `other` read as absent and any
+    /// read through it wedged the session the same way #233 did.
     ///
-    /// Foreign read-only mounts deliberately stay live. That is what makes
-    /// cross-mount stale detection work, and `check_observations` validates
-    /// those against the live tree to match.
+    /// Read-only mounts deliberately stay live and carry no pin. That is what
+    /// makes cross-mount stale detection work, and `check_observations` routes
+    /// through this same function so a read and its later validation can never
+    /// consult different trees.
     ///
-    /// The default `/` mount is `ref:<live_ref>` on the session's own private
-    /// ref, and `checkin` re-pins the session as it advances, so serving reads
-    /// from the pin is also correct for the ordinary private-workspace case.
-    fn session_mount_tree(&self, nsrow: &forge_store::NsRow, m: &Mount) -> Result<ObjectId> {
-        if m.mode == Mode::Rw && matches!(parse_spec(&m.spec)?, Spec::Ref(_)) {
-            if let Some(pin) = nsrow.pinned_oid {
-                return Ok(self.store.get_commit(pin)?.tree);
+    /// A read-write mount with no pin is reachable only for a pre-v3 catalog row
+    /// whose ref has since been deleted; `mount_tree` then fails closed with
+    /// `NotFound`, which is also what `fsck` reports for it (MOUNT_REF).
+    fn session_mount_tree(&self, m: &Mount) -> Result<ObjectId> {
+        if m.mode == Mode::Rw {
+            if let Some(base) = m.base_oid {
+                return self.tree_of(base);
             }
         }
         self.mount_tree(&m.spec)
     }
 
     fn mount_tree(&self, spec: &str) -> Result<ObjectId> {
-        let oid = self.resolve_spec_oid(spec)?;
+        self.tree_of(self.resolve_spec_oid(spec)?)
+    }
+
+    /// The tree a mountable object exposes.
+    fn tree_of(&self, oid: ObjectId) -> Result<ObjectId> {
         match self.store.object_type(oid)? {
             ObjectType::Commit => Ok(self.store.get_commit(oid)?.tree),
             ObjectType::Snapshot => Ok(self.store.get_snapshot(oid)?.tree),
@@ -109,12 +208,12 @@ impl Forge {
         ns: &str,
         path: &str,
     ) -> Result<Vec<(String, String, String, bool)>> {
-        let nsrow = self.require_ns(cap, ns)?;
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         self.check_spec_read(cap, &m.spec)?;
         let rel = rel_of(&m.path, path)?;
-        let tree = self.session_mount_tree(&nsrow, m)?;
+        let tree = self.session_mount_tree(m)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
         // I9: a directory read is a read. Record what was listed before
         // returning it, including the case where nothing is there, so that
@@ -140,12 +239,12 @@ impl Forge {
     }
 
     pub fn read(&self, cap: &Cap, ns: &str, path: &str) -> Result<Vec<u8>> {
-        let nsrow = self.require_ns(cap, ns)?;
+        self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
         let m = longest_mount(&mounts, path)?;
         self.check_spec_read(cap, &m.spec)?;
         let ov = self.store.meta.overlay_list(ns, &m.path)?;
-        let tree = self.session_mount_tree(&nsrow, m)?;
+        let tree = self.session_mount_tree(m)?;
         let rel = rel_of(&m.path, path)?;
         // I9: record the outcome of the lookup before acting on it. A miss used
         // to record nothing, which made "this path did not exist" invisible to
@@ -213,6 +312,40 @@ impl Forge {
         Ok(())
     }
 
+    /// Fold one mount's overlay onto THAT MOUNT's pinned base and CAS the ref
+    /// that mount names, from that pin (I19).
+    ///
+    /// The expected value is the mount's own pin, not the session's. A session
+    /// pin was wrong for every mount but the session's own: checking in a mount
+    /// of `ref:other` folded onto `ref:base`'s tree and then CASed `ref:other`
+    /// from a commit that was never in `other`'s history, so `other` could end
+    /// up holding `base`'s content. I5 is unchanged and still the loser's
+    /// contract: if the named ref has moved off this mount's pin the CAS loses
+    /// and forks, and the fork carries this mount's completed work (I18).
+    ///
+    /// Checkin publishes exactly ONE mount -- the one named. Publishing every
+    /// read-write mount was the other candidate and was rejected: each mount
+    /// names its own ref, so "check in everything" is N independent ref CASes
+    /// with no atomicity across them. One of them updating while the next forks
+    /// is a half-published session that no single `CasResult`, exit code or
+    /// Contribution receipt can describe, and the VERSION 1 receipt is frozen
+    /// at one `base`, one `tree` and one parent list, so a multi-ref checkin is
+    /// not representable without a format change and its own gate. Implicitly
+    /// advancing refs the caller never named is also the wrong default for an
+    /// isolation substrate: a stray `--rw` mount on a shared ref would be
+    /// published by a bare `forge checkin`.
+    ///
+    /// What is indefensible is the third behaviour, the one this had: answer
+    /// `noop` with exit 0 while the session held work checkin never folded.
+    /// That is indistinguishable from "there was nothing to do", and
+    /// `abandon_session` -- which counts overlay rows across the whole
+    /// namespace -- then refused to retire the session, so the only way out of
+    /// the loop was to discard the work. I22 forbids exactly that sentence and
+    /// nothing wider: the refusal is scoped to the `Noop` outcome. `updated`
+    /// and `forked` are progress and may legitimately leave another mount
+    /// staged -- under I19 a session holds a pin per writable mount and drains
+    /// them one `--mount` at a time, so refusing those too would deny the very
+    /// escape the diagnostic advises and wedge the session (I21).
     pub fn checkin(&self, cap: &Cap, ns: &str, mount: &str, msg: &str) -> Result<CasResult> {
         self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
@@ -222,11 +355,15 @@ impl Forge {
         }
         let ref_name = match parse_spec(&m.spec)? {
             Spec::Ref(n) => n,
+            // Unreachable through `mount`, which refuses a read-write `oid:`
+            // mount outright, and through a migrated catalog, which demotes any
+            // such row to read-only. Kept as the fail-closed floor.
             Spec::Oid(_) => return Err(Error::Invalid("cannot checkin an oid mount".into())),
         };
         self.check(cap, Op::Write, Some(&ref_name))?;
-        let nsrow = self.store.meta.get_namespace(ns)?;
-        let pin = nsrow.pinned_oid.ok_or(Error::InvalidBase)?;
+        // I19: THIS MOUNT's pin, not the session's. `InvalidBase` is the same
+        // answer a session with no pin got before: nothing to fold onto.
+        let pin = m.base_oid.ok_or(Error::InvalidBase)?;
         let row = self
             .store
             .meta
@@ -236,10 +373,43 @@ impl Forge {
         let ov_rows = self.store.meta.overlay_list(ns, &m.path)?;
         let observations = self.store.meta.observations(ns)?;
         let ov = overlay_map(&ov_rows);
-        self.check_observations(ns, &m.path, &ov, pin, &mounts)?;
+        self.check_observations(ns, &m.path, &ov, &mounts)?;
         let batch = self.store.begin_publish_batch();
         let new_tree = apply_overlay(Some(base_commit.tree), &ov, &batch)?;
         if new_tree == base_commit.tree && pin == row.oid {
+            // I22: this mount stages nothing, so the only outcome left is
+            // `Noop` -- and `Noop` is the one answer that may never be given
+            // over work that exists. `overlay_mounts_outside` asks exactly what
+            // `abandon_session` asks -- overlay rows anywhere under this
+            // namespace -- so the two verbs can never disagree about whether
+            // the session still holds staged work.
+            //
+            // Scoped to this branch on purpose. Refusing `updated`/`forked` as
+            // well would wedge a session holding two writable mounts with work
+            // in both (I19, I21): publishing either would be refused on account
+            // of the other, and the escape this very diagnostic advises could
+            // never be taken.
+            //
+            // `Error::Invalid` is exit 1 in CLI_ABI.md, the same row abandon
+            // already uses for "the session holds staged work": the request as
+            // stated is unsatisfiable and no retry of it will ever succeed.
+            let stranded = self.store.meta.overlay_mounts_outside(ns, &m.path)?;
+            if !stranded.is_empty() {
+                let named = stranded
+                    .iter()
+                    .map(|(other, n)| {
+                        let noun = if *n == 1 { "entry" } else { "entries" };
+                        format!("{other} ({n} staged {noun})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Invalid(format!(
+                    "checkin {} has nothing to publish, but session {ns} holds staged work under \
+                     mounts it does not publish: {named}; check each mount in on its own \
+                     (checkin --mount <path>) or discard it with abandon session --discard-staged",
+                    m.path
+                )));
+            }
             batch.finish()?;
             self.store.meta.complete_noop_session(ns, &m.path, pin)?;
             return Ok(CasResult::Noop {
@@ -319,26 +489,33 @@ impl Forge {
         Ok(result)
     }
 
+    /// Re-validate every recorded observation against the tree the mount that
+    /// recorded it resolves to NOW.
+    ///
+    /// I19: this routes through `session_mount_tree`, the same function the read
+    /// used, so a read and its validation can never consult different trees. A
+    /// read-write mount is checked against its own pin, which cannot move under
+    /// it, so an authorised read through one can never make a session
+    /// unpublishable (I21); a read-only mount is checked live, which is exactly
+    /// the cross-mount staleness I9 is for. Comparing a pinned read-write mount
+    /// against its LIVE ref was the wedge: the two could never agree, and the
+    /// diagnostic named the observation rather than the mount, so the escape was
+    /// not derivable from it.
     fn check_observations(
         &self,
         ns: &str,
         checkin_mount: &str,
         ov: &forge_core::Overlay,
-        pin: ObjectId,
         mounts: &[Mount],
     ) -> Result<()> {
-        let pin_tree = self.store.get_commit(pin)?.tree;
         for obs in self.store.meta.observations(ns)? {
             if obs.mount == checkin_mount && overlay_shadows(ov, &obs.path) {
                 continue;
             }
-            let tree = if obs.mount == checkin_mount {
-                pin_tree
-            } else if let Some(om) = mounts.iter().find(|m| m.path == obs.mount) {
-                self.mount_tree(&om.spec)?
-            } else {
+            let Some(om) = mounts.iter().find(|m| m.path == obs.mount) else {
                 continue;
             };
+            let tree = self.session_mount_tree(om)?;
             let now = current_at(&self.store, tree, &obs.path)?;
             if now != obs.seen {
                 self.stats.stale_observation.fetch_add(1, Ordering::Relaxed);
