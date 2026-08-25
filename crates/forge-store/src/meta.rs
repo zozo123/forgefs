@@ -9,6 +9,7 @@ use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const SCHEMA: &str = r#"
@@ -315,15 +316,50 @@ pub struct MetaStats {
     /// their statements, COMMIT, or implicit rollback. Repository open and
     /// SQLite autocommit statements are not included.
     pub txn_us: u64,
-    /// Number of explicit transaction attempts represented by `txn_us`.
+    /// Write transactions SQLite committed on the catalog's write connection:
+    /// one per explicit `BEGIN IMMEDIATE` that committed, and one per
+    /// autocommit statement that wrote, because SQLite wraps every such
+    /// statement in an implicit transaction of its own.
+    ///
+    /// Counted by SQLite's own commit hook rather than by the call sites, so a
+    /// write path added later cannot forget to count itself. That omission is
+    /// what made this counter report `0` for a phase that ran thousands of
+    /// autocommit `observe()` writes (issue #311).
+    ///
+    /// Three things it is deliberately not. It is not the denominator of
+    /// `txn_us` -- only explicit attempts are timed, so divide by
+    /// `explicit_txn_count`. It is not a row count: one transaction may mutate
+    /// many rows, and a statement that matched none still opened and committed
+    /// one, so use `Meta::row_mutations` for write amplification. And it
+    /// excludes schema creation and migration during `Meta::open`, matching
+    /// the scope `txn_us` has always had.
     pub txn_count: u64,
-    /// Cumulative time waiting to acquire ForgeFS's process-local SQLite
-    /// connection mutex. This does not include SQLite's cross-process busy
-    /// wait, which is part of `txn_us`.
+    /// Explicit `BEGIN IMMEDIATE` attempts, including those that rolled back.
+    /// This, not `txn_count`, is the number of samples in `txn_us`.
+    pub explicit_txn_count: u64,
+    /// Cumulative time waiting to acquire a process-local SQLite connection
+    /// mutex, summed over the write connection and every read-pool slot. This
+    /// does not include SQLite's cross-process busy wait, which is part of
+    /// `txn_us`.
+    ///
+    /// Since the read pool landed (#315) this sum spans two connection
+    /// families and is no longer a writer-contention signal on its own: read
+    /// `write_lock_wait_us` for that.
     pub lock_wait_us: u64,
-    /// Every acquisition of the process-local SQLite connection mutex,
-    /// including reads and autocommit writes.
+    /// Every acquisition of a process-local SQLite connection mutex, summed
+    /// over the write connection and every read-pool slot. Reads and
+    /// autocommit writes are both included.
     pub lock_acquires: u64,
+    /// The write connection's mutex alone. Every catalog write, and every read
+    /// that fell back to the writer, queues here, so this pair is the
+    /// writer-contention signal that `lock_acquires` / `lock_wait_us` stopped
+    /// being when catalog reads moved to their own pool.
+    pub write_lock_acquires: u64,
+    pub write_lock_wait_us: u64,
+    /// The read pool's slot mutexes, summed. Zero for a read-only catalog,
+    /// which has no pool, and zero for a process that never read.
+    pub read_lock_acquires: u64,
+    pub read_lock_wait_us: u64,
     pub busy: u64,
     pub cas_updated: u64,
     pub cas_forked: u64,
@@ -335,7 +371,9 @@ pub struct MetaStats {
 
 impl MetaStats {
     /// Saturating sum over this process-lifetime snapshot: local mutex wait
-    /// plus explicit transaction time. It is not a per-checkin measurement.
+    /// across both connection families plus explicit transaction time. It is
+    /// not a per-checkin measurement, and it accounts for no autocommit write:
+    /// those are counted by `txn_count` but nothing times them.
     pub fn sqlite_accounted_us(&self) -> u64 {
         self.lock_wait_us.saturating_add(self.txn_us)
     }
@@ -368,6 +406,10 @@ pub struct CheckpointResult {
 #[derive(Debug, Default)]
 struct MetaCounters {
     txn: TimingCounter,
+    /// Shared with the commit hook installed on the write connection, which is
+    /// why this one field is an `Arc`: SQLite owns that closure for the life of
+    /// the connection.
+    committed_write_txns: Arc<AtomicU64>,
     busy: AtomicU64,
     cas_updated: AtomicU64,
     cas_forked: AtomicU64,
@@ -1129,6 +1171,39 @@ fn audit_table_shape(
     clean
 }
 
+/// Count every write transaction SQLite commits on `conn`.
+///
+/// The write connection is the only one that may write -- read-pool members are
+/// opened `SQLITE_OPEN_READONLY` with `query_only=1` -- so this single hook
+/// sees the whole catalog. SQLite calls it once per committed write
+/// transaction: once for an explicit `BEGIN IMMEDIATE ... COMMIT` however many
+/// statements it carried, and once for each autocommit DML statement, which is
+/// its own implicit transaction. A rolled-back transaction and a read-only
+/// transaction never reach it.
+///
+/// Instrumenting SQLite instead of the call sites is the point. `txn_count`
+/// under-reported because counting was a per-call-site obligation that every
+/// autocommit path forgot, `observe()` included (issue #311); a hook cannot be
+/// forgotten by code written after it.
+///
+/// Installed after migration so the counter keeps the scope `txn_us` already
+/// documents: work a caller asked the catalog to do, not the schema setup that
+/// made the catalog usable.
+///
+/// A failure to install is propagated rather than ignored. A catalog whose
+/// counter is wired up is the only kind this code knows how to describe, and
+/// silently opening one that reports `0` forever is the exact failure #311 was.
+fn install_write_txn_counter(conn: &Connection, stats: &MetaCounters) -> Result<()> {
+    let counter = Arc::clone(&stats.committed_write_txns);
+    conn.commit_hook(Some(move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+        // Never veto a commit. This is instrumentation and holds no authority
+        // over durability: returning true here would roll the transaction back.
+        false
+    }))
+    .map_err(map_sql)
+}
+
 impl Meta {
     pub fn stats(&self) -> MetaStats {
         let txn = self.stats.txn.snapshot();
@@ -1142,9 +1217,14 @@ impl Meta {
             .unwrap_or_default();
         MetaStats {
             txn_us: txn.total_us,
-            txn_count: txn.count,
+            txn_count: self.stats.committed_write_txns.load(Ordering::Relaxed),
+            explicit_txn_count: txn.count,
             lock_wait_us: lock_wait.total_us.saturating_add(read_wait.total_us),
             lock_acquires: lock_wait.count.saturating_add(read_wait.count),
+            write_lock_acquires: lock_wait.count,
+            write_lock_wait_us: lock_wait.total_us,
+            read_lock_acquires: read_wait.count,
+            read_lock_wait_us: read_wait.total_us,
             busy: self.stats.busy.load(Ordering::Relaxed),
             cas_updated: self.stats.cas_updated.load(Ordering::Relaxed),
             cas_forked: self.stats.cas_forked.load(Ordering::Relaxed),
@@ -1161,10 +1241,10 @@ impl Meta {
     /// inserted, updated, or deleted since it was opened.
     ///
     /// This is the honest instrument for metadata write amplification.
-    /// `MetaStats::txn_count` counts only explicit `BEGIN IMMEDIATE` blocks and
-    /// is blind to autocommit statements, so a read-heavy phase reports zero
-    /// transactions while still dirtying one page per operation. Row mutations
-    /// cannot be fooled that way.
+    /// `MetaStats::txn_count` sees autocommit writes too since issue #311, but
+    /// it counts transactions, not rows: one transaction may mutate thousands
+    /// of rows, and a statement that matched nothing still committed a
+    /// transaction. Row mutations cannot be fooled that way.
     pub fn row_mutations(&self) -> u64 {
         self.write.lock().total_changes()
     }
@@ -2007,13 +2087,15 @@ impl Meta {
             [],
         )
         .map_err(map_sql)?;
+        let stats = MetaCounters::default();
+        install_write_txn_counter(&conn, &stats)?;
         Ok(Self {
             write: TimedMutex::new(conn),
             // Safe to build now and not before: the writable open has created
             // the database, switched it to WAL and mapped the wal-index, so a
             // later read-only member has both a file and a `-shm` to attach.
             read: Some(ReadPool::new(path.to_path_buf())),
-            stats: MetaCounters::default(),
+            stats,
             durability,
             read_only: false,
         })

@@ -18,7 +18,15 @@ use forge_store::{DurabilityPolicy, MetaStats};
 use serde::Serialize;
 
 /// Version of the `forge stats --json` key set, not of the repository.
-pub const STATS_SCHEMA_VERSION: u32 = 1;
+///
+/// 2: `txn_count` stopped under-reporting. It counted only explicit
+/// `BEGIN IMMEDIATE` blocks, so an autocommit-only phase reported zero write
+/// transactions (issue #311); it now counts every committed write transaction.
+/// The key set is add-only as promised -- `explicit_txn_count` carries the old
+/// number, and the lock pair was split into its write and read halves -- but a
+/// series keyed on `txn_count` changes meaning across this boundary, and that
+/// is exactly what the version exists to announce.
+pub const STATS_SCHEMA_VERSION: u32 = 2;
 
 /// The only scope these counters have ever had. Emitted as a field so a
 /// consumer never has to infer it from documentation.
@@ -44,10 +52,20 @@ pub struct StoreCounterReport {
 /// and the ref CAS outcomes decided inside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct MetaCounterReport {
+    /// Every write transaction SQLite committed: explicit blocks and
+    /// autocommit statements alike. Not the denominator of `txn_us`.
     pub txn_count: u64,
     pub txn_us: u64,
+    /// Explicit `BEGIN IMMEDIATE` attempts, the sample count behind `txn_us`.
+    pub explicit_txn_count: u64,
+    /// Summed over the write connection and the read pool, so neither is a
+    /// writer-contention signal on its own; the split pair below is.
     pub lock_acquires: u64,
     pub lock_wait_us: u64,
+    pub write_lock_acquires: u64,
+    pub write_lock_wait_us: u64,
+    pub read_lock_acquires: u64,
+    pub read_lock_wait_us: u64,
     pub busy: u64,
     pub cas_updated: u64,
     pub cas_forked: u64,
@@ -123,8 +141,13 @@ impl StatsReport {
             sqlite: MetaCounterReport {
                 txn_count: meta.txn_count,
                 txn_us: meta.txn_us,
+                explicit_txn_count: meta.explicit_txn_count,
                 lock_acquires: meta.lock_acquires,
                 lock_wait_us: meta.lock_wait_us,
+                write_lock_acquires: meta.write_lock_acquires,
+                write_lock_wait_us: meta.write_lock_wait_us,
+                read_lock_acquires: meta.read_lock_acquires,
+                read_lock_wait_us: meta.read_lock_wait_us,
                 busy: meta.busy,
                 cas_updated: meta.cas_updated,
                 cas_forked: meta.cas_forked,
@@ -154,7 +177,8 @@ impl StatsReport {
              {}\n\
              durability       journal_mode={} synchronous={} fullfsync={} read_only={}\n\
              storage lifetime puts={} dedup_hits={} fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_us={}\n\
-             sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} txn_us={} accounted_us={} busy={} updated={} forked={} denied={} noop={}\n\
+             sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} txn_us={} explicit_txn_count={} accounted_us={} busy={} updated={} forked={} denied={} noop={}\n\
+             sqlite locks     write_acquires={} write_wait_us={} read_acquires={} read_wait_us={}\n\
              api lifetime     sessions_opened={} stale={} merge_applied={} conflict={}\n",
             self.schema_version,
             self.scope,
@@ -174,12 +198,17 @@ impl StatsReport {
             self.sqlite.lock_wait_us,
             self.sqlite.txn_count,
             self.sqlite.txn_us,
+            self.sqlite.explicit_txn_count,
             self.sqlite.accounted_us,
             self.sqlite.busy,
             self.sqlite.cas_updated,
             self.sqlite.cas_forked,
             self.sqlite.cas_denied,
             self.sqlite.cas_noop,
+            self.sqlite.write_lock_acquires,
+            self.sqlite.write_lock_wait_us,
+            self.sqlite.read_lock_acquires,
+            self.sqlite.read_lock_wait_us,
             self.api.sessions_opened,
             self.api.stale_observation,
             self.api.merge_applied,
@@ -221,9 +250,14 @@ mod tests {
             },
             MetaStats {
                 txn_us: 17,
-                txn_count: 5,
+                txn_count: 9,
+                explicit_txn_count: 5,
                 lock_wait_us: 19,
                 lock_acquires: 23,
+                write_lock_acquires: 20,
+                write_lock_wait_us: 15,
+                read_lock_acquires: 3,
+                read_lock_wait_us: 4,
                 busy: 1,
                 cas_updated: 7,
                 cas_forked: 2,

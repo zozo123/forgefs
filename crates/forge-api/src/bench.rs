@@ -149,10 +149,11 @@ impl BenchReport {
         }
         if let Some(stats) = self.meta {
             s.push_str(&format!(
-                "sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} txn_us={} lifetime_accounted_us={} busy={} updated={} forked={} denied={}\n",
+                "sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} explicit_txn_count={} txn_us={} lifetime_accounted_us={} busy={} updated={} forked={} denied={}\n",
                 stats.lock_acquires,
                 stats.lock_wait_us,
                 stats.txn_count,
+                stats.explicit_txn_count,
                 stats.txn_us,
                 stats.sqlite_accounted_us(),
                 stats.busy,
@@ -396,9 +397,14 @@ mod tests {
             }),
             meta: Some(MetaStats {
                 txn_us: 17,
-                txn_count: 5,
+                txn_count: 9,
+                explicit_txn_count: 5,
                 lock_wait_us: 19,
                 lock_acquires: 23,
+                write_lock_acquires: 20,
+                write_lock_wait_us: 15,
+                read_lock_acquires: 3,
+                read_lock_wait_us: 4,
                 busy: 0,
                 cas_updated: 7,
                 cas_forked: 1,
@@ -425,7 +431,7 @@ mod tests {
             "storage lifetime puts=2 bytes=unavailable fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 lifetime_barrier_us=24"
         ));
         assert!(rendered.contains(
-            "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=5 txn_us=17 lifetime_accounted_us=36 busy=0 updated=7 forked=1 denied=0"
+            "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=9 explicit_txn_count=5 txn_us=17 lifetime_accounted_us=36 busy=0 updated=7 forked=1 denied=0"
         ));
         assert!(rendered.contains(
             "fsync_file_us=11 + fsync_dir_us=13 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=60"

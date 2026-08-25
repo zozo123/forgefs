@@ -132,12 +132,29 @@ The individual counter semantics are deliberately mechanical:
   SQLite connection mutex, including reads and autocommit writes. That is the
   write connection plus the read-only connections that serve SELECT-only
   catalog queries, so the pair is a sum across connections and not a measure of
-  writer contention on its own.
-- `txn_count` / `txn_us` cover every instrumented explicit `BEGIN IMMEDIATE`
-  attempt from before BEGIN through COMMIT or rollback. SQLite's
-  cross-process `busy_timeout` wait is therefore inside `txn_us`; `busy` is an
-  outcome count, not a duration. Schema setup during `Meta::open` and implicit
-  autocommit statements are not included in `txn_us`.
+  writer contention on its own. `forge stats --json` splits the sum into
+  `write_lock_acquires` / `write_lock_wait_us` and `read_lock_acquires` /
+  `read_lock_wait_us`; the write half is the writer-contention signal.
+- `txn_count` counts every write transaction SQLite committed on the catalog:
+  each explicit `BEGIN IMMEDIATE` that committed, and each autocommit statement
+  that wrote, since SQLite wraps every such statement in an implicit
+  transaction. It is taken from SQLite's commit hook, so no write path can be
+  missing from it, and a rolled-back or read-only transaction is absent from it
+  because nothing was committed. Schema setup during `Meta::open` is excluded.
+  It is a transaction count and never a row count -- `Meta::row_mutations`
+  (`sqlite3_total_changes`) is the instrument for write amplification.
+- `explicit_txn_count` / `txn_us` cover every instrumented explicit
+  `BEGIN IMMEDIATE` attempt from before BEGIN through COMMIT or rollback.
+  SQLite's cross-process `busy_timeout` wait is therefore inside `txn_us`;
+  `busy` is an outcome count, not a duration. Schema setup during `Meta::open`
+  and implicit autocommit statements are not included in `txn_us`, so
+  `explicit_txn_count` -- not `txn_count` -- is the sample count that pairs
+  with it.
+
+  Before issue #311 the field named `txn_count` held what is now
+  `explicit_txn_count`, and a phase whose only catalog writes were autocommit
+  reported zero transactions. `forge stats --json` bumped `schema_version` to 2
+  to mark the boundary.
 - Rendered `lifetime_accounted_us = lock_wait_us + txn_us` and
   `lifetime_barrier_us = fsync_file_us + fsync_dir_us` are saturating
   arithmetic sums over the lifetime snapshot, not per-operation measurements.
