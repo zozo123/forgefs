@@ -62,6 +62,16 @@ fn a_non_root_read_write_mount_publishes_to_its_own_ref_and_fscks_clean() {
     );
     ok(&r, &["branch", "heads/seed", "base"]);
     ok(&r, &["branch", "heads/seed", "other"]);
+    // The two refs must have DIVERGED, or a session pin and a mount pin are the
+    // same commit and nothing distinguishes the two behaviours.
+    let seed = ok(&r, &["session", "open", "--from", "base"]);
+    let seed = seed.lines().last().unwrap().to_string();
+    ok(&r, &["mount", "--ns", &seed, "--rw", "/", "ref:base"]);
+    ok(
+        &r,
+        &["write", "--ns", &seed, "/only-in-base.txt", "--text", "b"],
+    );
+    ok(&r, &["checkin", "--ns", &seed, "-m", "diverge"]);
 
     let ns = ok(&r, &["session", "open", "--from", "base"]);
     let ns = ns.lines().last().unwrap().to_string();
@@ -96,6 +106,15 @@ fn a_non_root_read_write_mount_publishes_to_its_own_ref_and_fscks_clean() {
     ok(&r, &["mount", "--ns", &ro, "/", "ref:base"]);
     let (_, _, code) = run(&r, &["read", "--ns", &ro, "/w.txt"]);
     assert_eq!(code, 1, "ref base must not hold ref other's content");
+
+    // ...and `other` did not acquire `base`'s. This is the direction that broke:
+    // the checkin used to fold onto the SESSION's base and CAS `other` from it.
+    let ro = ok(&r, &["session", "open", "--from", "other"]);
+    let ro = ro.lines().last().unwrap().to_string();
+    ok(&r, &["mount", "--ns", &ro, "/", "ref:other"]);
+    ok(&r, &["read", "--ns", &ro, "/w.txt"]);
+    let (_, _, code) = run(&r, &["read", "--ns", &ro, "/only-in-base.txt"]);
+    assert_eq!(code, 1, "ref other must not hold ref base's content");
 
     let (_, stderr, code) = run(&r, &["fsck", "--full"]);
     assert_eq!(
