@@ -27,6 +27,18 @@ const REFS: &[&str] = &["alpha", "beta", "gamma", "delta"];
 const AGENTS: usize = 16;
 const ROUNDS: usize = 6;
 
+/// The default shape is what CI runs on every commit. A longer soak is the same
+/// harness with more of it, so the scale is an env override rather than a second
+/// test that could drift from this one:
+/// `FORGEFS_MULTI_MOUNT_AGENTS=48 FORGEFS_MULTI_MOUNT_ROUNDS=24 cargo test ...`
+fn scale(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
 #[derive(Default, Debug)]
 struct Tally {
     updated: usize,
@@ -67,16 +79,18 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
         ));
     }
 
+    let agents = scale("FORGEFS_MULTI_MOUNT_AGENTS", AGENTS);
+    let rounds = scale("FORGEFS_MULTI_MOUNT_ROUNDS", ROUNDS);
     let started = std::time::Instant::now();
     let mut handles = Vec::new();
-    for agent in 0..AGENTS {
+    for agent in 0..agents {
         let f = Arc::clone(&f);
         let root = root.clone();
         handles.push(thread::spawn(move || {
             let mut tally = Tally::default();
             let mut wedged: Vec<String> = Vec::new();
             let mut ops = 0usize;
-            for round in 0..ROUNDS {
+            for round in 0..rounds {
                 // Rotate which ref is the session base so every ref is somebody's
                 // own base and somebody else's foreign read-write mount.
                 let own = REFS[(agent + round) % REFS.len()];
@@ -263,7 +277,7 @@ fn many_sessions_with_many_read_write_mounts_never_wedge_and_never_cross_refs() 
         report.findings
     );
     eprintln!(
-        "multi-mount concurrent: agents={AGENTS} rounds={ROUNDS} refs={} ops={ops} \
+        "multi-mount concurrent: agents={agents} rounds={rounds} refs={} ops={ops} \
          wall={:.3}s updated={} forked={} noop={} stale-retried={} busy={} \
          fsck_objects={}",
         REFS.len(),
