@@ -124,7 +124,14 @@ fn verify_rejects_metadata_commit_tag_and_provenance_mismatch() {
     sign_snapshot(&sk, &mut bad_commit);
     let oid = s.put_snapshot(&bad_commit).unwrap();
     s.meta
-        .commit_seal("bad-commit", oid, other_commit, main_commit.tree, "test")
+        .commit_seal(
+            "bad-commit",
+            oid,
+            other_commit,
+            main_commit.tree,
+            "test",
+            None,
+        )
         .unwrap();
     assert!(matches!(
         f.verify_tag(&root, "bad-commit"),
@@ -143,7 +150,7 @@ fn verify_rejects_metadata_commit_tag_and_provenance_mismatch() {
     sign_snapshot(&sk, &mut bad_tag);
     let oid = s.put_snapshot(&bad_tag).unwrap();
     s.meta
-        .commit_seal("bad-tag", oid, main.oid, main_commit.tree, "test")
+        .commit_seal("bad-tag", oid, main.oid, main_commit.tree, "test", None)
         .unwrap();
     assert!(matches!(
         f.verify_tag(&root, "bad-tag"),
@@ -162,7 +169,7 @@ fn verify_rejects_metadata_commit_tag_and_provenance_mismatch() {
     sign_snapshot(&sk, &mut bad_prov);
     let oid = s.put_snapshot(&bad_prov).unwrap();
     s.meta
-        .commit_seal("bad-prov", oid, main.oid, main_commit.tree, "test")
+        .commit_seal("bad-prov", oid, main.oid, main_commit.tree, "test", None)
         .unwrap();
     assert!(matches!(
         f.verify_tag(&root, "bad-prov"),
@@ -210,7 +217,7 @@ fn verify_and_full_fsck_reject_inexact_or_forged_provenance_manifest() {
         let oid = store.put_snapshot(&altered).unwrap();
         store
             .meta
-            .commit_seal(tag, oid, altered.commit, altered.tree, "test")
+            .commit_seal(tag, oid, altered.commit, altered.tree, "test", None)
             .unwrap();
     };
 
@@ -299,7 +306,14 @@ fn legacy_content_only_seal_with_contribution_history_remains_verifiable() {
     let legacy_oid = store.put_snapshot(&legacy).unwrap();
     store
         .meta
-        .commit_seal(&legacy.tag, legacy_oid, legacy.commit, legacy.tree, "test")
+        .commit_seal(
+            &legacy.tag,
+            legacy_oid,
+            legacy.commit,
+            legacy.tree,
+            "test",
+            None,
+        )
         .unwrap();
 
     assert_eq!(f.verify_tag(&root, &legacy.tag).unwrap(), legacy_oid);
@@ -386,7 +400,14 @@ fn verify_rejects_seal_signature_not_made_by_this_forge_trusted_key() {
     let forged_oid = store.put_snapshot(&forged).unwrap();
     store
         .meta
-        .commit_seal(&forged.tag, forged_oid, forged.commit, forged.tree, "test")
+        .commit_seal(
+            &forged.tag,
+            forged_oid,
+            forged.commit,
+            forged.tree,
+            "test",
+            None,
+        )
         .unwrap();
 
     assert_eq!(f.verify_tag(&root, "honest-signature").unwrap(), honest_oid);

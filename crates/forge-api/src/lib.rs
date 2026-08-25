@@ -25,7 +25,10 @@ pub use gc::{
 };
 pub use import::ImportOptions;
 pub use repository::find_forge;
-pub use serve::{dispatch as dispatch_request, serve, unix_worker_count};
+pub use serve::{
+    dispatch as dispatch_request, http_status as daemon_http_status, serve, unix_worker_count,
+    DAEMON_OPS,
+};
 pub use soak::{private_checkins_bounded, run_bench_with_workers, shared_stampede_bounded};
 pub use stats::{
     ApiCounterReport, DurabilityReport, MetaCounterReport, StatsReport, StoreCounterReport,

@@ -208,6 +208,31 @@ impl From<std::io::Error> for Error {
 }
 
 impl Error {
+    /// The CLI_ABI.md exit-code table, in one place.
+    ///
+    /// The CLI returns this from `main`; the daemon's `code` string below is
+    /// the same classification under a different name. Keeping both derived
+    /// from one exhaustive match is what makes "the daemon reports what the
+    /// CLI reports" a checkable statement rather than two tables that drift.
+    ///
+    /// 0 success / 1 denied, capability, input, not-found / 2 corruption or
+    /// sealed-state violation / 3 transient busy / 4 stale observation or
+    /// merge conflict / 5 I/O, SQLite or internal. Adopted rule: exit 5 must be
+    /// unreachable from caller-controlled input.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Error::Denied(_)
+            | Error::Cap(_)
+            | Error::Invalid(_)
+            | Error::InvalidBase
+            | Error::NotFound(_) => 1,
+            Error::Corrupt(_) | Error::Sealed(_) => 2,
+            Error::Busy(_) => 3,
+            Error::StaleObservation { .. } | Error::MergeConflict(_) => 4,
+            Error::Io(_) | Error::Sqlite(_) | Error::Internal(_) => 5,
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Error::Denied(_) => "denied",

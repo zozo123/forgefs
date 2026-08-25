@@ -123,6 +123,130 @@ a `SCHEMA_LEDGER` finding with exit 2. Admitting that one case is the reason
 `fsck --full` opens the catalog with its schema-compatibility check deferred at
 all.
 
+## Sealing: `forge seal`
+
+`seal` introduces no exit code. It maps onto the table above:
+
+| Outcome | Exit |
+|---|---:|
+| the tag was published; with `--attest`, also re-verified from durable bytes | 0 |
+| the ref does not exist, the tag name is malformed, or the capability may not seal the ref or `tags/<tag>` | 1 |
+| `tags/<tag>` already exists: a published tag is frozen and is never replaced | 2 |
+| the ref moved between the read and the publish | 4 |
+
+A seal is a provenance claim about a ref -- "this ref was this commit at this
+moment" -- so `seal` compares and swaps against the ref it names, in the same
+catalog transaction that publishes the tag (I5, I6). It reads the ref, builds
+and signs the snapshot from what it read, and publishes only while the ref
+**still holds that commit**. If another agent moved the head in between, the
+seal is refused with exit 4 and nothing is published: no tag ref, no reflog
+entry, no seals row.
+
+Exit 4, not 1, because a moved head is a stale observation of exactly the kind
+`checkin` reports (I8/I9): the request was well formed and authorised, the
+caller simply observed a value that is no longer current, and re-reading the ref
+makes the same request succeed. An input error would say the opposite -- that no
+retry can help.
+
+`seal` never silently seals the new head instead. The caller asked to seal what
+they observed; sealing something else under the same tag would publish a claim
+nobody made. Automation that gets exit 4 re-reads the ref and decides whether
+the new commit is the one it meant to tag.
+
+`--attest` re-reads the published tag from durable bytes (I15), which needs
+read authority on `tags/<tag>` as well as seal authority. A capability that may
+seal but may not read therefore publishes the tag and then reports the
+attestation refusal, exit 1; the tag stays published, because publishing it
+succeeded. The daemon's `"attest": true` behaves identically.
+
+Until #331 this window was open: `seal` read the ref, and published whatever it
+had read whenever it got there. The resulting tag named a commit the ref no
+longer held, `verify` passed on it -- the signed snapshot is internally
+consistent, so this was never corruption -- and the caller saw exit 0.
+`crates/forge-cli/tests/cli_seal_head_moves.rs` races the window through the
+debug-only `FORGEFS_TEST_SEAL_CAS_BARRIER` seam and pins the refusal.
+
+## The daemon surface: `forge serve`
+
+`forge serve` answers the same requests over a unix socket at
+`.forge/forge.sock` and, with `--http`, over `POST /v1/<op>`. **The daemon is a
+strict projection of this document, not a second ABI.** Three rules define it,
+and `crates/forge-api/tests/daemon_abi.rs` is their conformance suite:
+
+1. **Every op is a CLI verb.** The daemon serves a subset of the CLI, never a
+   superset. An op that is not in the table below is refused as an input error.
+2. **Every field is that verb's own argument, with that verb's own default.** A
+   field ForgeFS does not know is refused; it is never accepted and ignored, and
+   never silently taken to mean its default.
+3. **Every error carries the same classification its exit code carries.** The
+   `err.code` string is the exit-code table above under a different name.
+
+| op | CLI verb | body fields |
+|---|---|---|
+| `session.open` | `session open` | `from` (default `main`) |
+| `ns.write` | `write` | `ns`, `path`, and exactly one of `text` or `hex` |
+| `ns.read` | `read` | `ns`, `path` |
+| `ns.ls` | `ls` | `ns`, `path` (default `/`) |
+| `ns.checkin` | `checkin` | `ns`, `mount` (default `/`), `msg` (default empty) |
+| `ns.mount` | `mount` | `ns`, `path`, `spec`, `rw` (default `false`) |
+| `refs` | `refs` | none |
+| `seal` | `seal` | `ref`, `tag`, `attest` (default `false`) |
+
+`hex` is the wire form of `write --file`: a daemon client has no path on the
+server's filesystem, so it sends the bytes. Its reach is exactly `--file`'s.
+
+Fields standing for CLI flags (`rw`, `attest`) must be JSON booleans and fields
+standing for CLI arguments must be JSON strings; a flag is present or absent, so
+`"rw": "true"` is an input error rather than `false`.
+
+Every CLI verb absent from that table -- `import`, `merge`, `branch`, `grant`,
+`gc`, `abandon`, `fsck`, `verify`, `export`, `log`, `show`, `stats`, `inbox`,
+`landmark`, `init` -- is **not served**, and asking for it is an input error.
+Two response details are CLI-only and have no daemon equivalent: the count of
+refs suppressed by authority, which `forge refs` writes to stderr, and the
+human rendering of `stats`.
+
+`ns.checkin` answers in the CLI's own three-word outcome vocabulary:
+
+```
+{"result":"updated","name":"<ref>","oid":"<hex>"}
+{"result":"forked","requested":"<ref>","fork":"<ref>","ours":"<hex>","theirs":"<hex>"}
+{"result":"noop","name":"<ref>","oid":"<hex>"}
+```
+
+Every object id in a daemon response is lowercase hex. Consumers must ignore
+response keys they do not know; keys are added, never renamed or removed.
+
+### Daemon error mapping
+
+`err.code` is authoritative. The HTTP status is a coarser view of the same
+failure and several classes share one status, so a client that needs the CLI's
+classification reads `err.code`, never the status.
+
+| `err.code` | CLI exit | HTTP |
+|---|---:|---:|
+| — (`"ok": true`) | 0 | 200 |
+| `denied` | 1 | 403 |
+| `not_found` | 1 | 404 |
+| `invalid` | 1 | 400 |
+| `invalid_base` | 1 | 409 |
+| `sealed` | 2 | 409 |
+| `corrupt` | 2 | 500 |
+| `busy` | 3 | 503 |
+| `stale_observation` | 4 | 409 |
+| `conflict` | 4 | 409 |
+| `internal` | 5 | 500 |
+
+The adopted rule holds here too: `internal` must be unreachable from
+caller-controlled input, so no request a client can shape produces HTTP 500.
+
+The capability is loaded before the op is dispatched, so an unauthenticated peer
+cannot use the daemon to discover which ops exist. `serve` requires exclusive
+cell ownership (`Forge::open_for_serve`); a daemon and a direct CLI client never
+share a repository, and `serve` refuses with `busy` (exit 3) if one is already
+there. Transport limits -- frame size, worker pool, admission and read deadlines
+-- are in `crates/forge-api/src/serve.rs` and are not part of this contract.
+
 ## Reclamation: `forge abandon` and `forge gc`
 
 Neither verb introduces an exit code. Both map onto the table above:

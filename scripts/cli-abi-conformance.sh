@@ -455,6 +455,18 @@ check abi/4-merge-conflict blocking 4 "" -- \
 	--dir "$B" --cap "$B_INT" merge --into=main --from "heads/agents/anon/$B_B"
 check abi/4-stale-observation blocking 4 "" -- \
 	--dir "$C" --cap "$C_BOB" checkin --ns "$C_BOBNS" -m 'stale notes'
+# A seal is a claim about a ref, so it CASes the ref it names and a head that
+# moved inside the seal window is the same stale observation (#331). The race
+# itself needs the debug-only FORGEFS_TEST_SEAL_CAS_BARRIER seam, which a
+# release binary does not contain, so the row is declared rather than faked.
+declare_unexercised abi/4-seal-moved-head 4 \
+	"needs a second process to move the ref between seal's read and its publish; driven deterministically by crates/forge-cli/tests/cli_seal_head_moves.rs via FORGEFS_TEST_SEAL_CAS_BARRIER, which exists only in debug builds"
+check abi/0-seal-attest blocking 0 \
+	"seal --attest re-reads the durable bytes before reporting success (I15)" -- \
+	--dir "$A" --cap "$A_INT" seal main --tag abi-seal-attested --attest
+check abi/1-seal-unknown-ref blocking 1 \
+	"a ref the caller named that does not exist is not-found, never an internal failure" -- \
+	--dir "$A" --cap "$A_INT" seal heads/definitely-absent --tag abi-seal-absent
 
 # --- exit 5: I/O, SQLite, or internal failure -----------------------------
 # Contract: exit 5 is for genuine I/O, SQLite or internal failure. It must NOT
