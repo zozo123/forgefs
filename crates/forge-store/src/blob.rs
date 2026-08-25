@@ -1,5 +1,5 @@
 use crate::metrics::TimingCounter;
-use forge_core::hash_bytes;
+use forge_core::{hash_bytes, hash_parts};
 use forge_types::{Error, ObjectId, Result};
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -151,8 +151,13 @@ impl LocalBlobStore {
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<ObjectId> {
+        self.put_parts(&[bytes])
+    }
+
+    /// Single-object form of [`PublishBatch::put_parts`].
+    pub fn put_parts(&self, parts: &[&[u8]]) -> Result<ObjectId> {
         let mut batch = self.begin_batch();
-        let id = batch.put(bytes)?;
+        let id = batch.put_parts(parts)?;
         batch.finish()?;
         Ok(id)
     }
@@ -223,6 +228,15 @@ impl LocalBlobStore {
 
 impl PublishBatch<'_> {
     pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
+        self.put_parts(&[bytes])
+    }
+
+    /// Publish the object file formed by concatenating `parts`. Identity,
+    /// bytes, dedup and every durability barrier are exactly those of
+    /// `put(&parts.concat())`; the concatenation is never allocated, so a
+    /// caller that already holds a payload does not need a second copy of it
+    /// in order to publish one (I2, I3, I4).
+    pub fn put_parts(&mut self, parts: &[&[u8]]) -> Result<ObjectId> {
         // Every object write in the process funnels through here, so this is
         // the whole write boundary for a read-only store.
         if self.store.read_only {
@@ -230,7 +244,7 @@ impl PublishBatch<'_> {
                 "repository is open read-only; objects cannot be published".into(),
             ));
         }
-        let id = hash_bytes(bytes);
+        let id = hash_parts(parts);
         let dest = self.store.object_path(id);
         let (a, b) = id.shard_dirs();
         let objects = self.store.root.join("objects");
@@ -276,7 +290,9 @@ impl PublishBatch<'_> {
         let tmp = tmp_dir.join(ulid::Ulid::new().to_string());
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            f.write_all(bytes)?;
+            for part in parts {
+                f.write_all(part)?;
+            }
             sync_file_counted(&f, &self.store.stats, crate::DurabilityBarrier::ObjectFile)?;
             crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectFileAfter)?;
         }

@@ -15,6 +15,7 @@ Each fact has one owner. Link to it instead of copying it:
 | `CLI_ABI.md` | Stable CLI output, error, and exit-code contract |
 | `docs/RECOVERY.md` | Crash-durability and recovery contract |
 | `docs/BENCH.md` | Reproducible benchmark protocol and claim boundaries |
+| `docs/CHUNKING.md` | Measured object-size ceiling and the chunked-file design decision |
 | `docs/RELEASING.md` | Release, artifact, and verification procedure |
 | `SECURITY.md` | Threat model, supported reporting path, and non-goals |
 

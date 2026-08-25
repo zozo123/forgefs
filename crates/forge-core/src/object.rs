@@ -15,6 +15,36 @@ pub fn hash_bytes(bytes: &[u8]) -> ObjectId {
     ObjectId(*blake3::hash(bytes).as_bytes())
 }
 
+/// Identity of the object file formed by concatenating `parts`, without
+/// materializing that concatenation. `hash_parts(&[a, b]) == hash_bytes(&[a,
+/// b].concat())` by construction, so a streaming publisher computes the same
+/// ObjectId as a buffering one (I2).
+pub fn hash_parts(parts: &[&[u8]]) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    for p in parts {
+        h.update(p);
+    }
+    ObjectId(*h.finalize().as_bytes())
+}
+
+/// The framed prefix that precedes a Blob payload: type byte, header length,
+/// and the canonical `{size}` header. `blob_frame_prefix(n) ++ data` is
+/// byte-for-byte `Blob { data }.encode()` when `data.len() == n`, which lets a
+/// publisher hash and write a payload it does not own a second copy of. The
+/// encoding is unchanged; this only exposes the split point (FORMAT.md v1).
+pub fn blob_frame_prefix(size: u64) -> Vec<u8> {
+    let mut header = Vec::new();
+    let mut size_v = Vec::new();
+    encode_u64(&mut size_v, size);
+    encode_map_sorted(&mut header, vec![(text_key("size"), size_v)]);
+    let n = u32::try_from(header.len()).expect("Forge object header exceeds u32::MAX");
+    let mut v = Vec::with_capacity(5 + header.len());
+    v.push(ObjectType::Blob as u8);
+    v.extend_from_slice(&n.to_be_bytes());
+    v.extend_from_slice(&header);
+    v
+}
+
 pub fn encode_file(ty: ObjectType, header: &[u8], payload: &[u8]) -> Vec<u8> {
     let n = u32::try_from(header.len()).expect("Forge object header exceeds u32::MAX");
     let mut v = Vec::with_capacity(5 + header.len() + payload.len());
@@ -49,11 +79,10 @@ pub struct Blob {
 
 impl Blob {
     pub fn encode(&self) -> Vec<u8> {
-        let mut header = Vec::new();
-        let mut size_v = Vec::new();
-        encode_u64(&mut size_v, self.data.len() as u64);
-        encode_map_sorted(&mut header, vec![(text_key("size"), size_v)]);
-        encode_file(ObjectType::Blob, &header, &self.data)
+        let mut v = blob_frame_prefix(self.data.len() as u64);
+        v.reserve_exact(self.data.len());
+        v.extend_from_slice(&self.data);
+        v
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
