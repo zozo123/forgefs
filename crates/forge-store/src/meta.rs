@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS mounts (
   path  TEXT NOT NULL,
   spec  TEXT NOT NULL,
   mode  TEXT NOT NULL CHECK(mode IN ('ro','rw')),
-  PRIMARY KEY (ns_id, path)
+  base_oid BLOB,
+  PRIMARY KEY (ns_id, path),
+  CHECK(base_oid IS NULL OR length(base_oid)=32)
 );
 
 CREATE TABLE IF NOT EXISTS overlay (
@@ -122,7 +124,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// Reflog `reason` that retires a ref name for good. See `ref_retired`.
 pub const REFLOG_ABANDON: &str = "abandon";
@@ -156,9 +158,10 @@ const OBSERVATION_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' 
     AND typeof(path)='text' \
     AND ((kind='absent' AND oid IS NULL) \
          OR (kind IN ('blob','tree') AND typeof(oid)='blob'))";
-const MOUNT_COLUMNS: &[&str] = &["ns_id", "path", "spec", "mode"];
+const MOUNT_COLUMNS: &[&str] = &["ns_id", "path", "spec", "mode", "base_oid"];
 const MOUNT_VALUES: &str = "typeof(ns_id)='text' AND typeof(path)='text' \
-    AND typeof(spec)='text' AND typeof(mode)='text' AND mode IN ('ro','rw')";
+    AND typeof(spec)='text' AND typeof(mode)='text' AND mode IN ('ro','rw') \
+    AND typeof(base_oid) IN ('null','blob')";
 const OVERLAY_COLUMNS: &[&str] = &["ns_id", "mount", "path", "blob_oid", "exec"];
 const OVERLAY_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' \
     AND typeof(path)='text' AND typeof(blob_oid) IN ('null','blob') \
@@ -201,6 +204,11 @@ pub struct MountRow {
     pub path: String,
     pub spec: String,
     pub mode: String,
+    /// I19: the commit this read-write mount is pinned to, recorded when the
+    /// mount was taken and re-recorded by every checkin that publishes it.
+    /// `None` for a read-only mount, which deliberately resolves live, and for
+    /// a raw `oid:` mount, whose spec already names immutable bytes.
+    pub base_oid: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +326,7 @@ pub struct CatalogMountRow {
     pub path: String,
     pub spec: String,
     pub mode: String,
+    pub base_oid: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -853,6 +862,65 @@ INSERT INTO observations_v2 (ns_id, mount, path, kind, oid)
 DROP TABLE observations;
 ALTER TABLE observations_v2 RENAME TO observations;";
 
+/// Gives every read-write mount its own pinned base (I19).
+///
+/// Before v3 a session had one `namespaces.pinned_oid` and
+/// `Forge::session_mount_tree` served EVERY read-write `ref:` mount from it,
+/// whatever ref the mount named. What an existing read-write row means on
+/// upgrade is therefore not a free choice, and neither obvious answer is right:
+///
+/// * backfilling every read-write mount from `namespaces.pinned_oid` freezes
+///   that defect into the upgraded catalog -- a mount of `ref:other` would keep
+///   serving the session's base for the rest of its life;
+/// * leaving `base_oid` NULL and resolving live reintroduces #233 for every
+///   session open across the upgrade: a read would hit a ref another agent can
+///   move, and the observation it records could never match at checkin.
+///
+/// So the backfill is per mount, from the ref that mount actually names:
+///
+/// 1. A mount naming the session's OWN `live_ref` takes `namespaces.pinned_oid`
+///    verbatim. That is by construction the commit the live ref holds -- only
+///    this session's checkins move its private ref, and they move both together
+///    -- so this preserves the session's own base exactly instead of
+///    re-deriving it, and #233 stays fixed for the ordinary single-mount
+///    session, which is almost every session.
+/// 2. Any other read-write `ref:` mount takes that ref's CURRENT head. Under v2
+///    such a mount was serving a tree that did not come from the ref it named,
+///    so there is no honest older base to preserve; the head is the first value
+///    this mount has ever had that belongs to its own ref. The residual cost is
+///    bounded and loud, not silent: an observation recorded through such a
+///    mount before the upgrade fails the next checkin with `StaleObservation`
+///    naming that mount, and one re-read clears it, because after v3 the read
+///    and the check finally consult the same tree.
+/// 3. A read-write mount whose ref no longer exists keeps `base_oid` NULL.
+///    Reads through it fail closed with `NotFound`, which is what `fsck`
+///    already reports for it (`MOUNT_REF`); inventing a base for a ref that is
+///    gone would be worse.
+/// 4. A read-write `oid:` mount is demoted to `ro`. An immutable spec has no
+///    ref to advance, `checkin` refused it unconditionally, and `fsck` already
+///    reports it as `MOUNT_RW_OID` corruption, so v2 could accept a write no
+///    verb and no capability could ever publish. v3 refuses such a mount
+///    outright; demoting the stored row makes the upgraded catalog consistent
+///    with that rule. The demotion destroys nothing: an `oid:` mount serves the
+///    same frozen tree in either mode, any overlay staged under it stays
+///    readable (I18), and `abandon session --discard-staged` remains its exit,
+///    exactly as before the upgrade.
+///
+/// Mutable catalog rows only: no immutable object is read, written or rehashed
+/// here (I17).
+const MIGRATE_2_TO_3_BACKFILL: &str = "\
+UPDATE mounts SET base_oid = (
+  SELECT n.pinned_oid FROM namespaces n
+   WHERE n.id = mounts.ns_id AND n.live_ref IS NOT NULL
+     AND (mounts.spec = 'ref:' || n.live_ref OR mounts.spec = n.live_ref))
+ WHERE mode='rw' AND base_oid IS NULL;
+UPDATE mounts SET base_oid = (
+  SELECT r.oid FROM refs r
+   WHERE ('ref:' || r.name) = mounts.spec OR r.name = mounts.spec)
+ WHERE mode='rw' AND base_oid IS NULL;
+UPDATE mounts SET mode='ro'
+ WHERE mode='rw' AND base_oid IS NULL AND spec LIKE 'oid:%';";
+
 fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     if from > CURRENT_SCHEMA_VERSION {
         return Err(Error::Invalid(format!(
@@ -882,6 +950,7 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
         for step in first_step..CURRENT_SCHEMA_VERSION {
             match step {
                 1 => tx.execute_batch(MIGRATE_1_TO_2).map_err(map_sql)?,
+                2 => migrate_2_to_3(&tx)?,
                 _ => {
                     return Err(Error::Invalid(format!(
                         "unsupported metadata schema migration {step} -> {}",
@@ -914,6 +983,40 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
 /// Confirm the catalog actually reached the shape `SCHEMA` describes.
 /// Detection only: this never drops, rewrites, or repairs a relation, and it
 /// never touches an immutable object (I17).
+/// Apply the v3 `mounts.base_oid` step.
+///
+/// The `ALTER TABLE` is probed rather than issued blind, for the same reason
+/// `migrate` probes for the `observations` table: schema version 0 means either
+/// a fresh catalog or a *pre-versioning* one, and the second can already carry
+/// relations at any earlier shape -- including, when a current catalog has lost
+/// its ledger, the v3 shape itself. `MIGRATE_1_TO_2` survives that by rebuilding
+/// its relation; an unconditional `ADD COLUMN` would fail with "duplicate
+/// column name" and roll the whole open back. The backfill below is written to
+/// be safe either way: every statement is guarded on `base_oid IS NULL`, so a
+/// row that already has a pin is never re-derived.
+fn migrate_2_to_3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "mounts", "base_oid")? {
+        tx.execute_batch("ALTER TABLE mounts ADD COLUMN base_oid BLOB;")
+            .map_err(map_sql)?;
+    }
+    tx.execute_batch(MIGRATE_2_TO_3_BACKFILL).map_err(map_sql)
+}
+
+fn column_exists(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info('{table}')"))
+        .map_err(map_sql)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(map_sql)?;
+    for row in rows {
+        if row.map_err(map_sql)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn verify_migrated_shape(tx: &rusqlite::Transaction<'_>, from: i64) -> Result<()> {
     for (table, expected) in CATALOG_TABLES {
         let mut stmt = tx
@@ -1675,7 +1778,9 @@ impl Meta {
         let mut mount_keys = BTreeSet::new();
         if mounts_clean {
             let mut stmt = tx
-                .prepare("SELECT ns_id, path, spec, mode FROM mounts ORDER BY ns_id, path")
+                .prepare(
+                    "SELECT ns_id, path, spec, mode, base_oid FROM mounts ORDER BY ns_id, path",
+                )
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1684,16 +1789,29 @@ impl Meta {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 })
                 .map_err(map_sql)?;
             for row in rows {
-                let (ns_id, path, spec, mode) = row.map_err(map_sql)?;
+                let (ns_id, path, spec, mode, base_oid) = row.map_err(map_sql)?;
+                let resource = format!("catalog:mount:{ns_id}:{path}");
                 if namespaces_clean && !namespace_ids.contains(&ns_id) {
                     audit.finding(
                         "MOUNT_NAMESPACE",
-                        format!("catalog:mount:{ns_id}:{path}"),
+                        &resource,
                         "mount refers to a missing namespace",
+                    );
+                }
+                // I19: a read-write mount's pin is the only thing keeping the
+                // tree it serves alive once its ref has moved on, so it is a
+                // reclamation root in its own right, exactly like a session pin.
+                let base_oid = base_oid.and_then(|bytes| audit.oid(bytes, &resource, "base_oid"));
+                if let Some(oid) = base_oid {
+                    audit.root(
+                        oid,
+                        CatalogObjectExpectation::Any,
+                        format!("namespace:{ns_id}:mount:{path}:base"),
                     );
                 }
                 mount_keys.insert((ns_id.clone(), path.clone()));
@@ -1702,6 +1820,7 @@ impl Meta {
                     path,
                     spec,
                     mode,
+                    base_oid,
                 });
             }
         }
@@ -2806,14 +2925,27 @@ impl Meta {
             params![ns_id, mount_path],
         )
         .map_err(|error| self.map_sql_counted(error))?;
-        let n = tx
-            .execute(
-                "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
-                params![new.as_bytes().as_slice(), ns_id],
-            )
-            .map_err(|error| self.map_sql_counted(error))?;
-        if n != 1 {
-            return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+        // I19: the published mount advances to the commit it just published, so
+        // the next read through it sees its own work and the next checkin CASes
+        // from what the ref now holds. Every OTHER mount keeps its own pin:
+        // publishing one ref must never move what another mount reads.
+        Self::repin_mount_tx(&tx, ns_id, mount_path, new)?;
+        // The session pin follows the ROOT mount only. `create_session` opens
+        // `/` on the session's own live ref and a losing CAS retargets that same
+        // row at the fork, so `/` is the session's own writable base and
+        // `namespaces.pinned_oid` is its mirror. Advancing it from a checkin of
+        // some other mount is what used to change what every other mount read,
+        // out from under the session.
+        if mount_path == "/" {
+            let n = tx
+                .execute(
+                    "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
+                    params![new.as_bytes().as_slice(), ns_id],
+                )
+                .map_err(|error| self.map_sql_counted(error))?;
+            if n != 1 {
+                return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+            }
         }
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
             .map_err(|error| self.map_sql_counted(error))?;
@@ -2832,6 +2964,31 @@ impl Meta {
         Ok(result)
     }
 
+    /// Move one mount's pinned base, inside the caller's transaction.
+    ///
+    /// I19: a checkin publishes exactly one mount, so exactly one mount's pin
+    /// moves. A missing row is corruption, not a benign no-op -- the caller
+    /// just folded and published that mount's overlay.
+    fn repin_mount_tx(
+        tx: &rusqlite::Transaction<'_>,
+        ns_id: &str,
+        mount_path: &str,
+        base: ObjectId,
+    ) -> Result<()> {
+        let n = tx
+            .execute(
+                "UPDATE mounts SET base_oid=?1 WHERE ns_id=?2 AND path=?3",
+                params![base.as_bytes().as_slice(), ns_id, mount_path],
+            )
+            .map_err(map_sql)?;
+        if n != 1 {
+            return Err(Error::Corrupt(format!(
+                "missing checkin mount {ns_id}:{mount_path}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn complete_noop_session(
         &self,
         ns_id: &str,
@@ -2846,14 +3003,17 @@ impl Meta {
             params![ns_id, mount_path],
         )
         .map_err(map_sql)?;
-        let n = tx
-            .execute(
-                "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
-                params![pinned.as_bytes().as_slice(), ns_id],
-            )
-            .map_err(map_sql)?;
-        if n != 1 {
-            return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+        Self::repin_mount_tx(&tx, ns_id, mount_path, pinned)?;
+        if mount_path == "/" {
+            let n = tx
+                .execute(
+                    "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
+                    params![pinned.as_bytes().as_slice(), ns_id],
+                )
+                .map_err(map_sql)?;
+            if n != 1 {
+                return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+            }
         }
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
             .map_err(map_sql)?;
@@ -2927,14 +3087,19 @@ impl Meta {
         )
         .map_err(map_sql)?;
         let root_spec = format!("ref:{live_ref}");
+        // I19: the session root mount is pinned to the same commit the session
+        // is, at the same instant and in the same transaction, so the two can
+        // never disagree about the session's own base.
         tx.execute(
-            "INSERT INTO mounts (ns_id, path, spec, mode) VALUES (?1,'/',?2,'rw')",
-            params![id, root_spec],
+            "INSERT INTO mounts (ns_id, path, spec, mode, base_oid) VALUES (?1,'/',?2,'rw',?3)",
+            params![id, root_spec, pinned.as_bytes().as_slice()],
         )
         .map_err(map_sql)?;
         if mount_main {
+            // Read-only, so it stays live by design: that is what lets a read
+            // of `main` through this mount go stale and refuse a checkin (I9).
             tx.execute(
-                "INSERT INTO mounts (ns_id, path, spec, mode) VALUES (?1,'/main','ref:main','ro')",
+                "INSERT INTO mounts (ns_id, path, spec, mode, base_oid) VALUES (?1,'/main','ref:main','ro',NULL)",
                 [id],
             )
             .map_err(map_sql)?;
@@ -3137,11 +3302,29 @@ impl Meta {
         Ok(())
     }
 
-    pub fn insert_mount(&self, ns_id: &str, path: &str, spec: &str, mode: &str) -> Result<()> {
+    /// Record a mount, with the base commit a read-write mount is pinned to.
+    ///
+    /// I19: `base_oid` is what makes a read-write mount name one immutable tree
+    /// rather than a moving ref. It is `None` for a read-only mount, which
+    /// resolves live on purpose so cross-mount stale detection works.
+    pub fn insert_mount(
+        &self,
+        ns_id: &str,
+        path: &str,
+        spec: &str,
+        mode: &str,
+        base_oid: Option<ObjectId>,
+    ) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO mounts (ns_id, path, spec, mode) VALUES (?1,?2,?3,?4)",
-            params![ns_id, path, spec, mode],
+            "INSERT OR REPLACE INTO mounts (ns_id, path, spec, mode, base_oid) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                ns_id,
+                path,
+                spec,
+                mode,
+                base_oid.map(|o| o.as_bytes().to_vec())
+            ],
         )
         .map_err(map_sql)?;
         Ok(())
@@ -3150,22 +3333,61 @@ impl Meta {
     pub fn list_mounts(&self, ns_id: &str) -> Result<Vec<MountRow>> {
         let conn = self.read_conn();
         let mut stmt = conn
-            .prepare("SELECT path, spec, mode FROM mounts WHERE ns_id=?1")
+            .prepare("SELECT path, spec, mode, base_oid FROM mounts WHERE ns_id=?1")
             .map_err(map_sql)?;
         let rows = stmt
             .query_map([ns_id], |r| {
-                Ok(MountRow {
-                    path: r.get(0)?,
-                    spec: r.get(1)?,
-                    mode: r.get(2)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
             })
             .map_err(map_sql)?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(map_sql)?);
+            let (path, spec, mode, base_oid) = r.map_err(map_sql)?;
+            out.push(MountRow {
+                path,
+                spec,
+                mode,
+                base_oid: base_oid.map(oid_from_blob).transpose()?,
+            });
         }
         Ok(out)
+    }
+
+    /// One mount of `ns_id` by exact path, or `None`.
+    ///
+    /// I19: re-mounting a path is the one operation that can move staged work
+    /// from the ref it was written against to another, so `mount` has to see
+    /// what is already there before it replaces it.
+    pub fn get_mount(&self, ns_id: &str, path: &str) -> Result<Option<MountRow>> {
+        let conn = self.read_conn();
+        conn.query_row(
+            "SELECT path, spec, mode, base_oid FROM mounts WHERE ns_id=?1 AND path=?2",
+            params![ns_id, path],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sql)?
+        .map(|(path, spec, mode, base_oid)| {
+            Ok(MountRow {
+                path,
+                spec,
+                mode,
+                base_oid: base_oid.map(oid_from_blob).transpose()?,
+            })
+        })
+        .transpose()
     }
 
     pub fn overlay_upsert(

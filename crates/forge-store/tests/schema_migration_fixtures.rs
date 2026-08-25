@@ -3,10 +3,9 @@
 //! row across unchanged, must never touch an ObjectId, and must fail closed on
 //! any version -- or any shape -- this binary cannot honour.
 //!
-//! Historical fixtures live in `testdata/schema/`. Only one metadata schema has
-//! ever shipped (`CURRENT_SCHEMA_VERSION = 1`), so the single migration the
-//! code implements is `0 -> 1`, where version 0 is the pre-versioning catalog
-//! that `schema_version()` itself defines as "no `schema_migrations` ledger".
+//! Historical fixtures live in `testdata/schema/`. Version 0 is the
+//! pre-versioning catalog that `schema_version()` itself defines as "no
+//! `schema_migrations` ledger"; 1 and 2 are shipped shapes.
 
 use forge_store::{Meta, CURRENT_SCHEMA_VERSION};
 use forge_types::Error;
@@ -18,12 +17,16 @@ const PRE_VERSIONING: &str = include_str!("../../../testdata/schema/v0_pre_versi
 const SHAPE_DRIFT: &str = include_str!("../../../testdata/schema/v0_shape_drift.sql");
 const V1_PRE_OBSERVATION_KIND: &str =
     include_str!("../../../testdata/schema/v1_pre_observation_kind.sql");
+const V2_PRE_MOUNT_PIN: &str = include_str!("../../../testdata/schema/v2_pre_mount_pin.sql");
 
 /// Every retired schema version needs frozen bytes to migrate from. The guard
 /// test below fails the moment `CURRENT_SCHEMA_VERSION` is bumped without one,
 /// which is the intended entry point to `testdata/schema/README.md`.
-const RETIRED_SCHEMA_FIXTURES: &[(i64, &str)] =
-    &[(0, PRE_VERSIONING), (1, V1_PRE_OBSERVATION_KIND)];
+const RETIRED_SCHEMA_FIXTURES: &[(i64, &str)] = &[
+    (0, PRE_VERSIONING),
+    (1, V1_PRE_OBSERVATION_KIND),
+    (2, V2_PRE_MOUNT_PIN),
+];
 
 /// Relations whose rows must survive a migration untouched. `cap_root` is
 /// excluded on purpose: a writable open scrubs a legacy root HMAC key (I14),
@@ -115,6 +118,17 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
     found != 0
 }
 
+fn ref_oid(conn: &Connection, name: &str) -> forge_types::ObjectId {
+    let bytes: Vec<u8> = conn
+        .query_row("SELECT oid FROM refs WHERE name=?1", [name], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|error| panic!("ref {name}: {error}"));
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&bytes);
+    forge_types::ObjectId(id)
+}
+
 fn hex(byte: u8) -> String {
     std::iter::repeat_n(byte, 32)
         .map(|b| format!("{b:02x}"))
@@ -144,20 +158,34 @@ fn pre_versioning_catalog_carries_every_row_forward() {
 
     let after = open_fixture(&path);
     assert_eq!(ledger(&after), expected_ledger());
-    // `observations` is the one table this migration deliberately reshapes: v2
-    // adds a `kind` discriminant. Asserting byte-equality across it would be
-    // asserting the migration did nothing. Every OTHER table must be untouched,
-    // and the reshaped rows are checked separately below.
-    let without_observations = |rows: &[(String, Vec<String>)]| -> Vec<(String, Vec<String>)> {
+    // Two tables are deliberately reshaped on the way to the current version,
+    // so asserting byte-equality across them would be asserting the migrations
+    // did nothing: v2 gives `observations` a `kind` discriminant, and v3 gives
+    // `mounts` a `base_oid` and backfills it (I19). Every OTHER table must be
+    // untouched, and both reshaped relations are checked as transformations --
+    // here for `observations`, and in
+    // `v2_catalog_gives_every_read_write_mount_its_own_pin` for `mounts`.
+    let reshaped = |rows: &[(String, Vec<String>)]| -> Vec<(String, Vec<String>)> {
         rows.iter()
-            .filter(|(table, _)| table != "observations")
+            .filter(|(table, _)| table != "observations" && table != "mounts")
             .cloned()
             .collect()
     };
     assert_eq!(
-        without_observations(&dump_all(&after)),
-        without_observations(&before_rows),
+        reshaped(&dump_all(&after)),
+        reshaped(&before_rows),
         "migration must not rewrite, drop, or reorder any mutable row"
+    );
+    // The one `mounts` row the pre-versioning fixture carries is read-write on
+    // spec `main`, which is also its namespace's `live_ref`, so I19 backfills it
+    // from `namespaces.pinned_oid` -- the session's own base, preserved exactly.
+    assert_eq!(
+        dump_table(&after, "mounts"),
+        vec![format!(
+            "'ns-fixture-0001'|'/src'|'main'|'rw'|X'{}'",
+            hex(0xa1).to_uppercase()
+        )],
+        "a read-write mount on the session's own live ref must be pinned to the session pin"
     );
 
     // Every pre-existing observation is carried forward as the blob
@@ -254,6 +282,121 @@ fn migration_that_cannot_reach_the_current_shape_fails_closed() {
     assert!(
         Meta::open(&path).is_err(),
         "a refused migration must stay refused on the next open"
+    );
+}
+
+/// I19/I17: v3 gives every read-write mount its own pinned base. The migration
+/// has to decide what an existing read-write row means, and the two obvious
+/// answers are both wrong -- backfilling every one from `namespaces.pinned_oid`
+/// freezes the defect that a mount of another ref serves the session's base,
+/// and leaving them NULL to resolve live reintroduces #233 for every session
+/// open across the upgrade. This asserts the decision actually taken, per mount,
+/// from the ref that mount names.
+#[test]
+fn v2_catalog_gives_every_read_write_mount_its_own_pin() {
+    let (_dir, path) = catalog_from(V2_PRE_MOUNT_PIN);
+    let before = open_fixture(&path);
+    assert_eq!(ledger(&before), vec![1, 2], "the fixture must start at v2");
+    let before_rows = dump_all(&before);
+    let base = ref_oid(&before, "base");
+    let other = ref_oid(&before, "other");
+    assert_ne!(base, other, "the fixture's two refs must have diverged");
+    drop(before);
+
+    let meta = Meta::open(&path).expect("a v2 catalog must migrate forward");
+    let sessions: Vec<String> = meta
+        .list_namespaces()
+        .expect("namespaces")
+        .into_iter()
+        .map(|ns| ns.id)
+        .collect();
+    assert_eq!(sessions.len(), 2, "the fixture has two live sessions");
+
+    // Session A is the one holding several read-write mounts; session B is the
+    // ordinary single-mount shape. Identify them by their mount tables, not by
+    // ULID order, so the fixture can be regenerated without editing this test.
+    let mut multi = None;
+    let mut single = None;
+    for id in &sessions {
+        let mounts = meta.list_mounts(id).expect("mounts");
+        if mounts.len() > 2 {
+            multi = Some((id.clone(), mounts));
+        } else {
+            single = Some((id.clone(), mounts));
+        }
+    }
+    let (multi_id, multi_mounts) = multi.expect("session A");
+    let (single_id, single_mounts) = single.expect("session B");
+
+    let pin_of = |mounts: &[forge_store::MountRow], path: &str| {
+        mounts
+            .iter()
+            .find(|m| m.path == path)
+            .unwrap_or_else(|| panic!("mount {path}"))
+            .clone()
+    };
+
+    // The session's OWN ref keeps the session pin, exactly: #233 stays fixed
+    // for the ordinary session, and the value is preserved rather than
+    // re-derived.
+    let own = pin_of(&single_mounts, "/");
+    let pin = meta
+        .get_namespace(&single_id)
+        .expect("namespace")
+        .pinned_oid
+        .expect("pin");
+    assert_eq!(
+        own.base_oid,
+        Some(pin),
+        "a mount on the session's own live ref must be pinned to the session pin"
+    );
+
+    // A read-write mount of ANOTHER ref is pinned to THAT ref, not to the
+    // session base it used to be served from. This is bug A, fixed on upgrade.
+    let root = pin_of(&multi_mounts, "/");
+    let foreign = pin_of(&multi_mounts, "/other");
+    assert_eq!(root.base_oid, Some(base), "/ must be pinned to ref:base");
+    assert_eq!(
+        foreign.base_oid,
+        Some(other),
+        "a read-write mount of ref:other must be pinned to ref:other, not to the session base"
+    );
+
+    // I19: publishing is what moves a pin, and this migration publishes
+    // nothing, so session A's own base is exactly where it was.
+    assert_eq!(
+        meta.get_namespace(&multi_id).expect("namespace").pinned_oid,
+        Some(base),
+        "the migration must not move a session pin"
+    );
+
+    // A read-only mount takes no pin: resolving live is what it is for (I9).
+    assert_eq!(pin_of(&multi_mounts, "/dep").base_oid, None);
+    assert_eq!(pin_of(&multi_mounts, "/main").base_oid, None);
+
+    // A read-write raw `oid:` mount is demoted, because v3 refuses to create
+    // one: an immutable spec has no ref to advance, so it was a write path with
+    // no publish path, and `fsck` reported the row as MOUNT_RW_OID corruption.
+    let snap = pin_of(&multi_mounts, "/snap");
+    assert!(snap.spec.starts_with("oid:"), "{snap:?}");
+    assert_eq!(snap.mode, "ro", "a read-write oid mount must be demoted");
+    assert_eq!(snap.base_oid, None);
+
+    // I18: the upgrade publishes nothing and discards nothing. Every staged
+    // overlay entry and every observation is still there, byte for byte.
+    drop(meta);
+    let after = open_fixture(&path);
+    assert_eq!(ledger(&after), expected_ledger());
+    let keep = |rows: &[(String, Vec<String>)]| -> Vec<(String, Vec<String>)> {
+        rows.iter()
+            .filter(|(table, _)| table != "mounts")
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        keep(&dump_all(&after)),
+        keep(&before_rows),
+        "the v3 migration must touch nothing but the mounts relation"
     );
 }
 

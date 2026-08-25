@@ -205,6 +205,17 @@ impl Forge {
                     Err(err) => report.finding("MOUNT_SPEC", &mount_resource, err.to_string()),
                 }
 
+                // I19: the mount's own pinned base. The ref above is rooted at
+                // what it holds now; this is the commit the mount still reads
+                // and still folds onto, so a full walk must reread it too.
+                if let Some(base) = mount.base_oid {
+                    roots.push((
+                        base,
+                        GraphExpectation::Any,
+                        format!("{mount_resource}:base"),
+                    ));
+                }
+
                 for row in self.store.meta.overlay_list(&ns.id, &mount.path)? {
                     if let Some(id) = row.blob_oid {
                         roots.push((

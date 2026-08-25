@@ -35,7 +35,13 @@ ref is a root".
 ```
 refs                       every row in `refs`, including unresolved forks/*
 live session pins          namespaces.pinned_oid
-session mounts             raw-oid mounts (a `ref:` mount roots nothing new)
+mount pins                 mounts.base_oid -- every read-write mount's own base
+                           (I19). The refs pass roots what a ref holds NOW; once
+                           it has moved on, this pin is the only thing keeping
+                           the tree the mount still serves, and still folds at
+                           checkin, reachable.
+session mounts             raw-oid mounts (a `ref:` mount roots nothing new
+                           beyond its pin above)
 session overlays           staged blobs that have not been checked in
 session observations       blob/tree ids a session recorded reading (I9)
 landmarks                  #249 made `landmark` ref-unrestricted precisely
