@@ -803,18 +803,31 @@ impl World {
         // no-op checkin on a sealed or protected ref still reports Noop.
         if &new_tree == self.model.tree_of(base_cid) && base_cid == ref_cid {
             // I22: `Noop` is the one outcome that may never be said over work
-            // that exists. This mount stages nothing publishable, so staged
-            // entries under any OTHER mount turn the answer into a refusal
-            // that names them. `updated`/`forked` below are progress and are
-            // deliberately NOT constrained this way -- refusing them would
-            // wedge a session holding two writable mounts (I19/I21).
-            let elsewhere: usize = s
-                .overlay
-                .iter()
-                .filter(|(mp, _)| mp.as_str() != m.path.as_str())
-                .map(|(_, e)| e.len())
-                .sum();
-            if elsewhere > 0 {
+            // that exists. This mount stages nothing publishable, so WORK
+            // under any OTHER mount turns the answer into a refusal naming it.
+            //
+            // Work, not rows. An overlay that folds to its own mount's base --
+            // a delete of a path that mount does not have, a write of bytes it
+            // already holds -- is not work, and counting it as such wedges a
+            // session all of whose mounts hold only such rows (#342).
+            //
+            // `updated`/`forked` below are deliberately NOT constrained this
+            // way either: they are progress, and refusing them would wedge a
+            // session holding two writable mounts with work in both (I19/I21).
+            let elsewhere = s.overlay.iter().any(|(mp, entries)| {
+                if mp.as_str() == m.path.as_str() || entries.is_empty() {
+                    return false;
+                }
+                match s.base.get(mp) {
+                    Some(c) => {
+                        let base = self.model.tree_of(*c);
+                        &model_apply_overlay(base, entries) != base
+                    }
+                    // Fails safe, exactly as production does.
+                    None => true,
+                }
+            });
+            if elsewhere {
                 return Err(Refusal::StagedElsewhere);
             }
             return Ok(Predicted::Noop);
