@@ -1,0 +1,20 @@
+forgefs commit:        63fa09852a0c60edf7cea1c5a1813d1410b74dc3
+build profile:         release
+forge --version:       forge 0.1.0
+rustc:                 rustc 1.97.0 (2d8144b78 2026-07-07)
+command line:          /workspace/forgefs/target/release/forge bench --agents 32 --shared 0 --workers 4 ;; w7_git_worktree_bench.py run --agents 32 --workers 4 --durability {default,durable}
+worker count:          4
+cpu model:             AMD EPYC 9454 48-Core Processor
+cpu logical cores:     4
+ram:                   7.8 GiB (8343212032 bytes)
+os:                    Debian GNU/Linux 12
+kernel:                Linux 6.16.9+
+arch:                  x86_64
+filesystem:            ext2/ext3
+storage device:        /dev/vdd[/workspace]
+sqlite journal_mode:   WAL
+sqlite synchronous:    FULL (declared; Meta::open fails closed without it, docs/RECOVERY.md)
+macos fullfsync:       n/a (Linux fsync path, docs/RECOVERY.md)
+run class:             cold
+repetition:            1
+repository class:      fresh repository per repetition, both sides

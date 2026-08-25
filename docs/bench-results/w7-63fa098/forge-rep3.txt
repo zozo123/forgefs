@@ -1,0 +1,21 @@
+forge bench dir=/tmp/forge-bench-WtK0Vg agents=32 shared=0 workers=4
+ForgeFS e2e bench (durable puts: fsync file+dir)
+serial = one agent at a time (true op latency).
+private = N threads, private refs (throughput; p50 includes convoy wait).
+shared  = N threads, one ref; I8 pin ⇒ 1 Updated + N-1 Forked.
+counter scope = cumulative whole-run process lifetime, never per-checkin.
+counter start = storage at blob-store construction; sqlite/api post-open.
+counter end   = after init + all workloads + merge/seal + verify (+ worker fsck).
+per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals.
+serial checkin   n=8  p50=7.44ms  p95=9.10ms  p99=9.10ms
+private checkin  n=32/32  wall=0.079s    403.2 Hz
+  p50=9.72ms  p95=12.58ms  p99=13.35ms  max=13.35ms
+shared stampede  n=0  wall=0.000s  updated=0 forked=0
+  p50=0.00ms  p95=0.00ms  p99=0.00ms
+merge+seal       wall=0.064s
+verify           wall=0.004s
+durability       journal_mode=wal synchronous=FULL(2) fullfsync=n/a
+storage lifetime puts=241 bytes=unavailable fsync_file=241 fsync_file_us=60706 fsync_dir=644 fsync_dir_us=68799 lifetime_barrier_us=129505
+sqlite lifetime  lock_acquires=688 lock_wait_us=43628 txn_count=161 txn_us=78328 lifetime_accounted_us=121956 busy=0 updated=80 forked=0 denied=0
+lifetime phases  fsync_file_us=60706 + fsync_dir_us=68799 + sqlite_lock_wait_us=43628 + sqlite_txn_us=78328 = cumulative_phase_us=251461
+api lifetime     stale=0 conflict=0

@@ -1,0 +1,21 @@
+{
+  "agents": 32,
+  "durability_line": "durability       journal_mode=wal synchronous=FULL(2) fullfsync=n/a",
+  "durability_mode": "synchronous=FULL, object file+dir fsync",
+  "fsck": "ok (forge bench fails the run otherwise)",
+  "latency": {
+    "max_us": 12260,
+    "n": 32,
+    "p50_us": 8030,
+    "p95_us": 10110,
+    "p99_us": 12260
+  },
+  "ops_s": 477.5,
+  "side": "forgefs",
+  "sqlite_lifetime": "sqlite lifetime  lock_acquires=688 lock_wait_us=31559 txn_count=161 txn_us=77313 lifetime_accounted_us=108872 busy=0 updated=80 forked=0 denied=0",
+  "storage_lifetime": "storage lifetime puts=241 bytes=unavailable fsync_file=241 fsync_file_us=60719 fsync_dir=643 fsync_dir_us=66145 lifetime_barrier_us=126864",
+  "updated": 32,
+  "wall_s": 0.067,
+  "workers": 4,
+  "workload": "W1 private (the W7 comparison workload)"
+}
