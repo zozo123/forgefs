@@ -74,3 +74,41 @@ decoders (`object_decode`), the capability parser (`cap_token`), daemon framing
 and dispatch (`protocol_frame`), the tree-name and ref-name grammars
 (`tree_name`, `ref_name`), and the tar export/import round trip
 (`tar_roundtrip`). CI compiles every target and smokes each for 60 seconds.
+
+## Shape gaps
+
+I1-I18 are all safety properties: each one names something that must never
+happen. None of them requires anything to eventually happen, and none of them
+requires an operation to act on *everything* in front of it. Both P0s that
+reached production here sat in exactly those two blind spots -- #233 because
+nothing said where a read resolves FROM, #326 because nothing said checkin must
+publish or explicitly refuse everything staged. The rules below are the missing
+shape. They are **not yet true of the implementation**; each is a defect
+reproduced by a `#[test]` in `multi_mount_shape.rs`, whose `#[ignore]`d
+companion is the regression test a fix must flip on.
+
+| ID | Proposed rule |
+|---|---|
+| I19 | A session has exactly one writable base. A read-write mount may name only the session's own live ref; every other ref is mounted read-only. Reads through a read-write mount resolve against the session pin (I8), so a read-write mount of any other ref serves that ref's paths from the wrong tree and reports a present file as absent. |
+| I20 | Checkin publishes or explicitly refuses everything the session staged. `Noop` means the session stages nothing anywhere, not that the named mount stages nothing. A mount that accepts a write must have a verb that can publish it: a read-write `oid:` mount accepts writes today and `checkin` of it is refused unconditionally, so the write is staged where no capability and no verb can ever reach it. |
+| I21 | A session holding write authority over its base can always reach a terminal state: publish, fork, or `abandon`. No sequence of authorised reads may leave every checkin refused, and a refusal that a re-read cannot clear must name the mount that caused it, not only the observation. |
+
+I9 is also silent about scope: it says stale observations fail checkin, but not
+how long an observation constrains a session. `Meta::cas_ref_session` deletes
+observations for the whole namespace while deleting overlay for the published
+mount alone, so a foreign-mount read stops constraining the session at the first
+checkin of any *other* mount. Either the epoch is per-session -- in which case
+say so, and clear the overlay with it -- or it is per-mount, in which case the
+`DELETE FROM observations` must be scoped the same way `DELETE FROM overlay` is.
+
+`Meta::insert_mount` is likewise `INSERT OR REPLACE` on (ns, path) while the
+overlay is keyed on (ns, mount path) with no record of the spec it was staged
+against, so re-mounting a path silently re-targets staged work at a different
+ref. And `Meta::commit_seal` performs no compare-and-swap against the ref it was
+asked to seal: the snapshot is internally consistent, but `seal main v1` can
+publish a tag naming a commit `main` no longer held when the tag became visible.
+
+| Invariants | Production owner | Primary evidence |
+|---|---|---|
+| I19, I21 | `forge-api/workspace.rs` (`session_mount_tree`, `check_observations`), `forge-store/meta.rs` (`insert_mount`) | `multi_mount_shape.rs` |
+| I20 | `forge-api/workspace.rs` (`checkin`), `forge-store/meta.rs` (`complete_noop_session`), `forge-cli/src/main.rs` (`Cmd::Checkin`) | `multi_mount_shape.rs`, `gc_and_abandon.rs` |
