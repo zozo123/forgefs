@@ -5,9 +5,10 @@ use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
+use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub const SCHEMA: &str = r#"
@@ -421,8 +422,112 @@ impl<T> TimedMutex<T> {
     }
 }
 
+/// Connections that may only SELECT.
+///
+/// WAL exists so readers do not have to queue behind the writer, but every
+/// catalog query used to take the one connection mutex, so three of the four
+/// acquisitions a `Forge::read` makes were pure reads waiting on writes
+/// (issue #308). The pool takes them off that mutex.
+///
+/// Members are opened by `connect_read_only`, the same constructor the
+/// read-only-media open uses: `SQLITE_OPEN_READONLY` plus `query_only=1`, and
+/// no `journal_mode` or `synchronous` pragma, so a pool member cannot mutate
+/// the database or its durability contract even by accident.
+///
+/// Slots fill lazily. A process-per-command CLI opens at most one extra
+/// connection and only if it reads at all; a threaded server grows to
+/// `slots.len()` as readers actually collide. The pool is an optimisation and
+/// never a failure mode: if a member cannot be opened, the caller falls back
+/// to the write connection.
+struct ReadPool {
+    path: PathBuf,
+    slots: Vec<Mutex<Option<Connection>>>,
+    next: AtomicUsize,
+    wait: TimingCounter,
+}
+
+/// Read connections per catalog. Small on purpose: each one is an open file
+/// descriptor and a mapped wal-index region, and readers past this many are
+/// better off queueing than multiplying.
+const READ_POOL_MAX: usize = 8;
+const READ_POOL_MIN: usize = 2;
+
+impl ReadPool {
+    fn new(path: PathBuf) -> Self {
+        let width = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(READ_POOL_MIN)
+            .clamp(READ_POOL_MIN, READ_POOL_MAX);
+        Self {
+            path,
+            slots: (0..width).map(|_| Mutex::new(None)).collect(),
+            next: AtomicUsize::new(0),
+            wait: TimingCounter::default(),
+        }
+    }
+
+    /// An open connection, preferring one that already exists over paying for
+    /// a new one, and blocking only when every slot is busy.
+    fn acquire(&self) -> Option<MutexGuard<'_, Option<Connection>>> {
+        let started = Instant::now();
+        let width = self.slots.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % width;
+        for offset in 0..width {
+            if let Some(guard) = self.slots[(start + offset) % width].try_lock() {
+                if guard.is_some() {
+                    self.wait.observe(started.elapsed());
+                    return Some(guard);
+                }
+            }
+        }
+        for offset in 0..width {
+            if let Some(guard) = self.slots[(start + offset) % width].try_lock() {
+                return self.populate(guard, started);
+            }
+        }
+        self.populate(self.slots[start].lock(), started)
+    }
+
+    fn populate<'a>(
+        &self,
+        mut guard: MutexGuard<'a, Option<Connection>>,
+        started: Instant,
+    ) -> Option<MutexGuard<'a, Option<Connection>>> {
+        if guard.is_none() {
+            *guard = Some(connect_read_only(&self.path).ok()?);
+        }
+        self.wait.observe(started.elapsed());
+        Some(guard)
+    }
+}
+
+/// A connection a read may use. `Pooled` is always populated: `ReadPool`
+/// opens the slot before handing the guard out, and falls back to `Writer`
+/// rather than yielding an empty one.
+enum CatalogRead<'a> {
+    Pooled(MutexGuard<'a, Option<Connection>>),
+    Writer(MutexGuard<'a, Connection>),
+}
+
+impl Deref for CatalogRead<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Pooled(guard) => guard
+                .as_ref()
+                .expect("a pooled read slot is populated before it is handed out"),
+            Self::Writer(guard) => guard,
+        }
+    }
+}
+
 pub struct Meta {
     write: TimedMutex<Connection>,
+    /// `None` for a read-only catalog: there is no writer to get out of the
+    /// way of, and `open_read_only` may hold an `immutable=1` handle that a
+    /// second plain read-only open could not reproduce.
+    read: Option<ReadPool>,
     stats: MetaCounters,
     durability: DurabilityPolicy,
     read_only: bool,
@@ -1027,12 +1132,19 @@ fn audit_table_shape(
 impl Meta {
     pub fn stats(&self) -> MetaStats {
         let txn = self.stats.txn.snapshot();
+        // Both mutexes, so the counter keeps meaning "every acquisition of a
+        // process-local SQLite connection" now that reads have their own.
         let lock_wait = self.write.wait.snapshot();
+        let read_wait = self
+            .read
+            .as_ref()
+            .map(|pool| pool.wait.snapshot())
+            .unwrap_or_default();
         MetaStats {
             txn_us: txn.total_us,
             txn_count: txn.count,
-            lock_wait_us: lock_wait.total_us,
-            lock_acquires: lock_wait.count,
+            lock_wait_us: lock_wait.total_us.saturating_add(read_wait.total_us),
+            lock_acquires: lock_wait.count.saturating_add(read_wait.count),
             busy: self.stats.busy.load(Ordering::Relaxed),
             cas_updated: self.stats.cas_updated.load(Ordering::Relaxed),
             cas_forked: self.stats.cas_forked.load(Ordering::Relaxed),
@@ -1043,6 +1155,18 @@ impl Meta {
 
     pub fn durability_policy(&self) -> &DurabilityPolicy {
         &self.durability
+    }
+
+    /// SQLite's `sqlite3_total_changes` for the write connection: every row
+    /// inserted, updated, or deleted since it was opened.
+    ///
+    /// This is the honest instrument for metadata write amplification.
+    /// `MetaStats::txn_count` counts only explicit `BEGIN IMMEDIATE` blocks and
+    /// is blind to autocommit statements, so a read-heavy phase reports zero
+    /// transactions while still dirtying one page per operation. Row mutations
+    /// cannot be fooled that way.
+    pub fn row_mutations(&self) -> u64 {
+        self.write.lock().total_changes()
     }
 
     /// True when this catalog was opened read-only. Every write path is
@@ -1728,6 +1852,23 @@ impl Meta {
         })
     }
 
+    /// The connection a SELECT-only query must use.
+    ///
+    /// Only for statements that cannot write. Anything inside an explicit
+    /// transaction, and any read whose result must reflect a write this same
+    /// logical operation has not committed yet, stays on the write connection:
+    /// a WAL reader sees the last committed state, which is exactly right for
+    /// a read that follows a committed write and exactly wrong for one that
+    /// does not.
+    fn read_conn(&self) -> CatalogRead<'_> {
+        if let Some(pool) = &self.read {
+            if let Some(guard) = pool.acquire() {
+                return CatalogRead::Pooled(guard);
+            }
+        }
+        CatalogRead::Writer(self.write.lock())
+    }
+
     fn map_sql_counted(&self, error: rusqlite::Error) -> Error {
         let error = map_sql(error);
         if matches!(error, Error::Busy(_)) {
@@ -1868,6 +2009,10 @@ impl Meta {
         .map_err(map_sql)?;
         Ok(Self {
             write: TimedMutex::new(conn),
+            // Safe to build now and not before: the writable open has created
+            // the database, switched it to WAL and mapped the wal-index, so a
+            // later read-only member has both a file and a `-shm` to attach.
+            read: Some(ReadPool::new(path.to_path_buf())),
             stats: MetaCounters::default(),
             durability,
             read_only: false,
@@ -1940,6 +2085,7 @@ impl Meta {
         let durability = Self::observe_durability(&conn, true)?;
         Ok(Self {
             write: TimedMutex::new(conn),
+            read: None,
             stats: MetaCounters::default(),
             durability,
             read_only: true,
@@ -1957,13 +2103,13 @@ impl Meta {
     }
 
     pub fn get_seal_pub(&self) -> Result<Vec<u8>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         conn.query_row("SELECT seal_pub FROM cap_root WHERE id=1", [], |r| r.get(0))
             .map_err(|_| Error::Corrupt("missing cap_root".into()))
     }
 
     pub fn get_ref(&self, name: &str) -> Result<Option<RefRow>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT name, oid, kind, protected, sealed FROM refs WHERE name=?1",
             [name],
@@ -2564,7 +2710,7 @@ impl Meta {
     }
 
     pub fn list_refs(&self) -> Result<Vec<RefRow>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare("SELECT name, oid, kind, protected, sealed FROM refs ORDER BY name")
             .map_err(map_sql)?;
@@ -2641,7 +2787,7 @@ impl Meta {
     }
 
     pub fn list_namespaces(&self) -> Result<Vec<NsRow>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare("SELECT id, agent_id, pinned_oid, live_ref FROM namespaces ORDER BY id")
             .map_err(map_sql)?;
@@ -2691,7 +2837,7 @@ impl Meta {
     }
 
     pub fn get_namespace(&self, id: &str) -> Result<NsRow> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT id, agent_id, pinned_oid, live_ref FROM namespaces WHERE id=?1",
             [id],
@@ -2727,25 +2873,72 @@ impl Meta {
         Ok(())
     }
 
+    /// Record what a read saw, so I9 can validate it at checkin.
+    ///
+    /// I9 constrains what the `observations` table *holds* when checkin reads
+    /// it, not how many times it was written on the way there. Re-reading a
+    /// path whose row already records the same `(kind, oid)` would have
+    /// `INSERT OR REPLACE` delete and re-insert a byte-identical row: one
+    /// dirtied page, one WAL commit and, under `synchronous=FULL`, one fsync,
+    /// to arrive at the state the table is already in. Issue #308 measured
+    /// exactly one row mutation per read op in every workload shape while the
+    /// row count stayed pinned at the distinct-path count -- 3650 write
+    /// transactions to hold 146 rows in the grep-heavy shape.
+    ///
+    /// So look first, on a read connection where the check costs no
+    /// write-mutex time, and write only when the row would actually change.
+    /// The table ends in the same state either way.
+    ///
+    /// Concurrency: the look and the write are not one atomic step, so two
+    /// threads observing the same path with different OIDs still race. That
+    /// race is unchanged -- `INSERT OR REPLACE` was already last-writer-wins
+    /// for them -- and it cannot occur at all for the equal-value case this
+    /// skips, where every racer is recording the same bytes.
+    ///
+    /// A read-only catalog is excluded: it must keep refusing the write rather
+    /// than report success on the strength of a row it did not record.
     pub fn observe(&self, ns_id: &str, mount: &str, path: &str, seen: Observed) -> Result<()> {
+        let oid = seen.oid().map(|id| id.as_bytes().to_vec());
+        if !self.read_only && self.observation_is_current(ns_id, mount, path, seen.kind(), &oid)? {
+            return Ok(());
+        }
         let conn = self.write.lock();
         conn.execute(
             "INSERT OR REPLACE INTO observations (ns_id, mount, path, kind, oid) \
              VALUES (?1,?2,?3,?4,?5)",
-            params![
-                ns_id,
-                mount,
-                path,
-                seen.kind(),
-                seen.oid().map(|id| id.as_bytes().to_vec())
-            ],
+            params![ns_id, mount, path, seen.kind(), oid],
         )
         .map_err(map_sql)?;
         Ok(())
     }
 
+    /// True when `observations` already records exactly this outcome for the
+    /// path, so writing it again would change no row.
+    fn observation_is_current(
+        &self,
+        ns_id: &str,
+        mount: &str,
+        path: &str,
+        kind: &str,
+        oid: &Option<Vec<u8>>,
+    ) -> Result<bool> {
+        let conn = self.read_conn();
+        let stored = conn
+            .query_row(
+                "SELECT kind, oid FROM observations WHERE ns_id=?1 AND mount=?2 AND path=?3",
+                params![ns_id, mount, path],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        Ok(match stored {
+            Some((stored_kind, stored_oid)) => stored_kind == kind && stored_oid == *oid,
+            None => false,
+        })
+    }
+
     pub fn observations(&self, ns_id: &str) -> Result<Vec<ObservationRow>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare("SELECT mount, path, kind, oid FROM observations WHERE ns_id=?1")
             .map_err(map_sql)?;
@@ -2797,7 +2990,7 @@ impl Meta {
     }
 
     pub fn list_mounts(&self, ns_id: &str) -> Result<Vec<MountRow>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare("SELECT path, spec, mode FROM mounts WHERE ns_id=?1")
             .map_err(map_sql)?;
@@ -2869,7 +3062,7 @@ impl Meta {
     }
 
     pub fn overlay_list(&self, ns_id: &str, mount: &str) -> Result<Vec<OverlayRow>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare("SELECT path, blob_oid, exec FROM overlay WHERE ns_id=?1 AND mount=?2")
             .map_err(map_sql)?;
@@ -2938,7 +3131,7 @@ impl Meta {
         Ok(())
     }
     pub fn intro_get(&self, oid: ObjectId) -> Result<Option<String>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT agent_id FROM object_intro WHERE oid=?1",
             params![oid.as_bytes().as_slice()],
@@ -3025,7 +3218,7 @@ impl Meta {
     }
 
     pub fn get_seal(&self, tag: &str) -> Result<Option<(ObjectId, ObjectId, ObjectId)>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT snap_oid, commit_oid, tree_oid FROM seals WHERE tag=?1",
             [tag],
@@ -3049,7 +3242,7 @@ impl Meta {
         name: &str,
         limit: usize,
     ) -> Result<Vec<(Option<ObjectId>, ObjectId, String, String)>> {
-        let conn = self.write.lock();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT old_oid, new_oid, agent_id, reason FROM reflog WHERE name=?1 ORDER BY id DESC LIMIT ?2",

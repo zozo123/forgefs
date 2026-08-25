@@ -128,8 +128,11 @@ The individual counter semantics are deliberately mechanical:
 - `fsync_file` / `fsync_file_us` count and time successful file durability
   barriers; `fsync_dir` / `fsync_dir_us` do the same for directories. Failed
   barriers fail the operation and are not reported as successful work.
-- `lock_acquires` / `lock_wait_us` cover every acquisition of ForgeFS's one
-  process-local SQLite connection mutex, including reads and autocommit writes.
+- `lock_acquires` / `lock_wait_us` cover every acquisition of a process-local
+  SQLite connection mutex, including reads and autocommit writes. That is the
+  write connection plus the read-only connections that serve SELECT-only
+  catalog queries, so the pair is a sum across connections and not a measure of
+  writer contention on its own.
 - `txn_count` / `txn_us` cover every instrumented explicit `BEGIN IMMEDIATE`
   attempt from before BEGIN through COMMIT or rollback. SQLite's
   cross-process `busy_timeout` wait is therefore inside `txn_us`; `busy` is an
