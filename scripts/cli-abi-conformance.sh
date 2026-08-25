@@ -25,6 +25,13 @@
 # refused to start without it with exit 2, the code CLI_ABI.md reserves for
 # corruption (issue #346). JSON is now shaped by scripts/json-lib.sh.
 #
+# The list is checked, not just claimed: scripts/prereq-lib.sh names every
+# command these scripts may run, verifies them before the first row, and turns
+# an undeclared command that a script reaches for anyway into the same exit 3
+# at the point of use. It was claimed and false until issue #354 -- `grep` is
+# its own package, and release-gate.sh used it while all three declarations
+# said otherwise.
+#
 # ---------------------------------------------------------------------------
 # What "expected" means here
 # ---------------------------------------------------------------------------
@@ -58,6 +65,17 @@ die() {
 [ -n "$FORGE" ] || die "usage: $0 <path-to-forge-binary> [OUTDIR]"
 [ -x "$FORGE" ] || die "not an executable forge binary: $FORGE"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -r "$SCRIPT_DIR/prereq-lib.sh" ] || {
+	printf 'abi-conformance: missing %s\n' "$SCRIPT_DIR/prereq-lib.sh" >&2
+	exit 3
+}
+PREREQ_SCRIPT=abi-conformance
+# shellcheck source=scripts/prereq-lib.sh
+. "$SCRIPT_DIR/prereq-lib.sh"
+# A declared tool this machine does not have is a harness error with an exit
+# code of its own, decided before the first row runs -- never a contract row
+# that appears to have failed (issue #354).
+require_declared_commands
 [ -r "$SCRIPT_DIR/json-lib.sh" ] || {
 	printf 'abi-conformance: missing %s\n' "$SCRIPT_DIR/json-lib.sh" >&2
 	exit 3
@@ -75,6 +93,9 @@ unset FORGE_CAP FORGE_DIR
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/forge-abi.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# From here on a command bash cannot find is recorded, and `check` refuses to
+# record a contract row as failed because of it.
+PREREQ_MARKER="$WORK/missing-commands"
 # `forge` walks parents looking for .forge, so no fixture may be created at
 # $WORK itself - otherwise the "no repository here" row would find a parent.
 
@@ -183,6 +204,8 @@ check() {
 		printf 'ok       %-34s exit=%s  %s\n' "$id" "$observed" "$argv"
 		;;
 	blocking:mismatch)
+		# A row can only disprove the contract if the harness itself ran.
+		prereq_guard
 		printf 'FAIL     %-34s expected=%s observed=%s  %s\n' "$id" "$expected" "$observed" "$argv" >&2
 		printf '         output: %s\n' "$(printf '%s' "$out" | tr '\n' '|')" >&2
 		blocking_fail=$((blocking_fail + 1))

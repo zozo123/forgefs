@@ -37,6 +37,15 @@
 # scripts/json-lib.sh now, and a missing prerequisite has an exit code of its
 # own.
 #
+# That list is now checked rather than merely claimed. It was false: `grep` is
+# its own Debian package, not part of coreutils, and one `grep -Eq` here
+# reported a missing TOOL as a failing PRODUCT -- exit 1, and `"ok": false` in
+# gate-summary.json against a repository nothing was wrong with (issue #354).
+# The match it did is done in awk now, and scripts/prereq-lib.sh checks every
+# declared command before the first assertion runs, so an absent prerequisite
+# exits 3 naming itself, while an UNDECLARED command that this script reaches
+# for anyway is caught at the point of use and turned into the same exit 3.
+#
 # Environment:
 #   FORGE_GATE_TAG   seal tag to use (default: v<forge --version>)
 #   FORGE_ENV_COMMIT commit sha recorded in the environment line
@@ -54,6 +63,17 @@ harness_die() {
 
 [ -n "$FORGE" ] || harness_die "usage: $0 <path-to-forge-binary> [OUTDIR]"
 [ -x "$FORGE" ] || harness_die "not an executable forge binary: $FORGE"
+[ -r "$SCRIPT_DIR/prereq-lib.sh" ] || {
+	printf 'release-gate: missing %s\n' "$SCRIPT_DIR/prereq-lib.sh" >&2
+	exit 3
+}
+PREREQ_SCRIPT=release-gate
+# shellcheck source=scripts/prereq-lib.sh
+. "$SCRIPT_DIR/prereq-lib.sh"
+# Before anything else runs: a tool this gate needs and this machine lacks is a
+# harness error with an exit code of its own, never a gate assertion that
+# failed (issue #354).
+require_declared_commands
 [ -r "$SCRIPT_DIR/json-lib.sh" ] || {
 	printf 'release-gate: missing %s\n' "$SCRIPT_DIR/json-lib.sh" >&2
 	exit 3
@@ -80,6 +100,9 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/forge-release-gate.XXXXXX")"
 DEMO="$WORK/forge"
 PHASES="$WORK/phases"
 FAILURES="$WORK/failures"
+# From here on, a command bash cannot find is recorded here by
+# scripts/prereq-lib.sh, and `fail` refuses to blame forge for it.
+PREREQ_MARKER="$WORK/missing-commands"
 : >"$PHASES"
 : >"$FAILURES"
 US=$'\x1f'
@@ -99,6 +122,18 @@ redact() {
 
 note() { printf '%s\n' "$*"; }
 
+# ere_match <extended-regex> <text> - true when any LINE of <text> matches.
+#
+# What `grep -Eq` did, in the awk this script already depends on. `grep` is a
+# package of its own and was never a declared prerequisite (issue #354). The
+# pattern travels in the environment rather than through `awk -v`, because -v
+# processes escape sequences in the value and would eat the backslash out of
+# `\.` before the regex engine ever saw it.
+ere_match() {
+	printf '%s\n' "$2" |
+		GATE_ERE="$1" awk '$0 ~ ENVIRON["GATE_ERE"] { hit = 1 } END { exit hit ? 0 : 1 }'
+}
+
 phase() {
 	printf '%s%s%s\n' "$1" "$US" "$(printf '%s' "$2" | redact | tr '\n' ' ')" >>"$PHASES"
 	printf 'gate: ok    %-38s %s\n' "$1" "$(printf '%s' "$2" | redact | tr '\n' ' ')"
@@ -106,6 +141,11 @@ phase() {
 
 fail() {
 	local id="$1" detail="$2"
+	# The single funnel for "forge did not honour a contract", and therefore
+	# the single place that can be lied to by a missing tool. If bash could
+	# not find a command during this run, whatever is about to be blamed on
+	# forge is this harness's fault; exit 3 instead (issue #354).
+	prereq_guard
 	printf '%s%s%s\n' "$id" "$US" "$(printf '%s' "$detail" | redact | tr '\n' ' ')" >>"$FAILURES"
 	printf 'gate: FAIL  %-38s %s\n' "$id" "$(printf '%s' "$detail" | redact | tr '\n' ' ')" >&2
 }
@@ -166,6 +206,16 @@ gate_artifact_array() {
 finish() {
 	local status=$?
 	local failed ok fsck_block cli_abi_block environment_block
+	# A gate that could not run produced no verdict, so it must not leave a
+	# document that reads like one. `"ok": false` beside a missing-tool
+	# message is exactly the fabricated product failure issue #354 is about,
+	# and a stale summary from an earlier run would be read the same way.
+	if prereq_missing; then
+		rm -f "$OUTDIR/gate-summary.json" 2>/dev/null || true
+		printf 'release-gate: no gate-summary.json written: the harness could not run\n' >&2
+		rm -rf "$WORK" 2>/dev/null || true
+		exit 3
+	fi
 	failed="$(wc -l <"$FAILURES" | tr -d ' ')"
 
 	if [ "$failed" -eq 0 ] && [ "$status" -eq 0 ]; then ok=true; else ok=false; fi
@@ -421,14 +471,25 @@ printf '%s\n' "$LAST_OUT" >"$OUTDIR/conflict-object.txt"
 CONFLICT_SHOW="$LAST_OUT"
 # `show` renders conflict paths tree-relative, so /overlap.txt appears as
 # `path overlap.txt`. Accept either spelling rather than pinning a cosmetic.
-for want in "^conflict $CONFLICT_OID" "^ours [0-9a-f]{64}$" "^theirs [0-9a-f]{64}$" "^path /?overlap\.txt "; do
-	if ! printf '%s\n' "$CONFLICT_SHOW" | grep -Eq "$want"; then
+#
+# No `{64}` in these patterns: mawk 1.3.4 -- what a Debian base image has, and
+# the awk json-lib.sh is written against -- has no interval expressions, so
+# `[0-9a-f]{64}` there matches the literal characters `{64}` and every side
+# would be reported missing. The hex length is asserted below, on the captured
+# value, which is a stronger check than the regex was anyway.
+for want in "^conflict $CONFLICT_OID" "^ours [0-9a-f]+$" "^theirs [0-9a-f]+$" "^path /?overlap\.txt "; do
+	if ! ere_match "$want" "$CONFLICT_SHOW"; then
 		fail gate/conflict-object "Conflict object is missing /$want/: $CONFLICT_SHOW"
 		exit 1
 	fi
 done
 CONFLICT_OURS="$(printf '%s\n' "$CONFLICT_SHOW" | awk '/^ours /{print $2; exit}')"
 CONFLICT_THEIRS="$(printf '%s\n' "$CONFLICT_SHOW" | awk '/^theirs /{print $2; exit}')"
+if [ "${#CONFLICT_OURS}" -ne 64 ] || [ "${#CONFLICT_THEIRS}" -ne 64 ]; then
+	fail gate/conflict-object \
+		"conflict sides are not full object ids: ours=$CONFLICT_OURS theirs=$CONFLICT_THEIRS"
+	exit 1
+fi
 if [ "$CONFLICT_OURS" = "$CONFLICT_THEIRS" ]; then
 	fail gate/conflict-object "conflict ours == theirs; both sides were not preserved"
 	exit 1

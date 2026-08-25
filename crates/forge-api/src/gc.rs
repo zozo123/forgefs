@@ -230,18 +230,14 @@ impl Forge {
     ///   whole computation with `Corrupt`, because an undecodable object hides
     ///   its outgoing edges and every child would be misreported as garbage.
     ///
-    /// What is still missing before `--collect` could exist, and why this
-    /// function refuses to delete:
-    ///
-    /// * there is no session lease. `min_age_secs` is a blunt stand-in for one:
-    ///   it bounds the put-before-commit window (I4) but it does not bound how
-    ///   long a session may hold an unwritten pin.
-    /// * deletion and the root read are not one transaction. A collector needs
-    ///   a durable collection epoch that new roots are stamped against, so a
-    ///   root published after the walk cannot be collected by it.
-    /// * `Store` keeps hot LRU object caches, so a collected object may still
-    ///   be served from memory in the collecting process, which hides exactly
-    ///   the bug a collector must not have.
+    /// This is the plan, not the sweep. [`Forge::gc_collect`] is what deletes,
+    /// and it answers the three objections that once kept collection out of
+    /// the product entirely: the write transaction supplies the durable
+    /// collection epoch, a deduplicating put refreshes an object's age so
+    /// "old" means "unused", and the sweep drops the collecting process's
+    /// cached copies. Both paths report reachability from
+    /// [`reachable_closure`], so a plan and a sweep of the same repository
+    /// cannot disagree about how much of it is live.
     pub fn gc(&self, cap: &Cap, dry_run: bool, min_age_secs: u64) -> Result<GcReport> {
         self.check(cap, Op::Read, None)?;
         // A ref-scoped cap sees a filtered ref list, and a filtered root set is
@@ -253,20 +249,24 @@ impl Forge {
             ));
         }
         if !dry_run {
+            // Reached only when the operator named no mode at all: the CLI
+            // routes `--collect` to `gc_collect`. This used to answer
+            // "collection is not implemented", which stopped being true when
+            // `gc_collect` landed and stayed on screen for every release
+            // after -- while `gc --help` advertised `--collect` and CLI_ABI.md
+            // documented it. Exit 1 was and is right, which is exactly why the
+            // exit-code conformance suite could not catch the lie.
             return Err(Error::Invalid(
-                "gc supports --dry-run only; collection is not implemented (see docs/GC.md)".into(),
+                "gc needs a mode: --dry-run to plan, or --collect to reclaim (see docs/GC.md)"
+                    .into(),
             ));
         }
 
         let mut unnamed_files = 0usize;
         let scanned = scan_objects(&self.store.root(), &mut unnamed_files)?;
 
-        let mut roots = GcRootCounts::default();
-        let mut queue = GraphWorkQueue::default();
-        schedule_catalog_roots(&self.store.meta.gc_roots()?, &mut roots, &mut queue)?;
-
         let mut reachable = HashSet::new();
-        walk(self, queue, &mut reachable)?;
+        let roots = reachable_closure(self, &self.store.meta.gc_roots()?, &mut reachable)?;
 
         let min_age = Duration::from_secs(min_age_secs);
         let mut report = GcReport {
@@ -399,12 +399,8 @@ impl Forge {
         // Pass one, unlocked. This is the expensive walk, and it exists only
         // to shrink the work the write transaction has to do; nothing is
         // decided here.
-        let mut warm = GcRootCounts::default();
-        let mut queue = GraphWorkQueue::default();
-        let first_roots = self.store.meta.gc_roots()?;
-        schedule_catalog_roots(&first_roots, &mut warm, &mut queue)?;
         let mut reachable = HashSet::new();
-        walk(self, queue, &mut reachable)?;
+        let _warm = reachable_closure(self, &self.store.meta.gc_roots()?, &mut reachable)?;
         let shortlist: Vec<&ScannedObject> = scanned
             .iter()
             .filter(|object| !reachable.contains(&object.id))
@@ -418,16 +414,24 @@ impl Forge {
         // pass one reached and pass two would not is kept, never swept.
         let min_age = Duration::from_secs(min_age_secs);
         self.store.meta.gc_sweep(|sweep| {
-            let mut roots = GcRootCounts::default();
-            let mut queue = GraphWorkQueue::default();
-            schedule_catalog_roots(&sweep.roots()?, &mut roots, &mut queue)?;
-            walk(self, queue, &mut reachable)?;
+            let roots = reachable_closure(self, &sweep.roots()?, &mut reachable)?;
+            // The answer to "how much of this repository is reachable", fixed
+            // here, where it means the same thing it means in `gc`: what the
+            // root walk proved live. Below, `reachable` stops being that set
+            // and becomes the sweep's protection set -- it grows to cover
+            // withheld and batch-limited garbage so their children are not
+            // unlinked. Reporting its size after that growth is what made
+            // `--collect` say `16 of 16 objects reachable` beside `withheld: 2`
+            // for a repository whose `--dry-run` had just said 14 of 16: two
+            // unreachable objects, reported as reachable, on the one path that
+            // deletes (issue #356).
+            let reachable_objects = reachable.len();
 
             let mut report = GcReport {
                 dry_run: false,
                 min_age_secs,
                 roots,
-                reachable_objects: reachable.len(),
+                reachable_objects,
                 scanned_objects: scanned.len(),
                 collectable_objects: 0,
                 collectable_bytes: 0,
@@ -507,8 +511,13 @@ impl Forge {
             // a crash, and there is nothing left to protect down that edge.
             // The root walk above is the one that must fail closed, and it
             // already did.
+            // From here `reachable` is the PROTECTION set, not the reachable
+            // set: it is deliberately widened past the root closure so that
+            // nothing a survivor names is unlinked. `report.reachable_objects`
+            // is not touched again -- it already holds what the root walk
+            // proved, which is the same quantity `gc` reports for the same
+            // repository.
             protect_from_survivors(self, &spared, &mut reachable);
-            report.reachable_objects = reachable.len();
 
             for (object, size) in &doomed {
                 if reachable.contains(&object.id) {
@@ -543,6 +552,26 @@ impl Forge {
             Ok(report)
         })
     }
+}
+
+/// Reachability from one consistent catalog snapshot: the root census, and
+/// every object id the walk proves live.
+///
+/// `gc` and `gc_collect` both report the number this produces, so neither can
+/// state a reachability the other would contradict for the same repository.
+/// Sharing the computation is the point: the two paths previously each did
+/// their own bookkeeping, and the sweep's arithmetic drifted into counting
+/// withheld garbage as reachable (issue #356).
+fn reachable_closure(
+    forge: &Forge,
+    catalog: &GcCatalogRoots,
+    reachable: &mut HashSet<ObjectId>,
+) -> Result<GcRootCounts> {
+    let mut counts = GcRootCounts::default();
+    let mut queue = GraphWorkQueue::default();
+    schedule_catalog_roots(catalog, &mut counts, &mut queue)?;
+    walk(forge, queue, reachable)?;
+    Ok(counts)
 }
 
 /// Turn one consistent catalog snapshot into the reclamation root set.

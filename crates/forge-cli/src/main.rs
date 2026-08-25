@@ -539,8 +539,9 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
                     ))
                 }
                 (_, true) => f.gc_collect(cap, min_age_secs)?,
-                // `gc` with neither flag still refuses, with the diagnostic
-                // that has always pointed at docs/GC.md.
+                // `gc` with neither flag still refuses -- with a diagnostic that
+                // names both modes, rather than the "collection is not
+                // implemented" it carried from #12 to #356.
                 (dry_run, false) => f.gc(cap, dry_run, min_age_secs)?,
             };
             if json {
@@ -607,6 +608,27 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             println!("{}", f.show(cap, &spec)?);
         }
         Cmd::Fsck { full, json } => {
+            // `--json` promises a document for every outcome this command
+            // has, and #348 turned "this catalog is from an older release"
+            // from a rare outcome into a routine one. It used to produce an
+            // empty stdout, a paragraph of English on stderr and exit 1, so
+            // the one consumer that most needs to tell "not audited" from
+            // "audited and clean" -- a script -- was the only one given
+            // nothing to read (issue #356). It gets a refusal document
+            // instead, distinguishable from a report by its `schema` field
+            // and its absence of counters, on stdout where its report would
+            // have been. The exit code does not move: this is still exit 1,
+            // the same refusal, said in the format that was asked for.
+            if json {
+                if let Some(refusal) = f.fsck_refusal(cap, full)? {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&refusal)
+                            .map_err(|e| Error::Internal(e.to_string()))?
+                    );
+                    return Err(Error::Invalid(refusal.detail));
+                }
+            }
             let report = f.fsck(cap, full)?;
             if json {
                 println!(

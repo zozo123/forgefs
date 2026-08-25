@@ -19,7 +19,7 @@ pub use bench::{
     merge_all_and_seal, private_checkins, run as run_bench, shared_stampede, BenchReport,
 };
 pub use export::ExportOptions;
-pub use fsck::{FsckFinding, FsckReport};
+pub use fsck::{FsckFinding, FsckRefusal, FsckRefusalReason, FsckReport, FSCK_REFUSAL_SCHEMA};
 pub use gc::{
     GcReport, GcRootCounts, DEFAULT_MIN_AGE_SECS, GC_COLLECT_MIN_AGE_FLOOR, GC_SAMPLE_LIMIT,
 };

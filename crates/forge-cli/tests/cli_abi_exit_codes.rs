@@ -257,6 +257,39 @@ fn an_unmigrated_catalog_is_an_input_error_not_corruption() {
         );
     }
 
+    // Issue #356. #348 made this refusal the routine answer for every
+    // repository written by an older release, and `--json` answered it with an
+    // empty stdout and a paragraph of English on stderr -- the one consumer
+    // that cannot read English got nothing at all. The exit code does not
+    // move; the refusal is simply also said in the format that was asked for.
+    let out = authed(&r)
+        .args(["fsck", "--full", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "--json must emit a document even when it refuses to audit: {e}; stdout was {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(doc["schema"], "forgefs.fsck-refusal/1", "{doc}");
+    assert_eq!(doc["audited"], false, "{doc}");
+    assert_eq!(doc["reason"], "schema_needs_migration", "{doc}");
+    assert_eq!(doc["schema_version"], 2, "{doc}");
+    assert!(
+        doc["supported_schema_version"].as_i64().unwrap() > 2,
+        "{doc}"
+    );
+    // A refusal must not be readable as a report. `ok` is the field a script
+    // branches on, and a report always carries counters; this carries neither.
+    for absent in ["ok", "checked_objects", "checked_refs", "findings"] {
+        assert!(
+            doc.get(absent).is_none(),
+            "a refusal must not look like an audit that found nothing: {absent} in {doc}"
+        );
+    }
+
     // One read-write open migrates it, and only then is the audit meaningful.
     assert_eq!(code(authed(&r).arg("refs")), 0);
     assert_eq!(code(authed(&r).args(["fsck", "--full"])), 0);

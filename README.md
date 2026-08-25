@@ -442,6 +442,17 @@ used to demand `python3` for JSON shaping alone and refuse up front with exit **
 [`CLI_ABI.md`](CLI_ABI.md) reserves for corruption, on a base Debian image (issue #346). JSON is
 shaped by `scripts/json-lib.sh` now, and a genuinely missing prerequisite exits **3**, naming it.
 
+That sentence used to be a claim; it is now a check. It was also false: `grep` is its own package,
+not part of coreutils, and one `grep -Eq` in the gate turned a machine without it into
+`gate: FAIL gate/conflict-object` and `"ok": false` — a missing **tool** reported as a failing
+**product** (issue #354). The match is done in awk now, and
+[`scripts/prereq-lib.sh`](scripts/prereq-lib.sh) names every command the gates may run, verifies
+them before the first assertion, and converts an *undeclared* command that a script reaches for
+anyway into the same exit **3** at the point of use — so no absent tool can ever disprove anything
+about `forge`. The list is enforced by running both gates on a PATH built from it and nothing else
+(`crates/forge-cli/tests/gate_scripts_need_no_interpreter.rs`), which is the only way to tell a true
+declaration from an aspirational one.
+
 ```bash
 bash scripts/release-gate.sh target/release/forge
 ```
