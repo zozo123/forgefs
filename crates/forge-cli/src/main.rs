@@ -129,11 +129,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AbandonCmd,
     },
-    /// Report what garbage collection would reclaim. Never deletes.
+    /// Report what garbage collection would reclaim, or reclaim it.
     Gc {
-        /// Required. Collection is not implemented; see docs/GC.md.
+        /// Report only. Exactly one of --dry-run and --collect is required.
         #[arg(long)]
         dry_run: bool,
+        /// Unlink unreachable objects. See docs/GC.md for the invariant this
+        /// preserves and the one precondition it cannot prove.
+        #[arg(long)]
+        collect: bool,
         /// Unreachable objects younger than this are withheld, because an
         /// object is durable before the catalog row that roots it (I4).
         #[arg(long, default_value_t = forge_api::DEFAULT_MIN_AGE_SECS)]
@@ -538,10 +542,21 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
         }
         Cmd::Gc {
             dry_run,
+            collect,
             min_age_secs,
             json,
         } => {
-            let report = f.gc(cap, dry_run, min_age_secs)?;
+            let report = match (dry_run, collect) {
+                (true, true) => {
+                    return Err(Error::Invalid(
+                        "gc takes --dry-run or --collect, never both".into(),
+                    ))
+                }
+                (_, true) => f.gc_collect(cap, min_age_secs)?,
+                // `gc` with neither flag still refuses, with the diagnostic
+                // that has always pointed at docs/GC.md.
+                (dry_run, false) => f.gc(cap, dry_run, min_age_secs)?,
+            };
             if json {
                 println!(
                     "{}",

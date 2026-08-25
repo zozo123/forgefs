@@ -199,6 +199,234 @@ const CATALOG_TABLES: &[(&str, &[&str])] = &[
     ("schema_migrations", MIGRATION_COLUMNS),
 ];
 
+/// Every catalog row a reclamation root can come out of, read as one
+/// consistent snapshot.
+///
+/// `gc` needs the whole root set to come from a single point in time: a root
+/// set stitched together from several reads is a root set that can miss a ref
+/// published between two of them, and a missed root is deleted data. Both
+/// readers below produce this from one connection, and the sweeping one
+/// produces it from inside the write transaction that unlinks (I23).
+///
+/// The rows are raw on purpose. What a mount spec or an observation kind
+/// *means* is `forge-api`'s to decide; the catalog's job is to hand over
+/// exactly what it stores.
+#[derive(Clone, Debug, Default)]
+pub struct GcCatalogRoots {
+    /// `(name, kind, oid)` for every row in `refs`, unresolved forks included.
+    pub refs: Vec<(String, String, ObjectId)>,
+    /// `(namespace, pinned oid)` -- I8's pinned base, reachable by definition.
+    pub pins: Vec<(String, ObjectId)>,
+    /// Namespaces naming a live ref. The ref pass already rooted it; this is
+    /// reported so an operator can see the shape of the root set.
+    pub live_refs: usize,
+    /// `(namespace, path, spec, base oid)` for every mount. `base_oid` is the
+    /// read-write mount's own pin (I19) and NULL for a read-only mount, which
+    /// resolves live and roots nothing of its own.
+    pub mounts: Vec<(String, String, String, Option<ObjectId>)>,
+    /// `(namespace, path, blob oid)` for every staged overlay entry.
+    pub overlay: Vec<(String, String, ObjectId)>,
+    /// `(namespace, path, kind, oid)` for every observation that named bytes.
+    pub observations: Vec<(String, String, String, ObjectId)>,
+    /// `(oid, kind)` for every landmark.
+    pub landmarks: Vec<(ObjectId, String)>,
+    /// `(tag, snapshot, commit, tree)` for every sealed release.
+    pub seals: Vec<(String, ObjectId, ObjectId, ObjectId)>,
+}
+
+fn read_gc_roots(conn: &Connection) -> Result<GcCatalogRoots> {
+    let mut out = GcCatalogRoots::default();
+    {
+        let mut stmt = conn
+            .prepare("SELECT name, kind, oid FROM refs ORDER BY name")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (name, kind, oid) = row.map_err(map_sql)?;
+            out.refs.push((name, kind, oid_from_blob(oid)?));
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, pinned_oid, live_ref FROM namespaces ORDER BY id")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<Vec<u8>>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (id, pinned, live_ref) = row.map_err(map_sql)?;
+            if let Some(pinned) = pinned {
+                out.pins.push((id, oid_from_blob(pinned)?));
+            }
+            if live_ref.is_some() {
+                out.live_refs += 1;
+            }
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT ns_id, path, spec, base_oid FROM mounts ORDER BY ns_id, path")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (ns_id, path, spec, base) = row.map_err(map_sql)?;
+            let base = match base {
+                Some(bytes) => Some(oid_from_blob(bytes)?),
+                None => None,
+            };
+            out.mounts.push((ns_id, path, spec, base));
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ns_id, path, blob_oid FROM overlay WHERE blob_oid IS NOT NULL \
+                 ORDER BY ns_id, mount, path",
+            )
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (ns, path, oid) = row.map_err(map_sql)?;
+            out.overlay.push((ns, path, oid_from_blob(oid)?));
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ns_id, path, kind, oid FROM observations WHERE oid IS NOT NULL \
+                 ORDER BY ns_id, mount, path",
+            )
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (ns, path, kind, oid) = row.map_err(map_sql)?;
+            out.observations.push((ns, path, kind, oid_from_blob(oid)?));
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT oid, kind FROM landmarks ORDER BY oid")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (oid, kind) = row.map_err(map_sql)?;
+            out.landmarks.push((oid_from_blob(oid)?, kind));
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT tag, snap_oid, commit_oid, tree_oid FROM seals ORDER BY tag")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (tag, snap, commit, tree) = row.map_err(map_sql)?;
+            out.seals.push((
+                tag,
+                oid_from_blob(snap)?,
+                oid_from_blob(commit)?,
+                oid_from_blob(tree)?,
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The catalog side of a reclamation sweep, scoped to one write transaction.
+///
+/// The transaction is `BEGIN IMMEDIATE`, which is the *cross-process* write
+/// lock every root publication already commits under, not merely this
+/// process's write mutex. While a `GcSweepTxn` is alive no ref can be CASed,
+/// no pin set, no overlay entry staged and no seal committed -- by this
+/// process or any other. That is the durable collection epoch `docs/GC.md`
+/// asked for: roots read through this handle cannot change under the sweep,
+/// and the unlinks commit or roll back with the catalog rows that describe
+/// them (I23).
+pub struct GcSweepTxn<'a> {
+    tx: rusqlite::Transaction<'a>,
+}
+
+impl GcSweepTxn<'_> {
+    /// The root set, read inside the sweep's own transaction.
+    pub fn roots(&self) -> Result<GcCatalogRoots> {
+        read_gc_roots(&self.tx)
+    }
+
+    /// Drop every catalog row that names a swept object.
+    ///
+    /// `object_intro` is a root for `fsck --full` in both its columns, so a
+    /// collector that unlinks bytes and leaves the provenance rows behind
+    /// converts reclaimed space into reported corruption. Removing them in the
+    /// sweep's transaction makes the two facts commit together (I6, I23).
+    pub fn forget_object(&self, oid: ObjectId) -> Result<usize> {
+        let bytes = oid.as_bytes();
+        let mut removed = self
+            .tx
+            .execute("DELETE FROM object_intro WHERE oid=?1", [bytes.as_slice()])
+            .map_err(map_sql)?;
+        removed += self
+            .tx
+            .execute(
+                "DELETE FROM object_intro WHERE commit_oid=?1",
+                [bytes.as_slice()],
+            )
+            .map_err(map_sql)?;
+        Ok(removed)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MountRow {
     pub path: String,
@@ -4050,6 +4278,50 @@ impl Meta {
                 oid_from_blob(tree)?,
             ));
         }
+        Ok(out)
+    }
+
+    /// The reclamation root set, read from one pooled read connection.
+    ///
+    /// This is the reporting path (`gc --dry-run`). It sees a consistent
+    /// snapshot but holds no write lock, so a root published after it returns
+    /// is invisible to it -- which is why nothing may be deleted on the
+    /// strength of it. [`Self::gc_sweep`] is the deleting path.
+    pub fn gc_roots(&self) -> Result<GcCatalogRoots> {
+        let conn = self.read_conn();
+        read_gc_roots(&conn)
+    }
+
+    /// Run `body` inside the catalog write transaction a sweep must hold.
+    ///
+    /// The whole point is the exclusion: `BEGIN IMMEDIATE` is the same
+    /// cross-process lock `cas_ref`, `set_pin`, `overlay_upsert` and
+    /// `commit_seal` take, so mark and publish cannot interleave. `body`
+    /// therefore MUST NOT call back into any other `Meta` method: those take
+    /// the write mutex or a pooled read connection that can fall back to it,
+    /// and this transaction already holds it. Read roots through
+    /// [`GcSweepTxn::roots`] instead.
+    ///
+    /// An error from `body` rolls the transaction back, so a sweep that aborts
+    /// half way leaves the catalog exactly as it found it. It cannot unlink
+    /// bytes back, which is why the caller unlinks only after it has proved
+    /// the object unreachable inside this transaction.
+    pub fn gc_sweep<T>(&self, body: impl FnOnce(&GcSweepTxn<'_>) -> Result<T>) -> Result<T> {
+        if self.read_only {
+            return Err(Error::Denied(
+                "repository is open read-only; collection may not unlink objects".into(),
+            ));
+        }
+        let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
+        let sweep = GcSweepTxn { tx };
+        let out = body(&sweep)?;
+        sweep
+            .tx
+            .commit()
+            .map_err(|error| self.map_sql_counted(error))?;
+        txn_timer.finish();
         Ok(out)
     }
 

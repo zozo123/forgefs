@@ -1,5 +1,6 @@
-//! #326 / I19 at the CLI boundary: `forge checkin` publishes the mount it is
-//! given and refuses, with exit 1 per CLI_ABI.md, while the session holds
+//! #326 / I22 at the CLI boundary: `forge checkin` publishes the mount it is
+//! given, and when it has nothing of its own to publish it refuses -- exit 1
+//! per CLI_ABI.md -- rather than reporting `noop`, while the session holds
 //! staged work under any other mount. The refusal is the same answer
 //! `forge abandon session` already gives, so the two verbs cannot strand an
 //! agent between "nothing to do" and "you still have work".
