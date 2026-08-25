@@ -396,6 +396,7 @@ dependencies = [
  "forge-cap",
  "forge-types",
  "libc",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

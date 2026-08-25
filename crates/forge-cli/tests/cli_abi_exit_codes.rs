@@ -4,6 +4,7 @@
 //! caller controls may produce it -- and clap's own default code 2 must never
 //! be mistaken for corruption.
 
+use rusqlite::Connection;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -186,4 +187,77 @@ fn duplicate_names_are_input_errors_and_a_frozen_tag_is_sealed_state() {
     assert_eq!(seal(), 0);
     // A frozen tag is sealed state, which CLI_ABI.md classes as 2.
     assert_eq!(seal(), 2);
+}
+
+/// Issue #348: exit 2 means corruption, so a healthy repository from an older
+/// release must never receive it. `fsck --full` is the command a careful
+/// operator runs *before* deciding to upgrade, and it is the only read-only
+/// command that opens through the ledger-deferred path, so it was the only one
+/// that got this wrong: `verify` and reachable `fsck` already exit 1 here.
+#[test]
+fn an_unmigrated_catalog_is_an_input_error_not_corruption() {
+    let d = tempdir().unwrap();
+    let r = d.path().join("r");
+    init(&r);
+
+    // Give the repository real content, then put its catalog back into the
+    // schema-2 shape v0.2.1 wrote: the ledger stops at 2 and `mounts` has no
+    // `base_oid` column. Not one object file changes.
+    let ns = String::from_utf8(
+        authed(&r)
+            .args(["session", "open", "--from=main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(authed(&r)
+        .args(["write", "--ns", &ns, "/kept.txt", "--text", "kept"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(authed(&r)
+        .args(["checkin", "--ns", &ns, "-m", "fixture"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let conn = Connection::open(r.join(".forge/meta.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE mounts_v2 (
+           ns_id TEXT NOT NULL,
+           path  TEXT NOT NULL,
+           spec  TEXT NOT NULL,
+           mode  TEXT NOT NULL CHECK(mode IN ('ro','rw')),
+           PRIMARY KEY (ns_id, path)
+         );
+         INSERT INTO mounts_v2 (ns_id, path, spec, mode)
+           SELECT ns_id, path, spec, mode FROM mounts;
+         DROP TABLE mounts;
+         ALTER TABLE mounts_v2 RENAME TO mounts;
+         DELETE FROM schema_migrations WHERE version > 2;",
+    )
+    .unwrap();
+    drop(conn);
+
+    for argv in [
+        vec!["fsck", "--full"],
+        vec!["fsck", "--full", "--json"],
+        vec!["fsck"],
+        vec!["verify", "whatever"],
+    ] {
+        let got = code(authed(&r).args(&argv));
+        assert_eq!(
+            got, 1,
+            "an intact un-migrated repository is not corrupt: {argv:?} exited {got}"
+        );
+    }
+
+    // One read-write open migrates it, and only then is the audit meaningful.
+    assert_eq!(code(authed(&r).arg("refs")), 0);
+    assert_eq!(code(authed(&r).args(["fsck", "--full"])), 0);
 }

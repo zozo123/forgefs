@@ -63,7 +63,7 @@ not diluted into a mock:
 | I23 | `forge-api/gc.rs` (`gc_collect`, `schedule_catalog_roots`), `forge-store/meta.rs` (`gc_sweep`, `GcCatalogRoots`), `forge-store/blob.rs` (`refresh_dedup_mtime`) | `gc_collect_concurrent.rs`, `gc_collect.rs`, `gc_and_abandon.rs`, `cache_trust.rs`, `docs/GC.md` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs`, `rename_characterisation.rs`, `property_merge_symmetry.rs` |
 | I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs`, `property_attenuation.rs`, `fuzz/cap_token` |
-| I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs` |
+| I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs`, `fsck_unmigrated_catalog.rs` |
 | I16 | `forge-core/tree.rs`, `forge-api/export.rs` | `path_identity.rs`, `export_long_names.rs`, `export_name_collisions.rs`, `fuzz/tar_roundtrip` |
 
 Tests are named after these IDs or state the invariant in a one-line rationale.
