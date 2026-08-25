@@ -6,15 +6,16 @@ pub mod meta;
 mod metrics;
 pub mod objectstore;
 
-pub use blob::{LocalBlobStore, PublishBatch};
+pub use blob::{GcObjectGuard, LocalBlobStore, PublishBatch};
 pub use graph::{
     decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, GraphWorkQueue,
     VerifiedGraphObject, MAX_GRAPH_OBJECTS,
 };
 pub use meta::{
     sanitize_agent, validate_ref_kind, validate_ref_name, AbandonedSession, CatalogAudit,
-    CatalogObjectExpectation, CheckpointResult, DurabilityPolicy, Meta, MetaStats, MountRow, NsRow,
-    Observed, OverlayRow, RetiredRef, ABANDONABLE_PREFIX, CURRENT_SCHEMA_VERSION, REFLOG_ABANDON,
+    CatalogObjectExpectation, CheckpointResult, DurabilityPolicy, GcCatalogRoots, GcSweepTxn, Meta,
+    MetaStats, MountRow, NsRow, Observed, OverlayRow, RetiredRef, ABANDONABLE_PREFIX,
+    CURRENT_SCHEMA_VERSION, REFLOG_ABANDON,
 };
 pub use objectstore::{DurabilityClass, ObjectBatch, ObjectStore};
 
@@ -290,6 +291,16 @@ impl Store {
     /// Detection-only open used by fsck. It is byte-for-byte read-only like
     /// `open_read_only`, but lets the catalog auditor report a damaged schema
     /// ledger rather than rejecting it before fsck can produce a finding.
+    /// Take the object plane's reclamation lock exclusively for the lifetime
+    /// of the guard, so a sweep's age check and its unlink are one decision.
+    ///
+    /// Local-backend only, like the object enumeration `gc` and `fsck` already
+    /// do directly; `objectstore.rs` names that surface rather than pretending
+    /// the trait covers it.
+    pub fn gc_exclusive_objects(&self) -> Result<GcObjectGuard> {
+        self.blobs.gc_exclusive()
+    }
+
     pub fn open_read_only_for_fsck(root: &Path) -> Result<Self> {
         let blobs = LocalBlobStore::open_read_only(root.to_path_buf())?;
         let meta = Meta::open_read_only_for_fsck(&root.join("meta.sqlite"))?;
@@ -329,6 +340,19 @@ impl<O: ObjectStore> Store<O> {
     /// Trust-boundary read: always hits durable bytes and re-hashes (I15).
     pub fn get_raw_verified(&self, id: ObjectId) -> Result<Vec<u8>> {
         self.blobs.get(id)
+    }
+
+    /// Drop every cached copy of `id`.
+    ///
+    /// The hot LRU caches assume immutability, which is true of an object's
+    /// bytes and false of its *existence*: after a collector unlinks an
+    /// object, `get_raw` in the collecting process would keep serving it from
+    /// memory, which hides exactly the bug a collector must not have. The
+    /// sweep calls this on every object it unlinks so absence is observable in
+    /// the process that caused it, not only after a cold reopen (I19).
+    pub fn forget_cached(&self, id: ObjectId) {
+        self.trees.lock().pop(&id);
+        self.blob_cache.lock().pop(&id);
     }
 
     /// Publish `data` as a Blob without copying it. The published bytes are

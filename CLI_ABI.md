@@ -62,13 +62,21 @@ Neither verb introduces an exit code. Both map onto the table above:
 | ref is protected, or the capability may not write it | 1 |
 | ref is sealed | 2 |
 | `gc --dry-run` produced a report | 0 |
-| `gc` without `--dry-run`, or `gc` under a ref-scoped capability | 1 |
+| `gc --collect` reclaimed (possibly zero) objects | 0 |
+| `gc` with neither `--dry-run` nor `--collect`, or with both | 1 |
+| `gc --collect --min-age-secs` below the hard floor | 1 |
+| `gc` under a ref-scoped capability | 1 |
 | `gc` could not prove reachability because an object is unreadable or does not decode | 2 |
 
-`forge gc` **never deletes**. Collection is unimplemented and `--dry-run` is
-mandatory, so automation can call it on a schedule today and get a plan, not a
-mutation. `docs/GC.md` states the root set and what a safe collector still
-needs.
+`forge gc --dry-run` **never deletes** and is the reporting half. `forge gc
+--collect` is the reclaiming half: it unlinks unreachable objects and removes
+the catalog rows that named them. Exactly one of the two flags is required, so
+a bare `forge gc` still exits 1 with the diagnostic pointing at `docs/GC.md`,
+and no invocation deletes anything by default. `--min-age-secs` is refused
+below its hard floor rather than quietly raised, because that floor is the only
+bound ForgeFS has on the window between a writer's put and the transaction that
+names it. `docs/GC.md` states the root set, the invariant collection preserves
+(I19) and the one precondition it cannot prove for itself.
 
 `forge gc --json` writes one JSON object to stdout. It is not part of the
 `forge stats --json` contract above and carries no `schema_version`; consumers

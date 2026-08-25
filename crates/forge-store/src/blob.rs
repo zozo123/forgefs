@@ -14,6 +14,121 @@ use std::sync::{
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// The name of the lock that serialises a deduplicating put against a sweep.
+///
+/// It lives in `tmp/` because that is the one repository directory with no
+/// layout contract: `objects/` is asserted shard-by-shard by `fsck`, and
+/// `cleanup_stale_tmp` only reclaims tmp entries whose name is a ULID, so a
+/// dotfile here is neither corruption nor litter.
+const GC_LOCK_NAME: &str = ".gc-lock";
+
+/// Outcome of refreshing a deduplicated object's age.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refreshed {
+    /// The object is present and its age now reads as "just relied upon".
+    Yes,
+    /// The object was gone by the time we held the lock. A collector unlinked
+    /// it, and the caller must republish the bytes rather than name absent
+    /// ones.
+    Vanished,
+}
+
+/// Open the reclamation lock. Created on demand; only write paths reach here.
+fn open_gc_lock(root: &Path) -> Result<fs::File> {
+    let tmp = root.join("tmp");
+    // A fresh descriptor per acquisition is deliberate: `flock` locks are held
+    // per open file description, so a cached descriptor shared between threads
+    // would let a sweep and a publisher in the same process "both" hold the
+    // lock by converting it.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(tmp.join(GC_LOCK_NAME))
+        .map_err(|e| Error::Io(format!("cannot open the reclamation lock: {e}")))
+}
+
+fn flock(file: &fs::File, operation: i32, what: &str) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `file` owns a valid descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(Error::Io(format!("{what}: {error}")));
+    }
+    Ok(())
+}
+
+/// Exclusion held by a sweep while it decides and unlinks.
+///
+/// While this is alive no deduplicating put anywhere -- this process or another
+/// -- can refresh an object's age, and therefore no put can pass the "these
+/// bytes are already here, I need not write them" branch. That is what makes
+/// the sweep's age check and its unlink one indivisible decision instead of
+/// two syscalls with a race between them (I19).
+pub struct GcObjectGuard {
+    _file: fs::File,
+}
+
+/// A deduplicating publication refreshes the object's modification time,
+/// under the reclamation lock.
+///
+/// This is the barrier content addressing makes necessary. I3 says a put whose
+/// bytes already exist never rewrites them, so a writer that legitimately
+/// reproduces an object's bytes and is about to name it from a ref leaves that
+/// object looking arbitrarily old on disk. `gc`'s grace floor is expressed in
+/// object age, so without this the floor bounds nothing for exactly the
+/// objects most at risk of being swept out from under a live writer. After
+/// this call an object's age reads as "time since a writer last relied on
+/// these bytes", which is the quantity the floor has to bound (I19).
+///
+/// The shared lock is what makes it airtight rather than merely likely. A
+/// sweep holds the same lock exclusively, so this refresh either happens
+/// entirely before the sweep read the age -- in which case the sweep sees a
+/// young object and withholds it -- or entirely after the sweep finished, in
+/// which case the object is either still there or already gone and reported as
+/// [`Refreshed::Vanished`]. There is no interleaving in which a sweep reads an
+/// old age and unlinks bytes a publisher has just joined.
+///
+/// Any other failure is fatal to the put. A publisher that cannot refresh the
+/// age of an object it is about to name cannot prove that object will survive
+/// a concurrent collection, so it refuses rather than publishing a name over
+/// bytes a sweep is entitled to delete.
+fn refresh_dedup_mtime(root: &Path, path: &Path) -> Result<Refreshed> {
+    use std::os::unix::ffi::OsStrExt;
+    let lock = open_gc_lock(root)?;
+    flock(&lock, libc::LOCK_SH, "cannot share the reclamation lock")?;
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| Error::Io(format!("object path is not a C string: {e}")))?;
+    // atime is deliberately left alone: it is not a liveness signal and
+    // touching it would fight `relatime` for no benefit.
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        },
+    ];
+    // SAFETY: `raw` is a valid NUL-terminated path and `times` is a
+    // two-element array of the layout utimensat documents.
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(Refreshed::Yes);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Ok(Refreshed::Vanished);
+    }
+    Err(Error::Io(format!(
+        "cannot refresh the age of deduplicated object {}: {error}; publishing a ref over bytes \
+         whose age cannot be refreshed would expose them to collection (I19)",
+        path.display()
+    )))
+}
+
 const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
 const DURABLE_DIR_CACHE_CAPACITY: usize = 65_536;
 const DURABLE_OID_CACHE_CAPACITY: usize = 65_536;
@@ -212,6 +327,17 @@ impl LocalBlobStore {
         self.object_path(id).exists()
     }
 
+    /// Take the reclamation lock exclusively for the lifetime of the guard.
+    ///
+    /// A sweep holds this while it reads a candidate's age and unlinks it, so
+    /// no deduplicating put can slip between the two. See
+    /// [`refresh_dedup_mtime`].
+    pub fn gc_exclusive(&self) -> Result<GcObjectGuard> {
+        let file = open_gc_lock(&self.root)?;
+        flock(&file, libc::LOCK_EX, "cannot take the reclamation lock")?;
+        Ok(GcObjectGuard { _file: file })
+    }
+
     pub fn stats(&self) -> BlobStoreStats {
         let fsync_file = self.stats.fsync_file.snapshot();
         let fsync_dir = self.stats.fsync_dir.snapshot();
@@ -267,7 +393,11 @@ impl PublishBatch<'_> {
             &self.store.durable_dirs,
         )?;
 
-        if dest.exists() {
+        // The age refresh comes first, because it is what decides whether this
+        // is a dedup at all: an object a sweep unlinked while we were looking
+        // at it is not "already here", and naming it would be the corruption
+        // this whole mechanism exists to prevent.
+        if dest.exists() && refresh_dedup_mtime(&self.store.root, &dest)? == Refreshed::Yes {
             if self.store.oid_is_durable(id) {
                 // Rehash at every trust boundary even when a process-local
                 // durability proof lets us avoid another physical barrier.
@@ -307,18 +437,33 @@ impl PublishBatch<'_> {
                 Ok(id)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || dest.exists() => {
-                let _ = fs::remove_file(&tmp);
-                if !self.store.oid_is_durable(id) {
-                    self.store.verify_and_sync_existing(id, &dest)?;
-                    self.dirs.insert(shard_b);
-                    self.oids.insert(id);
-                } else {
-                    self.store.verify_existing(id, &dest)?;
+                if refresh_dedup_mtime(&self.store.root, &dest)? == Refreshed::Yes {
+                    let _ = fs::remove_file(&tmp);
+                    if !self.store.oid_is_durable(id) {
+                        self.store.verify_and_sync_existing(id, &dest)?;
+                        self.dirs.insert(shard_b);
+                        self.oids.insert(id);
+                    } else {
+                        self.store.verify_existing(id, &dest)?;
+                    }
+                    self.new_dedup += 1;
+                    // Another publisher won after our existence check. Its file
+                    // and directory barriers may still be pending, so this batch
+                    // joins the proof unless another completed batch cached it.
+                    return Ok(id);
                 }
-                self.new_dedup += 1;
-                // Another publisher won after our existence check. Its file
-                // and directory barriers may still be pending, so this batch
-                // joins the proof unless another completed batch cached it.
+                // A sweep unlinked the object between our failed link and our
+                // refresh. Our tmp file still holds the exact bytes, so link
+                // them back rather than naming something that is not there.
+                if fs::hard_link(&tmp, &dest).is_ok() {
+                    self.new_puts += 1;
+                } else {
+                    self.store.verify_and_sync_existing(id, &dest)?;
+                    self.new_dedup += 1;
+                }
+                self.dirs.insert(shard_b);
+                self.oids.insert(id);
+                let _ = fs::remove_file(&tmp);
                 Ok(id)
             }
             Err(e) => {
