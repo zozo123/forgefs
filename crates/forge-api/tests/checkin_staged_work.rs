@@ -1,13 +1,15 @@
-//! #326 / I19: a checkin publishes everything the session has staged, or
-//! refuses and names what it would leave behind. It never reports success over
-//! work it did not fold.
+//! #326 / I22: `Noop` is the one checkin outcome that may never be said over
+//! work that exists. A checkin with nothing of its own to publish refuses and
+//! names what it would otherwise have denied; a checkin that DOES publish is
+//! progress and may leave another mount staged, because under I19 a session
+//! holds a pin per writable mount and drains them one `--mount` at a time.
 //!
 //! Written as the general property, not as the single reported case: every
 //! placement of staged work across a session's read-write mounts, crossed with
 //! every mount checkin can be asked to publish. The oracle is
 //! `abandon_session`, the verb that already counts overlay rows across the
-//! whole namespace. Whatever checkin answers, the two must agree on the one
-//! question they both ask -- does this session still hold staged work.
+//! whole namespace -- after the checkin, the two must agree on the one question
+//! they both ask: does this session still hold staged work.
 
 use forge_api::Forge;
 use forge_types::{CasResult, Error};
@@ -55,11 +57,12 @@ fn check_placement(staged: &[&str], checkin_mount: &str) {
             );
         }
         Ok(published) => {
-            assert_eq!(
-                staged.to_vec(),
-                vec![checkin_mount],
-                "{label}: checkin published {published:?} but the staged set was not exactly the \
-                 mount it folded"
+            // Progress. It must have folded its OWN mount's work -- publishing
+            // is not allowed to be a disguised no-op -- but it may leave other
+            // mounts staged: that is the I19 multi-mount drain, not data loss.
+            assert!(
+                staged.contains(&checkin_mount),
+                "{label}: checkin published {published:?} but its own mount staged nothing"
             );
             assert_eq!(
                 forge.read(&root, &ns, &staged_path(checkin_mount)).unwrap(),
@@ -68,6 +71,12 @@ fn check_placement(staged: &[&str], checkin_mount: &str) {
             );
         }
         Err(Error::Invalid(msg)) => {
+            // The refusal is scoped: it may only replace a `Noop`, so the named
+            // mount itself must have had nothing to publish.
+            assert!(
+                !staged.contains(&checkin_mount),
+                "{label}: checkin refused although its own mount had work to publish: {msg}"
+            );
             assert!(
                 !stranded.is_empty(),
                 "{label}: checkin refused with nothing staged outside its mount: {msg}"
@@ -82,17 +91,24 @@ fn check_placement(staged: &[&str], checkin_mount: &str) {
         Err(other) => panic!("{label}: unexpected checkin failure {other:?}"),
     }
 
-    // The property itself, stated once: checkin and abandon never disagree
-    // about whether the session still holds staged work. A checkin that
-    // succeeded published everything staged, so the session is retirable
-    // without the discard flag; one that failed left the work where abandon
-    // can still see it.
+    // The property itself, stated once: after the checkin, exactly the mounts
+    // it did not publish still hold work, and `abandon` agrees. A refusal
+    // published nothing, so every staged mount survives for abandon to see; a
+    // success cleared its own mount and left the rest. In particular a `Noop`
+    // -- which is only reachable when `stranded` is empty -- always leaves a
+    // session that retires without the discard flag, which is I22.
     let abandon = forge.abandon_session(&root, &ns, false);
     assert_eq!(
-        outcome.is_ok(),
+        stranded.is_empty(),
         abandon.is_ok(),
-        "{label}: checkin said {outcome:?} but abandon said {abandon:?}"
+        "{label}: checkin said {outcome:?}, {stranded:?} left staged, but abandon said {abandon:?}"
     );
+    if matches!(outcome, Ok(CasResult::Noop { .. })) {
+        assert!(
+            abandon.is_ok(),
+            "{label}: I22 -- checkin reported a no-op but abandon still saw staged work"
+        );
+    }
 }
 
 #[test]

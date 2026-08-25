@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS mounts (
   path  TEXT NOT NULL,
   spec  TEXT NOT NULL,
   mode  TEXT NOT NULL CHECK(mode IN ('ro','rw')),
-  PRIMARY KEY (ns_id, path)
+  base_oid BLOB,
+  PRIMARY KEY (ns_id, path),
+  CHECK(base_oid IS NULL OR length(base_oid)=32)
 );
 
 CREATE TABLE IF NOT EXISTS overlay (
@@ -122,7 +124,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// Reflog `reason` that retires a ref name for good. See `ref_retired`.
 pub const REFLOG_ABANDON: &str = "abandon";
@@ -156,9 +158,10 @@ const OBSERVATION_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' 
     AND typeof(path)='text' \
     AND ((kind='absent' AND oid IS NULL) \
          OR (kind IN ('blob','tree') AND typeof(oid)='blob'))";
-const MOUNT_COLUMNS: &[&str] = &["ns_id", "path", "spec", "mode"];
+const MOUNT_COLUMNS: &[&str] = &["ns_id", "path", "spec", "mode", "base_oid"];
 const MOUNT_VALUES: &str = "typeof(ns_id)='text' AND typeof(path)='text' \
-    AND typeof(spec)='text' AND typeof(mode)='text' AND mode IN ('ro','rw')";
+    AND typeof(spec)='text' AND typeof(mode)='text' AND mode IN ('ro','rw') \
+    AND typeof(base_oid) IN ('null','blob')";
 const OVERLAY_COLUMNS: &[&str] = &["ns_id", "mount", "path", "blob_oid", "exec"];
 const OVERLAY_VALUES: &str = "typeof(ns_id)='text' AND typeof(mount)='text' \
     AND typeof(path)='text' AND typeof(blob_oid) IN ('null','blob') \
@@ -201,6 +204,11 @@ pub struct MountRow {
     pub path: String,
     pub spec: String,
     pub mode: String,
+    /// I19: the commit this read-write mount is pinned to, recorded when the
+    /// mount was taken and re-recorded by every checkin that publishes it.
+    /// `None` for a read-only mount, which deliberately resolves live, and for
+    /// a raw `oid:` mount, whose spec already names immutable bytes.
+    pub base_oid: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +326,7 @@ pub struct CatalogMountRow {
     pub path: String,
     pub spec: String,
     pub mode: String,
+    pub base_oid: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -596,13 +605,134 @@ impl Deref for CatalogRead<'_> {
     }
 }
 
+/// One waiting catalog write, boxed so unrelated operations of unrelated
+/// result types can ride the same durable commit.
+///
+/// The closure runs against a transaction the *leader* opened, so it must
+/// never touch `Meta::write` itself: it is already held.
+type GroupOut = Box<dyn std::any::Any + Send>;
+type GroupJob = Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> Result<GroupOut> + Send>;
+
+struct PendingWrite {
+    job: GroupJob,
+    /// Capacity 1 and exactly one send, so a leader publishing a result can
+    /// never block on a waiter that has not polled yet.
+    reply: std::sync::mpsc::SyncSender<Result<GroupOut>>,
+}
+
+/// Group commit for the metadata catalog (issue #49).
+///
+/// # Why
+///
+/// Every catalog write is `BEGIN IMMEDIATE ... COMMIT` under
+/// `synchronous=FULL`, so SQLite fsyncs the WAL inside `COMMIT`, and `COMMIT`
+/// runs while the process-wide write mutex is held. Independent writers
+/// therefore pay one serialised barrier each and their fsyncs can never
+/// overlap. Concurrent fsyncs are cheap -- the kernel group-commits them --
+/// but the mutex denies them the chance.
+///
+/// # Mechanism
+///
+/// A writer enqueues its work and then competes for the write connection like
+/// before. Whoever wins is the leader: it drains every job queued so far, runs
+/// them in one `BEGIN IMMEDIATE ... COMMIT`, and publishes each result. A
+/// writer that loses the race finds its work already committed and returns.
+/// N waiting writers thus cost one WAL fsync instead of N, and the per-write
+/// barrier cost falls as concurrency rises instead of staying flat.
+///
+/// # Durability (I4, I6)
+///
+/// `synchronous=FULL` is untouched, and so is the single-writer path: with one
+/// writer a batch holds one job and the emitted SQL is what it always was. A
+/// waiter is told it succeeded only after the leader's `COMMIT` returned, and
+/// that `COMMIT` is the same fsyncing commit the writer used to perform
+/// itself. There is no window in which a caller has been told "ok" while its
+/// bytes are not yet on stable storage, because the answer is sent strictly
+/// after the barrier that covered it.
+///
+/// That is also the precise reason a waiter knows *its* transaction was in the
+/// fsync that completed: the leader owns both the job and its reply channel,
+/// executes the job inside the transaction it is about to commit, and sends on
+/// that channel only after `COMMIT` returned. Membership is never inferred
+/// from a sequence number, a timestamp, or a window -- it is the same object.
+/// A job that was not executed is still sitting in the queue and its caller is
+/// still waiting, so no reply can outrun its own barrier.
+///
+/// # Per-job atomicity
+///
+/// Each job runs inside its own `SAVEPOINT`. A job that fails is rolled back
+/// to its savepoint and only its caller sees the error; its batch-mates still
+/// commit. If `BEGIN`, `COMMIT`, or savepoint bookkeeping itself fails, the
+/// whole transaction rolls back and every member of the batch is told so,
+/// which is correct: nothing was applied.
+#[derive(Default)]
+struct CommitGroup {
+    pending: Mutex<std::collections::VecDeque<PendingWrite>>,
+}
+
+/// `Error` is deliberately not `Clone`, but one failed `BEGIN`/`COMMIT` has to
+/// be reported to every member of the batch. Reproduce the variant and its
+/// message rather than flattening distinct failures into one string type: the
+/// CLI maps variants to stable exit codes (`CLI_ABI.md`).
+/// Recover the concrete result a `run_grouped` caller queued.
+///
+/// The boxing is an implementation detail of sharing one transaction between
+/// unrelated operations; a mismatch here is a programming error in this file,
+/// never something a caller can provoke.
+/// `map_sql`, plus the contention counter, without needing `&Meta`: a queued
+/// group-commit job holds the counters directly and never the catalog.
+fn count_busy(stats: &MetaCounters, error: rusqlite::Error) -> Error {
+    let error = map_sql(error);
+    if matches!(error, Error::Busy(_)) {
+        stats.busy.fetch_add(1, Ordering::Relaxed);
+    }
+    error
+}
+
+fn downcast_group<T: 'static>(done: Result<GroupOut>) -> Result<T> {
+    done.and_then(|value| {
+        value
+            .downcast::<T>()
+            .map(|boxed| *boxed)
+            .map_err(|_| Error::Internal("catalog group commit result type".into()))
+    })
+}
+
+fn duplicate_error(error: &Error) -> Error {
+    match error {
+        Error::Denied(m) => Error::Denied(m.clone()),
+        Error::NotFound(m) => Error::NotFound(m.clone()),
+        Error::Sealed(m) => Error::Sealed(m.clone()),
+        Error::Invalid(m) => Error::Invalid(m.clone()),
+        Error::Corrupt(m) => Error::Corrupt(m.clone()),
+        Error::Busy(m) => Error::Busy(m.clone()),
+        Error::MergeConflict(oid) => Error::MergeConflict(*oid),
+        Error::StaleObservation {
+            path,
+            expected,
+            found,
+        } => Error::StaleObservation {
+            path: path.clone(),
+            expected: expected.clone(),
+            found: found.clone(),
+        },
+        Error::InvalidBase => Error::InvalidBase,
+        Error::Io(m) => Error::Io(m.clone()),
+        Error::Sqlite(m) => Error::Sqlite(m.clone()),
+        Error::Cap(m) => Error::Cap(m.clone()),
+        Error::Internal(m) => Error::Internal(m.clone()),
+    }
+}
+
 pub struct Meta {
     write: TimedMutex<Connection>,
     /// `None` for a read-only catalog: there is no writer to get out of the
     /// way of, and `open_read_only` may hold an `immutable=1` handle that a
     /// second plain read-only open could not reproduce.
     read: Option<ReadPool>,
-    stats: MetaCounters,
+    stats: Arc<MetaCounters>,
+    /// Waiting catalog writes that may share one durable commit (issue #49).
+    group: CommitGroup,
     durability: DurabilityPolicy,
     read_only: bool,
 }
@@ -853,6 +983,65 @@ INSERT INTO observations_v2 (ns_id, mount, path, kind, oid)
 DROP TABLE observations;
 ALTER TABLE observations_v2 RENAME TO observations;";
 
+/// Gives every read-write mount its own pinned base (I19).
+///
+/// Before v3 a session had one `namespaces.pinned_oid` and
+/// `Forge::session_mount_tree` served EVERY read-write `ref:` mount from it,
+/// whatever ref the mount named. What an existing read-write row means on
+/// upgrade is therefore not a free choice, and neither obvious answer is right:
+///
+/// * backfilling every read-write mount from `namespaces.pinned_oid` freezes
+///   that defect into the upgraded catalog -- a mount of `ref:other` would keep
+///   serving the session's base for the rest of its life;
+/// * leaving `base_oid` NULL and resolving live reintroduces #233 for every
+///   session open across the upgrade: a read would hit a ref another agent can
+///   move, and the observation it records could never match at checkin.
+///
+/// So the backfill is per mount, from the ref that mount actually names:
+///
+/// 1. A mount naming the session's OWN `live_ref` takes `namespaces.pinned_oid`
+///    verbatim. That is by construction the commit the live ref holds -- only
+///    this session's checkins move its private ref, and they move both together
+///    -- so this preserves the session's own base exactly instead of
+///    re-deriving it, and #233 stays fixed for the ordinary single-mount
+///    session, which is almost every session.
+/// 2. Any other read-write `ref:` mount takes that ref's CURRENT head. Under v2
+///    such a mount was serving a tree that did not come from the ref it named,
+///    so there is no honest older base to preserve; the head is the first value
+///    this mount has ever had that belongs to its own ref. The residual cost is
+///    bounded and loud, not silent: an observation recorded through such a
+///    mount before the upgrade fails the next checkin with `StaleObservation`
+///    naming that mount, and one re-read clears it, because after v3 the read
+///    and the check finally consult the same tree.
+/// 3. A read-write mount whose ref no longer exists keeps `base_oid` NULL.
+///    Reads through it fail closed with `NotFound`, which is what `fsck`
+///    already reports for it (`MOUNT_REF`); inventing a base for a ref that is
+///    gone would be worse.
+/// 4. A read-write `oid:` mount is demoted to `ro`. An immutable spec has no
+///    ref to advance, `checkin` refused it unconditionally, and `fsck` already
+///    reports it as `MOUNT_RW_OID` corruption, so v2 could accept a write no
+///    verb and no capability could ever publish. v3 refuses such a mount
+///    outright; demoting the stored row makes the upgraded catalog consistent
+///    with that rule. The demotion destroys nothing: an `oid:` mount serves the
+///    same frozen tree in either mode, any overlay staged under it stays
+///    readable (I18), and `abandon session --discard-staged` remains its exit,
+///    exactly as before the upgrade.
+///
+/// Mutable catalog rows only: no immutable object is read, written or rehashed
+/// here (I17).
+const MIGRATE_2_TO_3_BACKFILL: &str = "\
+UPDATE mounts SET base_oid = (
+  SELECT n.pinned_oid FROM namespaces n
+   WHERE n.id = mounts.ns_id AND n.live_ref IS NOT NULL
+     AND (mounts.spec = 'ref:' || n.live_ref OR mounts.spec = n.live_ref))
+ WHERE mode='rw' AND base_oid IS NULL;
+UPDATE mounts SET base_oid = (
+  SELECT r.oid FROM refs r
+   WHERE ('ref:' || r.name) = mounts.spec OR r.name = mounts.spec)
+ WHERE mode='rw' AND base_oid IS NULL;
+UPDATE mounts SET mode='ro'
+ WHERE mode='rw' AND base_oid IS NULL AND spec LIKE 'oid:%';";
+
 fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
     if from > CURRENT_SCHEMA_VERSION {
         return Err(Error::Invalid(format!(
@@ -882,6 +1071,7 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
         for step in first_step..CURRENT_SCHEMA_VERSION {
             match step {
                 1 => tx.execute_batch(MIGRATE_1_TO_2).map_err(map_sql)?,
+                2 => migrate_2_to_3(&tx)?,
                 _ => {
                     return Err(Error::Invalid(format!(
                         "unsupported metadata schema migration {step} -> {}",
@@ -914,6 +1104,40 @@ fn migrate(conn: &mut Connection, from: i64) -> Result<()> {
 /// Confirm the catalog actually reached the shape `SCHEMA` describes.
 /// Detection only: this never drops, rewrites, or repairs a relation, and it
 /// never touches an immutable object (I17).
+/// Apply the v3 `mounts.base_oid` step.
+///
+/// The `ALTER TABLE` is probed rather than issued blind, for the same reason
+/// `migrate` probes for the `observations` table: schema version 0 means either
+/// a fresh catalog or a *pre-versioning* one, and the second can already carry
+/// relations at any earlier shape -- including, when a current catalog has lost
+/// its ledger, the v3 shape itself. `MIGRATE_1_TO_2` survives that by rebuilding
+/// its relation; an unconditional `ADD COLUMN` would fail with "duplicate
+/// column name" and roll the whole open back. The backfill below is written to
+/// be safe either way: every statement is guarded on `base_oid IS NULL`, so a
+/// row that already has a pin is never re-derived.
+fn migrate_2_to_3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "mounts", "base_oid")? {
+        tx.execute_batch("ALTER TABLE mounts ADD COLUMN base_oid BLOB;")
+            .map_err(map_sql)?;
+    }
+    tx.execute_batch(MIGRATE_2_TO_3_BACKFILL).map_err(map_sql)
+}
+
+fn column_exists(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info('{table}')"))
+        .map_err(map_sql)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(map_sql)?;
+    for row in rows {
+        if row.map_err(map_sql)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn verify_migrated_shape(tx: &rusqlite::Transaction<'_>, from: i64) -> Result<()> {
     for (table, expected) in CATALOG_TABLES {
         let mut stmt = tx
@@ -1675,7 +1899,9 @@ impl Meta {
         let mut mount_keys = BTreeSet::new();
         if mounts_clean {
             let mut stmt = tx
-                .prepare("SELECT ns_id, path, spec, mode FROM mounts ORDER BY ns_id, path")
+                .prepare(
+                    "SELECT ns_id, path, spec, mode, base_oid FROM mounts ORDER BY ns_id, path",
+                )
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1684,16 +1910,29 @@ impl Meta {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 })
                 .map_err(map_sql)?;
             for row in rows {
-                let (ns_id, path, spec, mode) = row.map_err(map_sql)?;
+                let (ns_id, path, spec, mode, base_oid) = row.map_err(map_sql)?;
+                let resource = format!("catalog:mount:{ns_id}:{path}");
                 if namespaces_clean && !namespace_ids.contains(&ns_id) {
                     audit.finding(
                         "MOUNT_NAMESPACE",
-                        format!("catalog:mount:{ns_id}:{path}"),
+                        &resource,
                         "mount refers to a missing namespace",
+                    );
+                }
+                // I19: a read-write mount's pin is the only thing keeping the
+                // tree it serves alive once its ref has moved on, so it is a
+                // reclamation root in its own right, exactly like a session pin.
+                let base_oid = base_oid.and_then(|bytes| audit.oid(bytes, &resource, "base_oid"));
+                if let Some(oid) = base_oid {
+                    audit.root(
+                        oid,
+                        CatalogObjectExpectation::Any,
+                        format!("namespace:{ns_id}:mount:{path}:base"),
                     );
                 }
                 mount_keys.insert((ns_id.clone(), path.clone()));
@@ -1702,6 +1941,7 @@ impl Meta {
                     path,
                     spec,
                     mode,
+                    base_oid,
                 });
             }
         }
@@ -2022,11 +2262,144 @@ impl Meta {
     }
 
     fn map_sql_counted(&self, error: rusqlite::Error) -> Error {
-        let error = map_sql(error);
-        if matches!(error, Error::Busy(_)) {
-            self.stats.busy.fetch_add(1, Ordering::Relaxed);
+        count_busy(&self.stats, error)
+    }
+
+    /// Run one catalog write as a member of a group commit (issue #49).
+    ///
+    /// The caller is suspended until its job has been executed inside a
+    /// transaction that has already committed -- and therefore already
+    /// fsynced, since `synchronous=FULL` puts the WAL barrier inside `COMMIT`.
+    /// Only then does it learn the outcome, so a success return still means
+    /// "durable", exactly as it did when every writer opened its own
+    /// transaction.
+    ///
+    /// The loop is the whole election. There is no leader thread, no timer,
+    /// and no batching window: a writer queues its work and then blocks on the
+    /// same write mutex it always blocked on, and whoever holds that mutex
+    /// drains the queue. Draining happens *only* under the mutex, so a job
+    /// removed from the queue is always completed and answered before the
+    /// remover releases it. That is what makes the loop terminate: after
+    /// acquiring the mutex, either this job is still queued -- and this thread
+    /// runs the batch itself -- or it was drained by the previous holder and
+    /// its reply is already waiting.
+    fn run_grouped<T, F>(&self, job: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T> + Send + 'static,
+    {
+        let (reply, outcome) = std::sync::mpsc::sync_channel::<Result<GroupOut>>(1);
+        let boxed: GroupJob = Box::new(move |tx| job(tx).map(|value| Box::new(value) as GroupOut));
+        self.group
+            .pending
+            .lock()
+            .push_back(PendingWrite { job: boxed, reply });
+        loop {
+            match outcome.try_recv() {
+                Ok(done) => return downcast_group(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // A leader that unwound mid-batch dropped the channel. Nothing
+                // was committed for this job; say so instead of hanging.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(Error::Internal(
+                        "catalog group commit abandoned a queued write".into(),
+                    ))
+                }
+            }
+            let mut conn = self.write.lock();
+            if let Ok(done) = outcome.try_recv() {
+                drop(conn);
+                return downcast_group(done);
+            }
+            self.drain_group(&mut conn);
         }
-        error
+    }
+
+    /// Execute every queued write in one `BEGIN IMMEDIATE ... COMMIT`.
+    ///
+    /// Runs with the write connection held. Each job gets a `SAVEPOINT` so one
+    /// caller's rejection is not the batch's rejection; savepoints cost no
+    /// barrier, unlike the separate transactions they replace.
+    fn drain_group(&self, conn: &mut Connection) {
+        let batch: Vec<PendingWrite> = {
+            let mut pending = self.group.pending.lock();
+            pending.drain(..).collect()
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let txn_timer = self.txn_timer();
+        let tx = match self.begin_tx(conn) {
+            Ok(tx) => tx,
+            Err(error) => {
+                txn_timer.finish();
+                for waiter in batch {
+                    let _ = waiter.reply.send(Err(duplicate_error(&error)));
+                }
+                return;
+            }
+        };
+        let mut replies = Vec::with_capacity(batch.len());
+        let mut outs: Vec<Result<GroupOut>> = Vec::with_capacity(batch.len());
+        // Set once the transaction itself is no longer trustworthy. From that
+        // point nothing can commit, so every remaining member is failed rather
+        // than executed against a doomed transaction.
+        let mut poisoned: Option<Error> = None;
+        for (i, waiter) in batch.into_iter().enumerate() {
+            replies.push(waiter.reply);
+            if let Some(error) = &poisoned {
+                outs.push(Err(duplicate_error(error)));
+                continue;
+            }
+            let point = format!("forge_group_{i}");
+            if let Err(error) = tx.execute_batch(&format!("SAVEPOINT {point}")) {
+                let error = self.map_sql_counted(error);
+                outs.push(Err(duplicate_error(&error)));
+                poisoned = Some(error);
+                continue;
+            }
+            match (waiter.job)(&tx) {
+                Ok(value) => match tx.execute_batch(&format!("RELEASE {point}")) {
+                    Ok(()) => outs.push(Ok(value)),
+                    Err(error) => {
+                        let error = self.map_sql_counted(error);
+                        outs.push(Err(duplicate_error(&error)));
+                        poisoned = Some(error);
+                    }
+                },
+                Err(rejected) => {
+                    outs.push(Err(rejected));
+                    if let Err(error) =
+                        tx.execute_batch(&format!("ROLLBACK TO {point}; RELEASE {point}"))
+                    {
+                        poisoned = Some(self.map_sql_counted(error));
+                    }
+                }
+            }
+        }
+        let committed = match poisoned {
+            Some(error) => {
+                let _ = tx.rollback();
+                Err(error)
+            }
+            None => self.commit_ref_tx(tx),
+        };
+        txn_timer.finish();
+        match committed {
+            // The barrier is behind us: every job in `outs` is durable.
+            Ok(()) => {
+                for (reply, out) in replies.into_iter().zip(outs) {
+                    let _ = reply.send(out);
+                }
+            }
+            // Nothing was applied. No member may be told otherwise, including
+            // the ones whose SQL ran without complaint.
+            Err(error) => {
+                for reply in replies {
+                    let _ = reply.send(Err(duplicate_error(&error)));
+                }
+            }
+        }
     }
 
     fn begin_tx<'a>(&self, conn: &'a mut Connection) -> Result<rusqlite::Transaction<'a>> {
@@ -2159,7 +2532,7 @@ impl Meta {
             [],
         )
         .map_err(map_sql)?;
-        let stats = MetaCounters::default();
+        let stats = Arc::new(MetaCounters::default());
         install_write_txn_counter(&conn, &stats)?;
         Ok(Self {
             write: TimedMutex::new(conn),
@@ -2168,6 +2541,7 @@ impl Meta {
             // later read-only member has both a file and a `-shm` to attach.
             read: Some(ReadPool::new(path.to_path_buf())),
             stats,
+            group: CommitGroup::default(),
             durability,
             read_only: false,
         })
@@ -2240,7 +2614,8 @@ impl Meta {
         Ok(Self {
             write: TimedMutex::new(conn),
             read: None,
-            stats: MetaCounters::default(),
+            stats: Arc::new(MetaCounters::default()),
+            group: CommitGroup::default(),
             durability,
             read_only: true,
         })
@@ -2708,128 +3083,185 @@ impl Meta {
         intro_oids: &[ObjectId],
     ) -> Result<CasResult> {
         validate_ref_kind(name, "commit")?;
-        let mut conn = self.write.lock();
-        let txn_timer = self.txn_timer();
-        let tx = self.begin_tx(&mut conn)?;
-        let row = tx
-            .query_row(
-                "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
-                [name],
-                |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| self.map_sql_counted(error))?
-            .ok_or_else(|| Error::NotFound(format!("ref {name}")))?;
-        let (oid_b, kind, protected, sealed) = row;
-        if kind != "commit" {
-            return Err(Error::Invalid(format!("ref {name} is {kind}, not commit")));
-        }
-        if sealed != 0 {
-            return Err(Error::Sealed(name.to_string()));
-        }
-        if protected != 0 {
-            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
-            return Err(Error::Denied(format!(
-                "ref {name} is protected; session checkin cannot advance it"
-            )));
-        }
-        let current = oid_from_blob(oid_b)?;
-        let ts = now_ms() as i64;
-
-        let result = if current == expected {
-            let n = tx
-                .execute(
-                    "UPDATE refs SET oid=?1, updated_ms=?2 WHERE name=?3 AND oid=?4 AND kind='commit' AND sealed=0 AND protected=0",
-                    params![new.as_bytes().as_slice(), ts, name, expected.as_bytes().as_slice()],
-                )
-                .map_err(|error| self.map_sql_counted(error))?;
-            if n != 1 {
-                self.stats.busy.fetch_add(1, Ordering::Relaxed);
-                return Err(Error::Busy(format!("ref {name} changed during checkin")));
-            }
-            tx.execute(
-                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'cas',?5)",
-                params![name, expected.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
-            )
-            .map_err(|error| self.map_sql_counted(error))?;
-            CasResult::Updated {
-                name: name.to_string(),
-                oid: new,
-            }
-        } else {
-            let fork = format!(
-                "forks/{}/{}/{}",
-                name,
-                sanitize_agent(fork_agent),
-                ulid::Ulid::new()
+        // Owned before the job is queued: it runs on another thread's
+        // transaction (issue #49 group commit). The counters ride along in the
+        // `Arc` so the outcome is still recorded by the code that decided it.
+        let name = name.to_string();
+        let agent_id = agent_id.to_string();
+        let fork_agent = fork_agent.to_string();
+        let ns_id = ns_id.to_string();
+        let mount_path = mount_path.to_string();
+        let intro_oids = intro_oids.to_vec();
+        let stats = Arc::clone(&self.stats);
+        self.run_grouped(move |tx| {
+            let (name, agent_id, fork_agent, ns_id, mount_path) = (
+                name.as_str(),
+                agent_id.as_str(),
+                fork_agent.as_str(),
+                ns_id.as_str(),
+                mount_path.as_str(),
             );
-            validate_ref_kind(&fork, "commit")?;
-            tx.execute(
-                "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
-                params![fork, new.as_bytes().as_slice(), ts],
-            )
-            .map_err(|error| self.map_sql_counted(error))?;
-            tx.execute(
-                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
-                params![fork, current.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
-            )
-            .map_err(|error| self.map_sql_counted(error))?;
-            let root_spec = format!("ref:{fork}");
-            let n = tx
-                .execute(
-                    "UPDATE mounts SET spec=?1 WHERE ns_id=?2 AND path=?3",
-                    params![root_spec, ns_id, mount_path],
+            let intro_oids = intro_oids.as_slice();
+            let row = tx
+                .query_row(
+                    "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
+                    [name],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
                 )
-                .map_err(|error| self.map_sql_counted(error))?;
-            if n != 1 {
-                return Err(Error::Corrupt(format!(
-                    "missing checkin mount {ns_id}:{mount_path}"
+                .optional()
+                .map_err(|error| count_busy(&stats, error))?
+                .ok_or_else(|| Error::NotFound(format!("ref {name}")))?;
+            let (oid_b, kind, protected, sealed) = row;
+            if kind != "commit" {
+                return Err(Error::Invalid(format!("ref {name} is {kind}, not commit")));
+            }
+            if sealed != 0 {
+                return Err(Error::Sealed(name.to_string()));
+            }
+            if protected != 0 {
+                stats.cas_denied.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::Denied(format!(
+                    "ref {name} is protected; session checkin cannot advance it"
                 )));
             }
-            CasResult::Forked {
-                requested: name.to_string(),
-                fork,
-                ours: new,
-                theirs: current,
-            }
-        };
+            let current = oid_from_blob(oid_b)?;
+            let ts = now_ms() as i64;
 
-        tx.execute(
-            "DELETE FROM overlay WHERE ns_id=?1 AND mount=?2",
-            params![ns_id, mount_path],
-        )
-        .map_err(|error| self.map_sql_counted(error))?;
+            let result = if current == expected {
+                let n = tx
+                    .execute(
+                        "UPDATE refs SET oid=?1, updated_ms=?2 WHERE name=?3 AND oid=?4 AND kind='commit' AND sealed=0 AND protected=0",
+                        params![new.as_bytes().as_slice(), ts, name, expected.as_bytes().as_slice()],
+                    )
+                    .map_err(|error| count_busy(&stats, error))?;
+                if n != 1 {
+                    stats.busy.fetch_add(1, Ordering::Relaxed);
+                    return Err(Error::Busy(format!("ref {name} changed during checkin")));
+                }
+                tx.execute(
+                    "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'cas',?5)",
+                    params![name, expected.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
+                )
+                .map_err(|error| count_busy(&stats, error))?;
+                CasResult::Updated {
+                    name: name.to_string(),
+                    oid: new,
+                }
+            } else {
+                let fork = format!(
+                    "forks/{}/{}/{}",
+                    name,
+                    sanitize_agent(fork_agent),
+                    ulid::Ulid::new()
+                );
+                validate_ref_kind(&fork, "commit")?;
+                tx.execute(
+                    "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
+                    params![fork, new.as_bytes().as_slice(), ts],
+                )
+                .map_err(|error| count_busy(&stats, error))?;
+                tx.execute(
+                    "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'fork',?5)",
+                    params![fork, current.as_bytes().as_slice(), new.as_bytes().as_slice(), agent_id, ts],
+                )
+                .map_err(|error| count_busy(&stats, error))?;
+                let root_spec = format!("ref:{fork}");
+                let n = tx
+                    .execute(
+                        "UPDATE mounts SET spec=?1 WHERE ns_id=?2 AND path=?3",
+                        params![root_spec, ns_id, mount_path],
+                    )
+                    .map_err(|error| count_busy(&stats, error))?;
+                if n != 1 {
+                    return Err(Error::Corrupt(format!(
+                        "missing checkin mount {ns_id}:{mount_path}"
+                    )));
+                }
+                CasResult::Forked {
+                    requested: name.to_string(),
+                    fork,
+                    ours: new,
+                    theirs: current,
+                }
+            };
+
+            tx.execute(
+                "DELETE FROM overlay WHERE ns_id=?1 AND mount=?2",
+                params![ns_id, mount_path],
+            )
+            .map_err(|error| count_busy(&stats, error))?;
+            // I19: the published mount advances to the commit it just published, so
+            // the next read through it sees its own work and the next checkin CASes
+            // from what the ref now holds. Every OTHER mount keeps its own pin:
+            // publishing one ref must never move what another mount reads.
+            Self::repin_mount_tx(tx, ns_id, mount_path, new)?;
+            // The session pin follows the ROOT mount only. `create_session` opens
+            // `/` on the session's own live ref and a losing CAS retargets that same
+            // row at the fork, so `/` is the session's own writable base and
+            // `namespaces.pinned_oid` is its mirror. Advancing it from a checkin of
+            // some other mount is what used to change what every other mount read,
+            // out from under the session.
+            if mount_path == "/" {
+                let n = tx
+                    .execute(
+                        "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
+                        params![new.as_bytes().as_slice(), ns_id],
+                    )
+                    .map_err(|error| count_busy(&stats, error))?;
+                if n != 1 {
+                    return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+                }
+            }
+            tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
+                .map_err(|error| count_busy(&stats, error))?;
+            Self::insert_intros_tx(tx, intro_oids, new, agent_id, ts)?;
+            // Counted here, inside the transaction that carries the outcome, so a
+            // batch-mate that poisons the commit cannot leave a phantom `Updated`
+            // in the counters: `run_grouped` returns the failure instead and the
+            // caller below never runs.
+            match &result {
+                CasResult::Updated { .. } => {
+                    stats.cas_updated.fetch_add(1, Ordering::Relaxed);
+                }
+                CasResult::Forked { .. } => {
+                    stats.cas_forked.fetch_add(1, Ordering::Relaxed);
+                }
+                CasResult::Noop { .. } => {}
+            }
+            Ok(result)
+        })
+    }
+
+    /// Move one mount's pinned base, inside the caller's transaction.
+    ///
+    /// I19: a checkin publishes exactly one mount, so exactly one mount's pin
+    /// moves. A missing row is corruption, not a benign no-op -- the caller
+    /// just folded and published that mount's overlay.
+    fn repin_mount_tx(
+        tx: &rusqlite::Transaction<'_>,
+        ns_id: &str,
+        mount_path: &str,
+        base: ObjectId,
+    ) -> Result<()> {
         let n = tx
             .execute(
-                "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
-                params![new.as_bytes().as_slice(), ns_id],
+                "UPDATE mounts SET base_oid=?1 WHERE ns_id=?2 AND path=?3",
+                params![base.as_bytes().as_slice(), ns_id, mount_path],
             )
-            .map_err(|error| self.map_sql_counted(error))?;
+            .map_err(map_sql)?;
         if n != 1 {
-            return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+            return Err(Error::Corrupt(format!(
+                "missing checkin mount {ns_id}:{mount_path}"
+            )));
         }
-        tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
-            .map_err(|error| self.map_sql_counted(error))?;
-        Self::insert_intros_tx(&tx, intro_oids, new, agent_id, ts)?;
-        self.commit_ref_tx(tx)?;
-        txn_timer.finish();
-        match &result {
-            CasResult::Updated { .. } => {
-                self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
-            }
-            CasResult::Forked { .. } => {
-                self.stats.cas_forked.fetch_add(1, Ordering::Relaxed);
-            }
-            CasResult::Noop { .. } => {}
-        }
-        Ok(result)
+        Ok(())
     }
 
     pub fn complete_noop_session(
@@ -2846,14 +3278,17 @@ impl Meta {
             params![ns_id, mount_path],
         )
         .map_err(map_sql)?;
-        let n = tx
-            .execute(
-                "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
-                params![pinned.as_bytes().as_slice(), ns_id],
-            )
-            .map_err(map_sql)?;
-        if n != 1 {
-            return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+        Self::repin_mount_tx(&tx, ns_id, mount_path, pinned)?;
+        if mount_path == "/" {
+            let n = tx
+                .execute(
+                    "UPDATE namespaces SET pinned_oid=?1 WHERE id=?2",
+                    params![pinned.as_bytes().as_slice(), ns_id],
+                )
+                .map_err(map_sql)?;
+            if n != 1 {
+                return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
+            }
         }
         tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
             .map_err(map_sql)?;
@@ -2907,41 +3342,49 @@ impl Meta {
         mount_main: bool,
     ) -> Result<()> {
         validate_ref_kind(live_ref, "commit")?;
-        let mut conn = self.write.lock();
-        let txn_timer = self.txn_timer();
-        let tx = self.begin_tx(&mut conn)?;
-        let ts = now_ms() as i64;
-        tx.execute(
-            "INSERT INTO namespaces (id, agent_id, created_ms, pinned_oid, live_ref) VALUES (?1,?2,?3,?4,?5)",
-            params![id, agent_id, ts, pinned.as_bytes().as_slice(), live_ref],
-        )
-        .map_err(map_sql)?;
-        tx.execute(
-            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
-            params![live_ref, pinned.as_bytes().as_slice(), ts],
-        )
-        .map_err(map_sql)?;
-        tx.execute(
-            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'session',?4)",
-            params![live_ref, pinned.as_bytes().as_slice(), agent_id, ts],
-        )
-        .map_err(map_sql)?;
-        let root_spec = format!("ref:{live_ref}");
-        tx.execute(
-            "INSERT INTO mounts (ns_id, path, spec, mode) VALUES (?1,'/',?2,'rw')",
-            params![id, root_spec],
-        )
-        .map_err(map_sql)?;
-        if mount_main {
+        // Owned before the job is queued: it runs on another thread's
+        // transaction (issue #49 group commit).
+        let id = id.to_string();
+        let agent_id = agent_id.to_string();
+        let live_ref = live_ref.to_string();
+        self.run_grouped(move |tx| {
+            let (id, agent_id, live_ref) = (id.as_str(), agent_id.as_str(), live_ref.as_str());
+            let ts = now_ms() as i64;
             tx.execute(
-                "INSERT INTO mounts (ns_id, path, spec, mode) VALUES (?1,'/main','ref:main','ro')",
-                [id],
+                "INSERT INTO namespaces (id, agent_id, created_ms, pinned_oid, live_ref) VALUES (?1,?2,?3,?4,?5)",
+                params![id, agent_id, ts, pinned.as_bytes().as_slice(), live_ref],
             )
             .map_err(map_sql)?;
-        }
-        tx.commit().map_err(map_sql)?;
-        txn_timer.finish();
-        Ok(())
+            tx.execute(
+                "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
+                params![live_ref, pinned.as_bytes().as_slice(), ts],
+            )
+            .map_err(map_sql)?;
+            tx.execute(
+                "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'session',?4)",
+                params![live_ref, pinned.as_bytes().as_slice(), agent_id, ts],
+            )
+            .map_err(map_sql)?;
+            let root_spec = format!("ref:{live_ref}");
+            // I19: the session root mount is pinned to the same commit the session
+            // is, at the same instant and in the same transaction, so the two can
+            // never disagree about the session's own base.
+            tx.execute(
+                "INSERT INTO mounts (ns_id, path, spec, mode, base_oid) VALUES (?1,'/',?2,'rw',?3)",
+                params![id, root_spec, pinned.as_bytes().as_slice()],
+            )
+            .map_err(map_sql)?;
+            if mount_main {
+                // Read-only, so it stays live by design: that is what lets a read
+                // of `main` through this mount go stale and refuse a checkin (I9).
+                tx.execute(
+                    "INSERT INTO mounts (ns_id, path, spec, mode, base_oid) VALUES (?1,'/main','ref:main','ro',NULL)",
+                    [id],
+                )
+                .map_err(map_sql)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn list_namespaces(&self) -> Result<Vec<NsRow>> {
@@ -3137,11 +3580,29 @@ impl Meta {
         Ok(())
     }
 
-    pub fn insert_mount(&self, ns_id: &str, path: &str, spec: &str, mode: &str) -> Result<()> {
+    /// Record a mount, with the base commit a read-write mount is pinned to.
+    ///
+    /// I19: `base_oid` is what makes a read-write mount name one immutable tree
+    /// rather than a moving ref. It is `None` for a read-only mount, which
+    /// resolves live on purpose so cross-mount stale detection works.
+    pub fn insert_mount(
+        &self,
+        ns_id: &str,
+        path: &str,
+        spec: &str,
+        mode: &str,
+        base_oid: Option<ObjectId>,
+    ) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO mounts (ns_id, path, spec, mode) VALUES (?1,?2,?3,?4)",
-            params![ns_id, path, spec, mode],
+            "INSERT OR REPLACE INTO mounts (ns_id, path, spec, mode, base_oid) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                ns_id,
+                path,
+                spec,
+                mode,
+                base_oid.map(|o| o.as_bytes().to_vec())
+            ],
         )
         .map_err(map_sql)?;
         Ok(())
@@ -3150,22 +3611,61 @@ impl Meta {
     pub fn list_mounts(&self, ns_id: &str) -> Result<Vec<MountRow>> {
         let conn = self.read_conn();
         let mut stmt = conn
-            .prepare("SELECT path, spec, mode FROM mounts WHERE ns_id=?1")
+            .prepare("SELECT path, spec, mode, base_oid FROM mounts WHERE ns_id=?1")
             .map_err(map_sql)?;
         let rows = stmt
             .query_map([ns_id], |r| {
-                Ok(MountRow {
-                    path: r.get(0)?,
-                    spec: r.get(1)?,
-                    mode: r.get(2)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
             })
             .map_err(map_sql)?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(map_sql)?);
+            let (path, spec, mode, base_oid) = r.map_err(map_sql)?;
+            out.push(MountRow {
+                path,
+                spec,
+                mode,
+                base_oid: base_oid.map(oid_from_blob).transpose()?,
+            });
         }
         Ok(out)
+    }
+
+    /// One mount of `ns_id` by exact path, or `None`.
+    ///
+    /// I19: re-mounting a path is the one operation that can move staged work
+    /// from the ref it was written against to another, so `mount` has to see
+    /// what is already there before it replaces it.
+    pub fn get_mount(&self, ns_id: &str, path: &str) -> Result<Option<MountRow>> {
+        let conn = self.read_conn();
+        conn.query_row(
+            "SELECT path, spec, mode, base_oid FROM mounts WHERE ns_id=?1 AND path=?2",
+            params![ns_id, path],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sql)?
+        .map(|(path, spec, mode, base_oid)| {
+            Ok(MountRow {
+                path,
+                spec,
+                mode,
+                base_oid: base_oid.map(oid_from_blob).transpose()?,
+            })
+        })
+        .transpose()
     }
 
     pub fn overlay_upsert(
@@ -3181,42 +3681,45 @@ impl Meta {
         // processes cannot concurrently stage an ancestor and descendant.
         // Exact-path replacement remains legal and keeps ordinary overwrite
         // semantics for a path already staged by this namespace.
-        let mut conn = self.write.lock();
-        let txn_timer = self.txn_timer();
-        let tx = self.begin_tx(&mut conn)?;
-        let conflict = tx
-            .query_row(
-                "SELECT path FROM overlay
-                 WHERE ns_id=?1 AND mount=?2 AND path<>?3 AND (
-                   (length(path) < length(?3)
-                    AND substr(?3,1,length(path))=path
-                    AND substr(?3,length(path)+1,1)='/')
-                   OR
-                   (length(path) > length(?3)
-                    AND substr(path,1,length(?3))=?3
-                    AND substr(path,length(?3)+1,1)='/')
-                 )
-                 ORDER BY path
-                 LIMIT 1",
-                params![ns_id, mount, path],
-                |row| row.get::<_, String>(0),
+        // Owned before the job is queued: it runs on another thread's
+        // transaction (issue #49 group commit).
+        let ns_id = ns_id.to_string();
+        let mount = mount.to_string();
+        let path = path.to_string();
+        self.run_grouped(move |tx| {
+            let (ns_id, mount, path) = (ns_id.as_str(), mount.as_str(), path.as_str());
+            let conflict = tx
+                .query_row(
+                    "SELECT path FROM overlay
+                     WHERE ns_id=?1 AND mount=?2 AND path<>?3 AND (
+                       (length(path) < length(?3)
+                        AND substr(?3,1,length(path))=path
+                        AND substr(?3,length(path)+1,1)='/')
+                       OR
+                       (length(path) > length(?3)
+                        AND substr(path,1,length(?3))=?3
+                        AND substr(path,length(?3)+1,1)='/')
+                     )
+                     ORDER BY path
+                     LIMIT 1",
+                    params![ns_id, mount, path],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sql)?;
+            if let Some(existing) = conflict {
+                return Err(Error::Invalid(format!(
+                    "overlay path conflict: {path} and {existing} cannot coexist"
+                )));
+            }
+            let oid = blob_oid.map(|o| o.0.to_vec());
+            tx.execute(
+                "INSERT OR REPLACE INTO overlay (ns_id, mount, path, blob_oid, exec) VALUES (?1,?2,?3,?4,?5)",
+                params![ns_id, mount, path, oid, exec as i64],
             )
-            .optional()
             .map_err(map_sql)?;
-        if let Some(existing) = conflict {
-            return Err(Error::Invalid(format!(
-                "overlay path conflict: {path} and {existing} cannot coexist"
-            )));
-        }
-        let oid = blob_oid.map(|o| o.0.to_vec());
-        tx.execute(
-            "INSERT OR REPLACE INTO overlay (ns_id, mount, path, blob_oid, exec) VALUES (?1,?2,?3,?4,?5)",
-            params![ns_id, mount, path, oid, exec as i64],
-        )
-        .map_err(map_sql)?;
-        tx.commit().map_err(map_sql)?;
-        txn_timer.finish();
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn overlay_list(&self, ns_id: &str, mount: &str) -> Result<Vec<OverlayRow>> {

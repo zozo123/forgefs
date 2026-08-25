@@ -51,6 +51,9 @@ pub struct GcRootCounts {
     pub session_pins: usize,
     pub session_live_refs: usize,
     pub mounts: usize,
+    /// Read-write mounts carrying their own pinned base (I19). Each one is a
+    /// root the refs pass does not cover once its ref has moved on.
+    pub mount_pins: usize,
     pub overlay_blobs: usize,
     pub observations: usize,
     pub landmarks: usize,
@@ -293,6 +296,22 @@ impl Forge {
                         id,
                         GraphExpectation::Any,
                         format!("{resource}:mount:{}", mount.path),
+                    )?;
+                }
+                // I19: a read-write mount's pinned base is a root in its own
+                // right. The refs pass roots what the ref holds NOW; once the
+                // ref has moved on, this pin is the only thing keeping the tree
+                // the mount still serves -- and still folds at checkin --
+                // reachable. Without it a collector could reclaim the base of a
+                // live mount, exactly as it could once have reclaimed a session
+                // pin.
+                if let Some(base) = mount.base_oid {
+                    counts.mount_pins += 1;
+                    schedule_root(
+                        queue,
+                        base,
+                        GraphExpectation::Any,
+                        format!("{resource}:mount:{}:base", mount.path),
                     )?;
                 }
                 for row in self.store.meta.overlay_list(&ns.id, &mount.path)? {

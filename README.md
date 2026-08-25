@@ -211,7 +211,7 @@ A README that names its limits is worth more than one that does not.
 - **Per-checkin cost attribution is unavailable**, as above. Do not redesign storage or concurrency on an incomplete attribution.
 - **W6 (large tree walk/update) and W7 (Git comparator) have no published results.** Do not infer tree scaling from W1/W2, and do not quote a ForgeFS-versus-Git ratio until the durability-equivalence gate in `docs/BENCH.md` is satisfied.
 - **Real process-kill crash evidence is still gated on #147.** A deterministic failpoint and an OS `SIGKILL` are different evidence classes, and `docs/BENCH.md` refuses to conflate them.
-- **A checkin can silently drop staged work in a non-root `--rw` mount (#326).** Writing through a mount at a path other than `/` is accepted and visible via `ls`, but `checkin` folds only the checkin mount, reports `noop` with exit 0, and publishes the entry nowhere — while `abandon` refuses the same session because it *can* see the staged entry. Until it is fixed, drive `checkin` against the mount you wrote through.
+- **`forge checkin` can still report `noop` while the session holds staged work under another mount (#326).** Since every read-write mount carries its own pinned base (I19), that work *is* publishable — `forge checkin --ns <ns> --mount /path` folds it onto that mount's base and CASes the ref that mount names — but a bare `forge checkin` still answers for `/` alone, so `noop` with exit 0 does not mean the session is empty, and `abandon` will refuse the same session because it *can* see the staged entry. Drive `checkin --mount` against every mount you wrote through.
 
 ## Local validation
 
