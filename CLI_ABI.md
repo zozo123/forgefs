@@ -335,11 +335,12 @@ long after `--collect` shipped, was listed in `gc --help`, and was documented in
 the table above. The exit code was right the whole time, which is why the
 conformance suite in `scripts/cli-abi-conformance.sh` could not catch it: it
 checks status codes, not sentences.
- `--min-age-secs` is refused
-below its hard floor rather than quietly raised, because that floor is the only
-bound ForgeFS has on the window between a writer's put and the transaction that
-names it. `docs/GC.md` states the root set, the invariant collection preserves
-(I23) and the one precondition it cannot prove for itself.
+
+`--min-age-secs` is refused below its hard floor rather than quietly raised,
+because that floor is the only bound ForgeFS has on the window between a
+writer's put and the transaction that names it. `docs/GC.md` states the root
+set, the invariant collection preserves (I23) and the one precondition it
+cannot prove for itself.
 
 `forge gc --json` writes one JSON object to stdout. It is not part of the
 `forge stats --json` contract above and carries no `schema_version`; consumers
