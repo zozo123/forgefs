@@ -89,6 +89,40 @@ it can succeed (I22). A checkin that DOES publish is unaffected: `updated` and
 session with several writable mounts drains them one `--mount` at a time.
 Automation that gets exit 1 from `checkin` re-runs it once per named mount.
 
+## Read-only checking: `forge fsck` and `forge verify`
+
+Neither verb introduces an exit code. Both take a structurally read-only open,
+so neither migrates, repairs, or normalizes anything it inspects, and both map
+onto the table above:
+
+| Outcome | Exit |
+|---|---:|
+| the check held: `fsck` found no problem, `verify` accepted the tag | 0 |
+| the capability may not read, or `fsck` was given anything less than unrestricted read authority | 1 |
+| `verify` names a tag that does not exist | 1 |
+| the catalog's metadata schema is not the one this binary audits: an un-migrated older repository, or one written by a newer ForgeFS | 1 |
+| `fsck` reported at least one finding: durable bytes, catalog rows, or the relations between them do not hold | 2 |
+| `verify` rejected the tag: missing, forged, wrongly scoped, or out-of-band provenance | 2 |
+
+The fourth row is the one worth stating outright (issue #348). A repository
+whose catalog is still at an earlier metadata schema version is **not corrupt**:
+it is intact, and the upgrade carries every object file across byte-identical.
+`fsck` refuses it -- naming the version it found, the version it needs, and the
+fact that one read-write open performs the migration -- instead of migrating it,
+because `fsck` is what an operator reaches for when they are already worried,
+most often while deciding whether to trust an upgrade, and a diagnostic tool
+must not silently rewrite the catalog it was asked to diagnose. The same
+refusal covers a catalog written by a *newer* ForgeFS, whose invariants this
+binary does not know; `verify` and `forge fsck` without `--full` have always
+answered both cases this way.
+
+Exit 2 keeps its reserved meaning here, in both directions. A damaged migration
+ledger -- a hole, a duplicate, an empty ledger, a missing or reshaped
+`schema_migrations` table -- is damage rather than age, and is still reported as
+a `SCHEMA_LEDGER` finding with exit 2. Admitting that one case is the reason
+`fsck --full` opens the catalog with its schema-compatibility check deferred at
+all.
+
 ## Reclamation: `forge abandon` and `forge gc`
 
 Neither verb introduces an exit code. Both map onto the table above:

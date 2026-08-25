@@ -27,6 +27,17 @@
 # guessed and never silently omitted.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Prerequisites, in full: bash, coreutils and awk. Nothing here needs an
+# interpreter or a `sqlite3` binary; see scripts/json-lib.sh and issue #346.
+[ -r "$SCRIPT_DIR/json-lib.sh" ] || {
+	printf 'forge-env-line: missing %s\n' "$SCRIPT_DIR/json-lib.sh" >&2
+	exit 3
+}
+# shellcheck source=scripts/json-lib.sh
+. "$SCRIPT_DIR/json-lib.sh"
+
 emit_json=0
 forge_bin=""
 meta_path=""
@@ -38,32 +49,50 @@ die() {
 }
 
 # journal_mode is persistent in the database file, so it is genuinely
-# observable from outside the process that wrote it.
+# observable from outside the process that wrote it -- and observable without
+# opening SQLite at all, which is what lets this script, and the release gate
+# that calls it, run on a machine with no interpreter and no `sqlite3` binary
+# (issue #346). Byte 18 of the 100-byte database header is the file-format
+# WRITE version, defined by <https://sqlite.org/fileformat2.html> as 1 for a
+# rollback journal and 2 for WAL. Reading it is also the more honest
+# observation: it reports what the FILE says, not what a fresh connection would
+# negotiate on opening it.
+#
+# Per the honesty rule above, byte 18 is not asked to say more than it knows.
+# It separates WAL from every rollback mode, but DELETE, TRUNCATE, PERSIST and
+# MEMORY all write 1, so 1 is reported as the class it actually identifies.
 probe_journal_mode() {
-	FORGE_ENV_META_PATH="$1" python3 - <<'PY'
-import os
-import sqlite3
-import urllib.parse
-
-path = os.path.abspath(os.environ["FORGE_ENV_META_PATH"])
-try:
-    uri = "file:" + urllib.parse.quote(path) + "?mode=ro"
-    con = sqlite3.connect(uri, uri=True)
-    print(str(con.execute("PRAGMA journal_mode").fetchone()[0]).upper())
-    con.close()
-except Exception:
-    print("unavailable")
-PY
+	local path="$1" magic version
+	[ -r "$path" ] || {
+		printf 'unavailable\n'
+		return 0
+	}
+	magic="$(head -c 15 "$path" 2>/dev/null || true)"
+	[ "$magic" = "SQLite format 3" ] || {
+		printf 'unavailable (not a SQLite database)\n'
+		return 0
+	}
+	version="$(od -An -tu1 -j18 -N1 "$path" 2>/dev/null | tr -d ' \n')"
+	case "$version" in
+	2) printf 'WAL\n' ;;
+	1) printf 'rollback journal (not WAL; file format write version 1)\n' ;;
+	*) printf 'unavailable\n' ;;
+	esac
 }
 
+# Every FEL_* variable, as one JSON object with sorted keys. The FEL_ prefix is
+# the whole selection rule, exactly as it was.
 emit_json_doc() {
-	python3 - <<'PY'
-import json
-import os
-
-out = {k[4:]: v for k, v in os.environ.items() if k.startswith("FEL_")}
-print(json.dumps(out, indent=2, sort_keys=True))
-PY
+	local key var first=1
+	printf '{\n'
+	for key in $(printf '%s\n' "${!FEL_@}" | LC_ALL=C sort); do
+		var="$key"
+		[ "$first" -eq 1 ] || printf ',\n'
+		first=0
+		printf '  "%s": "%s"' "$(json_string "${key#FEL_}")" "$(json_string "${!var}")"
+	done
+	[ "$first" -eq 1 ] || printf '\n'
+	printf '}\n'
 }
 
 while [ "$#" -gt 0 ]; do
