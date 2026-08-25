@@ -355,7 +355,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-api"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "forge-cap",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cap"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "forge-types",
  "hmac",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "clap",
  "forge-api",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "forge-types",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "forge-merge"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "forge-core",
  "forge-store",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "forge-ns"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "forge-core",
  "forge-store",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "forge-protocol"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "forge-types",
  "serde",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "forge-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "forge-core",
  "forge-types",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "forge-types"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
