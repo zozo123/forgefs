@@ -65,7 +65,7 @@ fn flock(file: &fs::File, operation: i32, what: &str) -> Result<()> {
 /// -- can refresh an object's age, and therefore no put can pass the "these
 /// bytes are already here, I need not write them" branch. That is what makes
 /// the sweep's age check and its unlink one indivisible decision instead of
-/// two syscalls with a race between them (I19).
+/// two syscalls with a race between them (I23).
 pub struct GcObjectGuard {
     _file: fs::File,
 }
@@ -80,7 +80,7 @@ pub struct GcObjectGuard {
 /// object age, so without this the floor bounds nothing for exactly the
 /// objects most at risk of being swept out from under a live writer. After
 /// this call an object's age reads as "time since a writer last relied on
-/// these bytes", which is the quantity the floor has to bound (I19).
+/// these bytes", which is the quantity the floor has to bound (I23).
 ///
 /// The shared lock is what makes it airtight rather than merely likely. A
 /// sweep holds the same lock exclusively, so this refresh either happens
@@ -124,7 +124,7 @@ fn refresh_dedup_mtime(root: &Path, path: &Path) -> Result<Refreshed> {
     }
     Err(Error::Io(format!(
         "cannot refresh the age of deduplicated object {}: {error}; publishing a ref over bytes \
-         whose age cannot be refreshed would expose them to collection (I19)",
+         whose age cannot be refreshed would expose them to collection (I23)",
         path.display()
     )))
 }

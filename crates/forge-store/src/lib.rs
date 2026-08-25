@@ -349,7 +349,7 @@ impl<O: ObjectStore> Store<O> {
     /// object, `get_raw` in the collecting process would keep serving it from
     /// memory, which hides exactly the bug a collector must not have. The
     /// sweep calls this on every object it unlinks so absence is observable in
-    /// the process that caused it, not only after a cold reopen (I19).
+    /// the process that caused it, not only after a cold reopen (I23).
     pub fn forget_cached(&self, id: ObjectId) {
         self.trees.lock().pop(&id);
         self.blob_cache.lock().pop(&id);

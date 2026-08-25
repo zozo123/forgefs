@@ -1,4 +1,4 @@
-//! I19 under concurrency: collect in a loop while many sessions write, check
+//! I23 under concurrency: collect in a loop while many sessions write, check
 //! in, fork and abandon, then prove `fsck --full` finds nothing dangling.
 //!
 //! This is the test that decides whether collection is trustworthy. A

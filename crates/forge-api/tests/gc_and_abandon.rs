@@ -247,3 +247,38 @@ fn gc_denies_a_ref_scoped_capability() {
         other => panic!("gc must refuse a ref-scoped capability, got {other:?}"),
     }
 }
+
+/// I19: a read-write mount's own pinned base is in the root set, and the
+/// reported root counts say so. `namespaces.pinned_oid` has always been a root
+/// for this reason -- once the ref it came from has moved on, the pin is the
+/// only thing naming the tree the mount still serves and still folds at checkin
+/// -- and a per-mount pin is the same object with the same job, so leaving it
+/// out would be a root set that does not match `docs/GC.md`.
+#[test]
+fn every_read_write_mount_pin_is_a_reported_gc_root() {
+    let (fx, root) = seeded();
+    let f = &fx.forge;
+    f.branch(&root, "main", "side").unwrap();
+
+    let before = f.gc(&root, true, 0).unwrap().roots;
+    let ns = f.session_open(&root, "main").unwrap();
+    // The default session opens `/` read-write on its own live ref and `/main`
+    // read-only, so this session ends with three read-write mounts and two
+    // read-only ones.
+    f.mount(&root, &ns, "/w", "ref:main", true).unwrap();
+    f.mount(&root, &ns, "/s", "ref:side", true).unwrap();
+    f.mount(&root, &ns, "/ro", "ref:side", false).unwrap();
+
+    let after = f.gc(&root, true, 0).unwrap().roots;
+    assert_eq!(
+        after.mounts - before.mounts,
+        5,
+        "the root set must see every mount: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.mount_pins - before.mount_pins,
+        3,
+        "every read-write mount contributes its own pinned base as a root, and \
+         no read-only mount does: {before:?} -> {after:?}"
+    );
+}

@@ -51,8 +51,10 @@ Memorize these before editing a write path:
    them.
 3. A SQLite ref transaction is the visibility point. A lost expected value is
    an explicit fork, denial, or conflict; never a retry that hides an outcome.
-4. A session reads and checks in from its pinned commit. Foreign read-only
-   mounts may remain live so stale observations can be detected.
+4. A session reads and checks in from a pinned commit, and the pin belongs to
+   the MOUNT, not the session (I19): each read-write mount records the commit
+   its ref held when the mount was taken. Read-only mounts may remain live so
+   stale observations can be detected.
 5. Capability verification precedes resource use. Namespace IDs and raw object
    IDs carry no authority.
 6. Merge causality comes only from the commit-parent DAG. Timestamps are
@@ -87,7 +89,7 @@ state. Put implementation in the invariant-aligned module:
 |---|---|
 | `repository.rs` | Discovery, init/open, locking, keys, durability helpers |
 | `authority.rs` | I13/I14 capability and namespace ownership |
-| `workspace.rs` | I8/I9 sessions, mounts, observations, checkin |
+| `workspace.rs` | I8/I9/I19-I21 sessions, per-mount pins, observations, checkin |
 | `refs.rs` | Typed refs, inbox, history, and ref/object resolution |
 | `integration.rs` | I11/I12 merge and I15 seal/verify |
 | `import.rs` / `export.rs` | Host adapter boundaries and TOCTOU/losslessness |

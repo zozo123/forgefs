@@ -83,6 +83,9 @@ pub struct GcRootCounts {
     pub session_pins: usize,
     pub session_live_refs: usize,
     pub mounts: usize,
+    /// Read-write mounts carrying their own pinned base (I19). Each one is a
+    /// root the refs pass does not cover once its ref has moved on.
+    pub mount_pins: usize,
     pub overlay_blobs: usize,
     pub observations: usize,
     pub landmarks: usize,
@@ -128,12 +131,13 @@ impl GcReport {
         ));
         out.push_str(&format!(
             "roots: {} refs ({} unresolved forks), {} session pins, {} live refs, {} mounts, \
-             {} overlay blobs, {} observations, {} landmarks, {} seals\n",
+             {} mount pins, {} overlay blobs, {} observations, {} landmarks, {} seals\n",
             self.roots.refs,
             self.roots.unresolved_forks,
             self.roots.session_pins,
             self.roots.session_live_refs,
             self.roots.mounts,
+            self.roots.mount_pins,
             self.roots.overlay_blobs,
             self.roots.observations,
             self.roots.landmarks,
@@ -303,7 +307,7 @@ impl Forge {
 
     /// Reclaim unreachable objects. This is the path that deletes bytes.
     ///
-    /// # I19, and how the concurrent sweep race is closed
+    /// # I23, and how the concurrent sweep race is closed
     ///
     /// The race that makes a naive collector unsound is not finding garbage,
     /// it is that garbage stops being garbage while you look at it: `gc`
@@ -570,17 +574,32 @@ fn schedule_catalog_roots(
     // operator can see the shape of the root set.
     counts.session_live_refs += catalog.live_refs;
 
-    for (ns, path, spec) in &catalog.mounts {
+    for (ns, path, spec, base) in &catalog.mounts {
         counts.mounts += 1;
-        // A `ref:` mount roots nothing new -- the refs pass covered it. A
-        // raw-OID mount is the only mount that can root an object no ref
-        // names, and it is the reason mounts are in the root set.
+        // A raw-OID mount can root an object no ref names.
         if let Ok(Spec::Oid(id)) = parse_spec(spec) {
             schedule_root(
                 queue,
                 id,
                 GraphExpectation::Any,
                 format!("namespace:{ns}:mount:{path}"),
+            )?;
+        }
+        // I19: a read-write mount's pinned base is a root in its OWN right,
+        // and this is the one that matters for collection. A `ref:` mount is
+        // NOT covered by the refs pass: the refs pass roots what the ref holds
+        // NOW, and the moment another agent advances that ref, this pin is the
+        // only thing keeping the tree the mount still serves -- and still folds
+        // at checkin -- reachable. Sweeping it would unlink the base of a live
+        // mount, which is I19's own tree and I18's staged work, exactly as a
+        // collector could once have reclaimed a session pin.
+        if let Some(id) = base {
+            counts.mount_pins += 1;
+            schedule_root(
+                queue,
+                *id,
+                GraphExpectation::Any,
+                format!("namespace:{ns}:mount:{path}:base"),
             )?;
         }
     }

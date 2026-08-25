@@ -17,7 +17,7 @@ fn verified_read_bypasses_warm_cache_after_disk_corruption() {
     assert!(matches!(store.get_raw_verified(id), Err(Error::Corrupt(_))));
 }
 
-/// I19: a collector must be able to make an object's absence observable in the
+/// I23: a collector must be able to make an object's absence observable in the
 /// process that unlinked it.
 ///
 /// The LRU caches assume immutability, which is true of an object's bytes and
@@ -44,6 +44,6 @@ fn a_swept_object_is_gone_from_the_hot_cache_too() {
     assert!(
         store.get_raw(id).is_err(),
         "an unlinked object is still served from memory, so a sweep cannot make absence \
-         observable without a cold reopen (I19)"
+         observable without a cold reopen (I23)"
     );
 }

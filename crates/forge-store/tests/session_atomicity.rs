@@ -11,7 +11,9 @@ fn seed(meta: &Meta, ns: &str, ref_name: &str, pin: ObjectId, current: ObjectId)
     meta.insert_ref(ref_name, current, "commit", false, false, "a", "seed")
         .unwrap();
     meta.insert_namespace(ns, "a", pin, ref_name).unwrap();
-    meta.insert_mount(ns, "/", &format!("ref:{ref_name}"), "rw")
+    // I19: a read-write mount carries its own pinned base, and for the session
+    // root mount that base is the session pin.
+    meta.insert_mount(ns, "/", &format!("ref:{ref_name}"), "rw", Some(pin))
         .unwrap();
     meta.overlay_upsert(ns, "/", "x", Some(oid(9)), false)
         .unwrap();
@@ -82,10 +84,11 @@ fn stale_checkin_forks_and_retargets_mount_atomically() {
     assert_eq!(meta.get_ref(&fork).unwrap().unwrap().oid, oid(3));
     assert_eq!(meta.get_namespace("ns").unwrap().pinned_oid, Some(oid(3)));
     let mounts = meta.list_mounts("ns").unwrap();
-    assert_eq!(
-        mounts.iter().find(|m| m.path == "/").unwrap().spec,
-        format!("ref:{fork}")
-    );
+    let root = mounts.iter().find(|m| m.path == "/").unwrap();
+    assert_eq!(root.spec, format!("ref:{fork}"));
+    // I19: the mount is re-pinned to the commit it published, in the same
+    // transaction that retargeted its spec at the fork.
+    assert_eq!(root.base_oid, Some(oid(3)));
     assert!(meta.overlay_list("ns", "/").unwrap().is_empty());
     assert!(meta.observations("ns").unwrap().is_empty());
 }

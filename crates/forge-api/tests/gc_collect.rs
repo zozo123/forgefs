@@ -1,4 +1,4 @@
-//! I19: collection unlinks only bytes nothing can reach.
+//! I23: collection unlinks only bytes nothing can reach.
 //!
 //! Issue #12/#309. `gc` used to plan and stop, so a repository grew without
 //! bound. The hard part of collecting is not finding garbage, it is that
@@ -102,7 +102,7 @@ fn a_deduplicating_put_makes_an_object_young_again() {
     assert!(
         !after.collectable_sample.contains(&orphan.hex()),
         "a deduplicating put did not protect {orphan}: gc still offers to collect bytes a \
-         writer joined moments ago, which is the content-addressed sweep race (I19). \
+         writer joined moments ago, which is the content-addressed sweep race (I23). \
          collectable={:?}",
         after.collectable_sample
     );
@@ -324,4 +324,126 @@ fn walk_objects(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// I23 x I19, the composition neither branch could test on its own: the root
+/// set the SWEEP walks carries every read-write mount's pinned base, and a
+/// sweep leaves everything under one of those pins alone.
+///
+/// This is not the same assertion as
+/// `gc_and_abandon.rs::every_read_write_mount_pin_is_a_reported_gc_root`, and
+/// the difference is the whole point. That one reads `gc --dry-run`. This one
+/// runs the collector: `gc_collect` re-reads its roots inside the sweep's own
+/// `BEGIN IMMEDIATE` transaction, through `GcCatalogRoots`, and it is that
+/// snapshot -- not the reporting one -- that decides which bytes are unlinked.
+/// A root class the reporting path knows about and the deleting path does not
+/// is precisely how a collector eats live data, and per-mount pins arrived
+/// after the collector's root snapshot was designed.
+///
+/// Each mount here is pinned to a commit its ref has since moved off, which is
+/// the state in which the pin -- not the ref -- is what the mount serves reads
+/// out of and folds onto at checkin.
+#[test]
+fn the_sweep_roots_every_read_write_mount_pin_and_spares_what_it_reaches() {
+    let (fx, root) = seeded();
+    let f = &fx.forge;
+    f.branch(&root, "main", "side").unwrap();
+
+    // Give `side` content of its own, so the pin below names a tree with bytes
+    // under it and the closure being spared is not empty.
+    let filler = f.session_open(&root, "main").unwrap();
+    f.mount(&root, &filler, "/f", "ref:side", true).unwrap();
+    f.write(
+        &root,
+        &filler,
+        "/f/under-the-pin.txt",
+        b"under the pin",
+        false,
+    )
+    .unwrap();
+    f.checkin(&root, &filler, "/f", "fill side").unwrap();
+
+    // A session whose read-write mounts are pinned to `side` as it is now.
+    let holder = f.session_open(&root, "main").unwrap();
+    f.mount(&root, &holder, "/s", "ref:side", true).unwrap();
+    f.mount(&root, &holder, "/ro", "ref:side", false).unwrap();
+    let pinned = f.peel_commit("ref:side").unwrap().0;
+
+    // Move `side` on underneath it, from a different session, so the mount's
+    // pin is no longer what the ref holds.
+    let mover = f.session_open(&root, "main").unwrap();
+    f.mount(&root, &mover, "/m", "ref:side", true).unwrap();
+    f.write(&root, &mover, "/m/moved.txt", b"moved", false)
+        .unwrap();
+    f.checkin(&root, &mover, "/m", "move side on").unwrap();
+    assert_ne!(
+        f.peel_commit("ref:side").unwrap().0,
+        pinned,
+        "the ref has to have moved off the pin for this to be the interesting state"
+    );
+
+    // Stage work through the pinned mount too: I18's staged bytes hang off the
+    // same root set.
+    f.write(&root, &holder, "/s/staged.txt", b"staged", false)
+        .unwrap();
+
+    // Real garbage, so the sweep actually unlinks something: a test in which
+    // nothing was collectable would pass with the collector disabled.
+    let writer = Store::open(f.root()).unwrap();
+    let garbage = writer.put_raw(b"nothing names these bytes").unwrap();
+
+    // Age everything past the floor, so nothing survives merely for being
+    // young: whatever the sweep spares, it spares because it is reachable.
+    for path in walk_objects(f.root()) {
+        backdate(&path, OLD);
+    }
+
+    let planned = f.gc(&root, true, FLOOR).unwrap();
+    let swept = f.gc_collect(&root, FLOOR).unwrap();
+
+    assert!(
+        planned.collectable_sample.contains(&garbage.hex()),
+        "the run has to have real garbage in it: {planned:?}"
+    );
+    assert!(
+        !object_path(f.root(), garbage).exists() && swept.deleted_objects >= 1,
+        "the sweep has to have actually unlinked something: {swept:?}"
+    );
+
+    // `/` for each of the four sessions (the seed's included), plus `/f`, `/s`
+    // and `/m`: seven read-write mounts, seven pins. `/ro` is read-only,
+    // resolves live, and contributes none -- the mode is what decides, as I19
+    // says.
+    assert_eq!(
+        swept.roots.mount_pins, 7,
+        "the sweep's own root set must carry every read-write mount pin, and no \
+         read-only one: {swept:?}"
+    );
+    assert_eq!(
+        swept.roots.mount_pins, planned.roots.mount_pins,
+        "the reporting root set and the deleting root set must not drift apart: \
+         {planned:?} vs {swept:?}"
+    );
+    assert!(
+        object_path(f.root(), pinned).exists(),
+        "the sweep unlinked the commit a live read-write mount is pinned to \
+         ({} deleted): {swept:?}",
+        swept.deleted_objects
+    );
+
+    // The decisive checks are on the bytes, not on the report. The mount still
+    // resolves out of its pin, and `fsck --full` rereads durable bytes (I15),
+    // so anything swept out from under the pin surfaces as OBJECT_READ on the
+    // edge that names it.
+    assert_eq!(
+        f.read(&root, &holder, "/s/under-the-pin.txt").unwrap(),
+        b"under the pin"
+    );
+    assert_eq!(f.read(&root, &holder, "/s/staged.txt").unwrap(), b"staged");
+    let report = f.fsck(&root, true).unwrap();
+    assert!(
+        report.findings.is_empty(),
+        "collection left dangling references under a live mount pin: {:?}",
+        report.findings
+    );
 }
