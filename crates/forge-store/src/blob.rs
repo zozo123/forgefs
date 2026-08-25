@@ -359,9 +359,64 @@ impl PublishBatch<'_> {
     }
 }
 
-impl crate::Store {
+/// `LocalBlobStore` is the sole production implementation of the seam. The
+/// inherent methods stay for direct local callers and these delegate to them,
+/// so the two cannot drift apart.
+impl crate::ObjectBatch for PublishBatch<'_> {
+    fn put_parts(&mut self, parts: &[&[u8]]) -> Result<ObjectId> {
+        PublishBatch::put_parts(self, parts)
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
+        PublishBatch::put(self, bytes)
+    }
+
+    fn finish(self: Box<Self>) -> Result<()> {
+        PublishBatch::finish(*self)
+    }
+}
+
+impl crate::ObjectStore for LocalBlobStore {
+    fn durability_class(&self) -> crate::DurabilityClass {
+        // Every publication path below ends in the strongest platform barrier
+        // on the object file and on every directory edge that names it. The
+        // crash and cross-process evidence backing this claim is named in
+        // `objectstore.rs`; a future backend owes the equivalent.
+        crate::DurabilityClass::CrashDurable
+    }
+
+    fn begin_batch(&self) -> Box<dyn crate::ObjectBatch + '_> {
+        Box::new(LocalBlobStore::begin_batch(self))
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
+        LocalBlobStore::get(self, id)
+    }
+
+    fn has(&self, id: ObjectId) -> bool {
+        LocalBlobStore::has(self, id)
+    }
+
+    fn read_only(&self) -> bool {
+        LocalBlobStore::read_only(self)
+    }
+
+    fn stats(&self) -> BlobStoreStats {
+        LocalBlobStore::stats(self)
+    }
+
+    fn put_parts(&self, parts: &[&[u8]]) -> Result<ObjectId> {
+        LocalBlobStore::put_parts(self, parts)
+    }
+
+    fn put(&self, bytes: &[u8]) -> Result<ObjectId> {
+        LocalBlobStore::put(self, bytes)
+    }
+}
+
+impl<O: crate::ObjectStore> crate::Store<O> {
     pub fn stats(&self) -> BlobStoreStats {
-        self.blobs.stats()
+        crate::ObjectStore::stats(&self.blobs)
     }
 }
 
