@@ -79,7 +79,7 @@ fn import_walk(store: &Store, dir: &Path, source_root: bool) -> Result<ObjectId>
         if source_root && (name == ".forge" || name == ".git") {
             continue;
         }
-        let ft = k.file_type()?;
+        let ft = k.file_type().map_err(|e| io_at(&k.path(), e))?;
         if ft.is_symlink() {
             return Err(Error::Invalid(format!(
                 "import refuses symlink {}",
@@ -120,8 +120,23 @@ fn import_walk(store: &Store, dir: &Path, source_root: bool) -> Result<ObjectId>
     store.put_tree(&Tree::new(entries)?)
 }
 
+/// Name the path in every host-filesystem error the import raises.
+///
+/// `std::io::Error` carries an errno and nothing else, and `From<io::Error>`
+/// turns it into a bare `Error::Io`. On a real source tree that produced
+/// `io: Permission denied (os error 13)` with no indication of WHICH of tens of
+/// thousands of files was unreadable, so the operator had no next step. The
+/// variant is deliberately still `Error::Io`: CLI_ABI.md pins the exit code for
+/// a host I/O failure and this only adds the missing subject to the sentence.
+fn io_at(path: &Path, error: std::io::Error) -> Error {
+    Error::Io(format!("{}: {error}", path.display()))
+}
+
 fn import_dir_entries(dir: &Path) -> Result<Vec<fs::DirEntry>> {
-    let mut kids: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    let mut kids: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| io_at(dir, e))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| io_at(dir, e))?;
     kids.sort_by_key(|e| e.file_name());
     Ok(kids)
 }
@@ -152,8 +167,8 @@ fn read_import_file(path: &Path) -> Result<(Vec<u8>, bool)> {
     {
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
-    let before = file.metadata()?;
+    let mut file = options.open(path).map_err(|e| io_at(path, e))?;
+    let before = file.metadata().map_err(|e| io_at(path, e))?;
     if !before.file_type().is_file() {
         return Err(Error::Invalid(format!(
             "import refuses non-regular file {}",
@@ -173,16 +188,16 @@ fn read_import_file(path: &Path) -> Result<(Vec<u8>, bool)> {
         .unwrap_or(usize::MAX)
         .min(16 * 1024 * 1024);
     let mut data = Vec::with_capacity(reserve);
-    file.read_to_end(&mut data)?;
+    file.read_to_end(&mut data).map_err(|e| io_at(path, e))?;
 
     // A second read from the same descriptor catches content mutation even on
     // filesystems with coarse timestamp granularity, without allocating a second
     // full-file buffer.
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| io_at(path, e))?;
     let mut offset = 0usize;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = file.read(&mut buf).map_err(|e| io_at(path, e))?;
         if n == 0 {
             break;
         }
@@ -202,7 +217,7 @@ fn read_import_file(path: &Path) -> Result<(Vec<u8>, bool)> {
         )));
     }
 
-    let after = file.metadata()?;
+    let after = file.metadata().map_err(|e| io_at(path, e))?;
     if !import_file_metadata_stable(&before, &after) {
         return Err(Error::Invalid(format!(
             "source file metadata changed during import: {}",
@@ -213,7 +228,7 @@ fn read_import_file(path: &Path) -> Result<(Vec<u8>, bool)> {
     // The pathname must still name the same regular file we opened. This closes
     // the common rename/symlink-swap TOCTOU without pretending to provide a host
     // filesystem snapshot primitive.
-    let path_after = fs::symlink_metadata(path)?;
+    let path_after = fs::symlink_metadata(path).map_err(|e| io_at(path, e))?;
     if !path_after.file_type().is_file() {
         return Err(Error::Invalid(format!(
             "source path changed type during import: {}",
