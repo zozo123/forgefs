@@ -30,6 +30,10 @@ Released binaries exist for four targets: `x86_64-unknown-linux-gnu`, `aarch64-u
 `x86_64-apple-darwin`, `aarch64-apple-darwin`. **There is no Windows build and the source does not
 compile on Windows** — production code uses `std::os::unix` unconditionally.
 
+The install below needs `curl`, `tar`, `sha256sum` (`shasum` on macOS) and root for the final
+`install`. A bare `debian:bookworm` has `tar` and `sha256sum` but **not** `curl`; `apt-get install
+curl ca-certificates` first, or the first line fails with `curl: command not found`.
+
 ```bash
 V=0.2.1; T=x86_64-unknown-linux-gnu
 curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/forge-$V-$T.tar.gz
@@ -51,9 +55,11 @@ binary reports `forge 0.2.1`. The tarball also contains `README.md`, `INVARIANTS
 and `LICENSE`.
 
 `SHA256SUMS` has 36 entries. It covers the four binaries *and* the release-gate evidence published
-beside them — the ABI conformance table, the `fsck --full` report, the seal attestation, the
-environment line and the gate summary, per target. Each release is also covered by a SLSA
-provenance attestation you can check without trusting this page:
+beside them — per target: a build-info file, the ABI conformance table, the Conflict-object
+record, the environment line (as both `.txt` and `.json`), the `fsck --full` report, the gate
+summary and the seal attestation. Each release is also covered by a SLSA provenance attestation
+you can check without trusting this page. This one needs the GitHub CLI (`gh`) on `$PATH`; it does
+**not** need `gh auth login` — attestations are public:
 
 ```bash
 gh attestation verify forge-$V-$T.tar.gz -R zozo123/forgefs
@@ -81,6 +87,11 @@ The following 1 attestation matched the policy criteria
   - Signer workflow: .github/workflows/release.yml@refs/tags/v0.2.1
 ```
 
+That transcript is a run against `forge-0.2.1-aarch64-apple-darwin.tar.gz`; with
+`T=x86_64-unknown-linux-gnu` the filename and digest differ, and the exact layout is `gh`-version
+dependent (gh 2.62 prints a short `REPO / PREDICATE_TYPE / WORKFLOW` table instead of the policy
+list). What does not vary is the exit status.
+
 `gh attestation verify` prints that only to a terminal; redirected to a pipe or a file it prints
 nothing and communicates through its exit status alone. Check `$?`, not the output.
 
@@ -106,19 +117,30 @@ cargo install --locked --git https://github.com/zozo123/forgefs forge-cli
 ```
 
 ```text
-  Installing /usr/local/cargo/bin/forge
+  Installing /home/you/.cargo/bin/forge
    Installed package `forge-cli v0.2.1 (https://github.com/zozo123/forgefs#2b463448)` (executable `forge`)
 ```
 
-Note that `cargo install --git` tracks whatever `main` is when you run it; it printed `#2b463448`
-here.
+That needs a Rust toolchain, `git`, and a C toolchain for the linker — on a bare Debian,
+`apt-get install git build-essential` and then rustup. Any stable `rustc` at or above the 1.89 MSRV
+works: the build above was done with 1.98.0, because `cargo install --git` selects your default
+toolchain and does not honour the repository's `rust-toolchain.toml`. Note that `cargo install
+--git` tracks whatever `main` is when you run it; it printed `#2b463448` here.
 
-or, in a clone, `cargo build --locked --release` and put `target/release/forge` on `$PATH`. It needs
-the pinned toolchain in `rust-toolchain.toml` (Rust 1.97.0); the MSRV floor is 1.89.
+Or clone and build, which is what the gate commands further down assume:
+
+```bash
+git clone https://github.com/zozo123/forgefs && cd forgefs
+cargo build --locked --release        # target/release/forge
+```
+
+In a clone rustup *does* honour `rust-toolchain.toml` and will fetch the pinned Rust 1.97.0.
 
 Every command on this page was executed. The worked example ran against the installed **v0.2.1
-release binary**; the reclamation section, the gates and the benchmark ran against a build of commit
-`2b4634488f49450537019fff0b5b4d1436f5181a` (which also reports `forge 0.2.1`). Object ids for
+release binary**; the benchmark ran against a build of commit
+`2b4634488f49450537019fff0b5b4d1436f5181a`, and the reclamation section and the gates were re-run
+against `507924f` on current `main` with identical results, down to the reclamation byte counts
+(both builds report `forge 0.2.1`). Object ids for
 *content* are reproducible and you should see the same ones — `b6b49a01…` for `pub fn a() {}` in
 both the worked example and the reclamation example below. Commit and tree ids embed a timestamp, so
 those will differ on your machine.
@@ -168,8 +190,9 @@ forge: denied: cap missing op grant
 forge: denied: cap does not cover ref sneaky
 ```
 
-Both exit 1. A capability is a 310-byte token carrying `(operation, resource)` caveats. Attenuation
-can only shrink it, and a namespace id is not authority (I13, I14).
+Both exit 1. A capability is a compact hex token carrying `(operation, resource)` caveats — its
+length tracks the caveats it holds, so `$ALICE` above is 310 bytes, `$BOB` 306, and the root cap
+186. Attenuation can only shrink it, and a namespace id is not authority (I13, I14).
 
 ### Two sessions, both writing the same ref
 
@@ -325,20 +348,21 @@ checkin --mount  -> fold that overlay onto that mount's pin
 
 Automation keys on those exit codes, never on stderr wording: `4` is a stale observation or a merge
 conflict, `2` is corruption or a sealed-state violation, `1` is denial or bad input, `3` is
-transient contention, `5` is I/O or internal failure. [`CLI_ABI.md`](CLI_ABI.md) is the contract,
-and 45 of its 46 rows are executable and blocking.
+transient contention, `5` is I/O or internal failure. [`CLI_ABI.md`](CLI_ABI.md) is the contract;
+[`scripts/cli-abi-conformance.sh`](scripts/cli-abi-conformance.sh) executes it as 46 rows, 45 of
+them blocking and one (`abi/3-busy`) not deterministically reproducible in a single process.
 
 ## Why you should believe any of this
 
 [INVARIANTS.md](INVARIANTS.md) is 23 numbered rules, I1 through I23. That file is not a manifesto,
 and this is the part that is genuinely unusual:
 
-**Every rule names its production owner and its test.** The file ends with a traceability table
-mapping each invariant to the module that implements it and to the exact test files that prove it.
-I18 ("a refused checkin never destroys staged work") points at `forge-api/workspace.rs`,
-`forge-api/gc.rs`, `forge-store/meta.rs`, and at `pinned_rw_session_reads.rs`,
-`cli_shared_stampede.rs`, `gc_and_abandon.rs`. You can check any claim on this page by opening the
-row.
+**Every rule names its production owner and its test.** Under the "Executable evidence" heading is
+a table mapping every one of I1–I23 to the module that implements it and to the exact test files
+that prove it. I18 ("a refused checkin never destroys staged work") points at
+`forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs`, and at
+`pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `model_composition.rs`
+and `docs/GC.md`. You can check any claim on this page by opening the row.
 
 **A PR that cannot name an invariant does not merge.** That is a stated rule in INVARIANTS.md,
 enforced by review rather than by CI. When a fix needs a rule that does not exist yet, the rule gets
@@ -379,6 +403,10 @@ repository through the whole contract with a packaged binary — same-path overl
 Conflict object, a stale-observation refusal, seal + attest + verify, `fsck --full`, and the full
 CLI ABI table — and it runs on all four targets during the release, from the packaged binary rather
 than a rebuild. Its evidence is published beside the tarballs and covered by `SHA256SUMS`.
+
+Both gate scripts need `python3` on `$PATH` in addition to the built binary. Without it they refuse
+up front and exit **2** — `release-gate: harness error: python3 is required`, or
+`abi-conformance: python3 is required` — which is a harness failure, not a contract failure.
 
 ```bash
 bash scripts/release-gate.sh target/release/forge
@@ -450,7 +478,7 @@ forge --cap $ROOT abandon session "$B" --discard-staged
 forge --cap $ROOT abandon fork "$FORK"
 
 find $FORGE_DIR/.forge/objects -type f | wc -l
-sleep 65                       # --collect refuses below a 60-second age floor
+sleep 65                       # the new garbage has to age past --min-age-secs first
 forge --cap $ROOT gc --collect --min-age-secs 60
 find $FORGE_DIR/.forge/objects -type f | wc -l
 forge --cap $ROOT fsck --full
@@ -483,8 +511,13 @@ collected: 4 objects unlinked
 ok (full): 4 refs, 9 objects, 0 namespaces
 ```
 
-`--min-age-secs` is a hard floor, not a hint: `--collect` below 60 seconds is refused, because an
-object is fsynced before the catalog row that roots it (I4), so a lower floor can collect live data.
+Two separate rules are at work in that `sleep`. `--min-age-secs` is a hard floor, not a hint:
+`--collect` below 60 seconds is refused outright (`gc --collect requires --min-age-secs >= 60`, exit
+1), because an object is fsynced before the catalog row that roots it (I4), so a lower floor can
+collect live data. And an object younger than the floor is *withheld* rather than taken — run the
+`--collect` above without the `sleep` and it exits 0 having deleted nothing, reporting `collectable:
+0 objects, 0 bytes` and `withheld (younger than min-age): 4 objects, 473 bytes`. The sleep is for
+the second rule, not the first.
 `abandon fork` refuses while any session still mounts the ref, and `abandon session` refuses a
 session holding staged work unless you pass `--discard-staged`. `--dry-run` computes the same plan
 and deletes nothing. [`docs/GC.md`](docs/GC.md) has the root set and the sweep-race argument.
@@ -523,6 +556,15 @@ repository class:      /workspace/envrepo (fresh repository per invocation)
 mounted `/workspace` `nobarrier`, under which no durability measurement means anything. After
 `mount -o remount,barrier /workspace`, 200 `fsync` calls moved `/proc/diskstats` field 19 by exactly
 200 — ratio 1.00. Every figure below was taken after that, on `/dev/vdd`, not on the overlay `/tmp`.
+
+`forge bench` refuses `--dir`/`FORGE_DIR` outright (`forge: invalid: bench does not accept
+--dir/FORGE_DIR; use --scratch <new-path> or omit it`, exit 1), so if you exported `FORGE_DIR` for
+the worked example above, unset it first. One run looks like:
+
+```bash
+unset FORGE_DIR
+forge --cap ./demo/.forge/keys/root.cap bench --agents 32 --shared 16 --workers 16 --scratch ./bench-run
+```
 
 `forge bench --agents 32 --shared 16 --workers W`, median of 5:
 
@@ -576,19 +618,22 @@ Count device flushes, not `fsync` calls.
 2.2x. If you care about tail latency, oversubscribing the CPU is the first thing to stop doing.
 
 **ForgeFS versus Git, stated against itself.** The checked-in comparator (`scripts/w7-git-comparator.sh`,
-results in [`docs/BENCH.md`](docs/BENCH.md)) measured, like for like — one process invocation per
-agent step, which is how an orchestrator drives either tool — **ForgeFS 198.3 ops/s against git
-worktrees at 289.2**. ForgeFS loses. It is also doing strictly more durability work: for one agent
-operation ForgeFS issued 6 file and 20 directory barriers, Git as shipped issued 0 and 0, and Git
-with `core.fsync=all` issued 6 and 0. Both Git configurations are therefore marked
-**`non-comparable: durability mismatch`** and neither quotient is a speed ratio.
+results in [`docs/BENCH.md`](docs/BENCH.md)) measured, like for like — a fresh process invocation
+per CLI step (3 execs per ForgeFS agent, 2 per Git agent), which is how an orchestrator drives
+either tool — **ForgeFS 198.3 ops/s against git worktrees at 289.2**. ForgeFS loses. It is also
+doing strictly more durability work: for one agent operation ForgeFS issued 6 file and 20
+directory barriers, Git as shipped issued 0 and 0, and Git with `core.fsync=all` issued 6 and 0.
+Both Git configurations are therefore marked **`non-comparable: durability mismatch`** and neither
+quotient is a speed ratio.
 
-Two things `forge bench` and `forge stats --json` deliberately do **not** report: object-byte
-accumulation is uninstrumented and prints the literal `bytes=unavailable`, and the per-checkin cost
-mix (`hash + encode + fsync_file + fsync_dir + sqlite_wait + sqlite_txn`) is reported as
-`unavailable` and must not be reconstructed by dividing lifetime totals by a checkin count. Those
+Two things `forge bench` deliberately does **not** report: object-byte accumulation is
+uninstrumented and prints the literal `bytes=unavailable`, and the per-checkin cost mix (`hash +
+encode + fsync_file + fsync_dir + sqlite_wait + sqlite_txn`) prints `per-checkin mix = unavailable;
+requires operation-scoped tracing; never derive it from lifetime totals`. `forge stats --json`
+carries no byte field at all, and its `note` says the same thing in prose. In both commands the
 counters are cumulative process-lifetime totals spanning init, both workloads, merge/seal, verify
-and `fsck`. [`docs/BENCH.md`](docs/BENCH.md) owns the protocol.
+and `fsck`, and must not be divided by a checkin count. [`docs/BENCH.md`](docs/BENCH.md) owns the
+protocol.
 
 ## Limits
 
