@@ -50,6 +50,30 @@ writer half-updated. Refusing to enter the band is the only safe answer.
 `scripts/enospc-sigbus-probe.sh` reproduces and asserts this contract. It needs
 Linux, root and `mkfs.ext4`, so it is not part of `scripts/release-gate.sh`.
 
+## Reclamation: `forge abandon` and `forge gc`
+
+Neither verb introduces an exit code. Both map onto the table above:
+
+| Outcome | Exit |
+|---|---:|
+| `abandon fork` retired the ref; `abandon session` retired the namespace | 0 |
+| ref or namespace does not exist | 1 |
+| ref is outside `forks/`, already abandoned, still mounted, still a session's live ref, or the session holds staged work without the explicit discard flag | 1 |
+| ref is protected, or the capability may not write it | 1 |
+| ref is sealed | 2 |
+| `gc --dry-run` produced a report | 0 |
+| `gc` without `--dry-run`, or `gc` under a ref-scoped capability | 1 |
+| `gc` could not prove reachability because an object is unreadable or does not decode | 2 |
+
+`forge gc` **never deletes**. Collection is unimplemented and `--dry-run` is
+mandatory, so automation can call it on a schedule today and get a plan, not a
+mutation. `docs/GC.md` states the root set and what a safe collector still
+needs.
+
+`forge gc --json` writes one JSON object to stdout. It is not part of the
+`forge stats --json` contract above and carries no `schema_version`; consumers
+must ignore keys they do not know and must not assert amounts.
+
 ## Structured metrics: `forge stats --json`
 
 `forge stats --json` writes exactly one JSON object to stdout and exits 0. It
