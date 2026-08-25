@@ -56,33 +56,14 @@ use tempfile::TempDir;
 /// signal to delete the row rather than to relax the check.
 const KNOWN: &[(&str, &str)] = &[
     (
-        "F1-CHECKIN-NOOP-OVER-STAGED-WORK",
-        "#326 / I18: checkin reported Noop (success, nothing to do) while the \
-         session still held staged overlay entries in another mount. The work \
-         is published nowhere and the caller is told it succeeded.",
-    ),
-    (
-        "F2-RW-MOUNT-IGNORES-ITS-OWN-REF",
-        "I8: a read-write `ref:R` mount at a non-root path serves and folds the \
-         session's single global pin instead of R. `ls`/`read` through the \
-         mount show a tree that is not R's, and `checkin` folds onto a base \
-         that is not R's either.",
-    ),
-    (
-        "F3-CHECKIN-REPINS-EVERY-MOUNT",
-        "I8: a successful checkin of one mount overwrites the session's single \
-         pinned_oid, which is the base every other read-write mount reads \
-         from. Checking in mount A silently moves what mount B sees.",
-    ),
-    (
-        "F5-PINNED-MOUNT-OBSERVATION-VALIDATED-AGAINST-LIVE-REF",
-        "I8/I9: a read through a read-write mount records what the session's          pinned base held, but `check_observations` re-validates that same          observation against the mount's LIVE ref whenever some other mount is          checked in. Once that ref moves, the observation can never be          satisfied again and no checkin on any mount succeeds; only a          successful checkin clears observations, so the session is stuck.",
-    ),
-    (
         "F4-SESSION-WEDGED-WITH-STAGED-WORK",
-        "Liveness: a session held staged overlay entries but no checkin on any \
-         of its mounts could publish them and `abandon` without an explicit \
-         discard refused. Neither publish nor explicit abandon was possible.",
+        "I20/I21 liveness, NOT closed: a read-write mount on a PROTECTED ref \
+         accepts writes that `checkin` then denies (`ref R is protected`), and \
+         `abandon` without an explicit discard refuses because work is staged. \
+         Neither publish nor explicit abandon is possible. I20 refuses a \
+         read-write `oid:` mount and a ref not holding a commit, which closed \
+         the other two shapes of this; a protected ref is still accepted at \
+         mount time and is still unpublishable.",
     ),
 ];
 
@@ -601,9 +582,8 @@ impl World {
                 continue;
             }
             // Any successful checkin is a transition out of "holding staged
-            // work": Updated and Forked publish it, and Noop clears the mount's
-            // overlay (which is its own defect, F1, not a liveness one). The
-            // authoritative check is the destructive drain at end of sequence;
+            // work". The authoritative check is the destructive drain at end
+            // of sequence;
             // this one exists so a wedge is reported at the step that created
             // it, with the trace that led there.
             let publishable = s
@@ -757,33 +737,27 @@ enum Refusal {
     Denied,
     Sealed,
     Stale,
+    /// I22: nothing to publish here, and the session holds staged work
+    /// somewhere else.
+    StagedElsewhere,
 }
 
 impl World {
     fn predict_checkin(&self, ns: &str, mount_arg: &str) -> Result<Predicted, Refusal> {
-        self.predict_checkin_detailed(ns, mount_arg).0
-    }
-
-    fn predict_checkin_detailed(
-        &self,
-        ns: &str,
-        mount_arg: &str,
-    ) -> (Result<Predicted, Refusal>, Vec<(&'static str, String)>) {
-        let mut notes: Vec<(&'static str, String)> = Vec::new();
         let s = &self.model.sessions[ns];
         let agent = &self.caps[s.agent].0;
         let m = longest_mount(&s.mounts, mount_arg).expect("a session always has a / mount");
         if !m.rw {
-            return (Err(Refusal::RoMount), notes);
+            return Err(Refusal::RoMount);
         }
         let SpecM::Ref(ref_name) = &m.spec else {
-            return (Err(Refusal::OidMount), notes);
+            return Err(Refusal::OidMount);
         };
         if !agent.allows_ref(ref_name) {
-            return (Err(Refusal::Denied), notes);
+            return Err(Refusal::Denied);
         }
         let Some(&ref_cid) = self.model.refs.get(ref_name) else {
-            return (Err(Refusal::Denied), notes);
+            return Err(Refusal::Denied);
         };
         let base_cid = *s
             .base
@@ -793,12 +767,11 @@ impl World {
 
         // I9 staleness, over the whole observation set, not just this mount.
         //
-        // The checkin mount is validated against its own pinned base. Every
-        // other mount is validated against what that mount resolves to NOW --
-        // which for a read-only mount is the point (foreign staleness must be
-        // detectable), and for a read-write mount is the asymmetry recorded as
-        // F5: the observation was taken from the pin and is re-checked against
-        // the live ref.
+        // Every mount is validated against the same tree its own reads resolve
+        // against: a read-write mount against its OWN pin (I19), which cannot
+        // move under it, so an authorised read through one can never make the
+        // session unpublishable (I21); a read-only mount against its live ref,
+        // which is exactly the cross-mount staleness I9 exists for.
         for ((obs_mount, rel), seen) in &s.obs {
             if obs_mount == &m.path && overlay_shadows(&ov, rel) {
                 continue;
@@ -808,6 +781,10 @@ impl World {
             } else if let Some(om) = s.mounts.iter().find(|x| &x.path == obs_mount) {
                 match &om.spec {
                     SpecM::Oid(t, _) => t.clone(),
+                    SpecM::Ref(_) if om.rw => match s.base.get(obs_mount) {
+                        Some(c) => self.model.tree_of(*c).clone(),
+                        None => continue,
+                    },
                     SpecM::Ref(r) => match self.model.refs.get(r) {
                         Some(c) => self.model.tree_of(*c).clone(),
                         None => continue,
@@ -817,28 +794,7 @@ impl World {
                 continue;
             };
             if &model_current_at(&tree, rel) != seen {
-                if let Some(om) = s.mounts.iter().find(|x| &x.path == obs_mount) {
-                    if om.rw && obs_mount != &m.path {
-                        let pinned = s
-                            .base
-                            .get(obs_mount)
-                            .map(|c| model_current_at(self.model.tree_of(*c), rel));
-                        if pinned.as_ref() == Some(seen) {
-                            notes.push((
-                                "F5-PINNED-MOUNT-OBSERVATION-VALIDATED-AGAINST-LIVE-REF",
-                                format!(
-                                    "session {ns}: checkin of {} refuses because the \
-                                     observation at {obs_mount}:{rel} still matches that \
-                                     mount's pinned base but no longer matches its live \
-                                     ref. No checkin can clear it, and nothing but a \
-                                     discarding abandon gets the session out.",
-                                    m.path
-                                ),
-                            ));
-                        }
-                    }
-                }
-                return (Err(Refusal::Stale), notes);
+                return Err(Refusal::Stale);
             }
         }
 
@@ -846,18 +802,33 @@ impl World {
         // The no-op shortcut is taken before the sealed/protected checks, so a
         // no-op checkin on a sealed or protected ref still reports Noop.
         if &new_tree == self.model.tree_of(base_cid) && base_cid == ref_cid {
-            return (Ok(Predicted::Noop), notes);
+            // I22: `Noop` is the one outcome that may never be said over work
+            // that exists. This mount stages nothing publishable, so staged
+            // entries under any OTHER mount turn the answer into a refusal
+            // that names them. `updated`/`forked` below are progress and are
+            // deliberately NOT constrained this way -- refusing them would
+            // wedge a session holding two writable mounts (I19/I21).
+            let elsewhere: usize = s
+                .overlay
+                .iter()
+                .filter(|(mp, _)| mp.as_str() != m.path.as_str())
+                .map(|(_, e)| e.len())
+                .sum();
+            if elsewhere > 0 {
+                return Err(Refusal::StagedElsewhere);
+            }
+            return Ok(Predicted::Noop);
         }
         if self.model.sealed.contains(ref_name) {
-            return (Err(Refusal::Sealed), notes);
+            return Err(Refusal::Sealed);
         }
         if self.model.protected.contains(ref_name) {
-            return (Err(Refusal::Denied), notes);
+            return Err(Refusal::Denied);
         }
         if base_cid == ref_cid {
-            (Ok(Predicted::Updated(new_tree)), notes)
+            Ok(Predicted::Updated(new_tree))
         } else {
-            (Ok(Predicted::Forked(new_tree)), notes)
+            Ok(Predicted::Forked(new_tree))
         }
     }
 }
@@ -865,6 +836,13 @@ impl World {
 // ---------------------------------------------------------------------------
 // operations
 // ---------------------------------------------------------------------------
+
+fn spec_str_of(spec: &SpecM) -> String {
+    match spec {
+        SpecM::Ref(r) => format!("ref:{r}"),
+        SpecM::Oid(_, id) => format!("oid:{}", id.hex()),
+    }
+}
 
 const FILES: &[&str] = &["a.txt", "b.txt", "d1/c.txt", "d1/e.txt", "d2/f.txt"];
 const DIRS: &[&str] = &["", "d1", "d2"];
@@ -970,10 +948,23 @@ impl World {
             return;
         }
         let spec = rng.pick(&specs).clone();
-        let spec_str = match &spec {
-            SpecM::Ref(r) => format!("ref:{r}"),
-            SpecM::Oid(_, id) => format!("oid:{}", id.hex()),
+        let spec_str = spec_str_of(&spec);
+
+        // What the model expects `mount` to refuse, decided BEFORE the call.
+        //
+        // I20: a read-write `oid:` spec names immutable bytes with no ref for
+        // checkin to advance, so it is refused at mount time rather than
+        // accepting a write that no verb and no capability could ever publish.
+        let rw_oid = rw && matches!(spec, SpecM::Oid(..));
+        // I19: re-mounting a path at a different spec, or demoting one to
+        // read-only, while it holds staged work would send that work to a ref
+        // it was never written against. Refused, never silently retargeted.
+        let (retarget, demote) = match s.mounts.iter().find(|m| m.path == path) {
+            Some(e) => (spec_str_of(&e.spec) != spec_str, e.rw && !rw),
+            None => (false, false),
         };
+        let moves_staged_work = !s.ov(&path).is_empty() && (retarget || demote);
+
         let cap = self.agent_cap(s.agent);
         let res = self.forge.mount(&cap, &ns, &path, &spec_str, rw);
         self.say(format!(
@@ -981,11 +972,22 @@ impl World {
             if rw { "rw" } else { "ro" },
             if res.is_ok() { "ok" } else { "err" }
         ));
-        match res {
-            Ok(()) => {}
-            Err(e) => self.bail(&format!(
-                "mount {path} {spec_str} rw={rw} as {} was refused: {e:?}",
-                a.id
+        match (&res, rw_oid, moves_staged_work) {
+            (Ok(()), false, false) => {}
+            // The rw-`oid:` refusal is checked first in production too.
+            (Err(Error::Denied(_)), true, _) => return,
+            (Err(Error::Invalid(_)), false, true) => return,
+            _ => self.bail(&format!(
+                "mount {path} {spec_str} rw={rw} as {}: real {res:?}, but the model \
+                 expected {}",
+                a.id,
+                if rw_oid {
+                    "a Denied for a read-write oid: spec (I20)"
+                } else if moves_staged_work {
+                    "an Invalid over staged work this re-mount would move (I19)"
+                } else {
+                    "success"
+                }
             )),
         }
 
@@ -1239,9 +1241,14 @@ impl World {
         self.note_observation(&ns, &m2, &rel, seen, &format!("ls {abs}"));
     }
 
-    /// A read or listing through `m` did not match. Decide whether the real
-    /// system is using the session's single global pin as this mount's base --
-    /// the known I8 defects -- and if so record it and adopt the real base.
+    /// A read or listing through `m` did not match the model.
+    ///
+    /// This used to be the classifier for the two I8 defects: the real system
+    /// served the session's ONE global pin as every read-write mount's base,
+    /// so a mismatch here was usually F2 or F3 rather than news. I19 gave each
+    /// read-write mount its own pin and both are gone, so there is nothing
+    /// left to classify -- any mount-view divergence is now unclassified, and
+    /// fails with the seed and the trace.
     fn diverged_on_mount_view(
         &mut self,
         ns: &str,
@@ -1250,76 +1257,14 @@ impl World {
         what: &str,
         detail: impl Fn() -> String,
     ) {
-        let SpecM::Ref(ref_name) = &m.spec else {
-            self.bail(&format!("{what}: {} on an oid mount", detail()));
-        };
-        if !m.rw {
-            self.bail(&format!("{what} on a read-only mount: {}", detail()));
-        }
         let store = self.store();
-        let pin = store
-            .meta
-            .get_namespace(ns)
-            .expect("namespace")
-            .pinned_oid
-            .expect("pinned");
-        let mut pin_tree = FlatTree::new();
-        flatten(
-            &store,
-            store.get_commit(pin).expect("commit").tree,
-            "",
-            &mut pin_tree,
-        );
-        let modelled = self
-            .model
-            .sessions
-            .get(ns)
-            .and_then(|s| s.base.get(&m.path))
-            .map(|c| self.model.tree_of(*c).clone())
-            .unwrap_or_default();
-        if pin_tree == modelled {
-            let rows = store.meta.list_mounts(ns).expect("mounts");
-            let obs = store.meta.observations(ns).expect("obs");
-            self.bail(&format!(
-                "{what}: the mount's base already matches the session pin, so \
-                 this is not the known I8 defect: {}\n    mount = {m:?}\n    \
-                 pin_tree = {}\n    real mounts = {rows:?}\n    real obs = {obs:?}",
-                detail(),
-                show_tree(&pin_tree)
-            ));
-        }
-
-        // Which of the two known I8 shapes is this?
-        let mounted_ref_cid = self.model.refs.get(ref_name).copied();
-        let kind = if mounted_ref_cid.map(|c| self.model.tree_of(c).clone())
-            == Some(modelled.clone())
-            && m.path != "/"
-        {
-            "F2-RW-MOUNT-IGNORES-ITS-OWN-REF"
-        } else {
-            "F3-CHECKIN-REPINS-EVERY-MOUNT"
-        };
-        self.record(
-            kind,
-            format!(
-                "{what} (mount {} -> ref:{ref_name}, rel {rel:?}): {}. The mount's \
-                 own base is {} but the repository served the session's global \
-                 pin {}.",
-                m.path,
-                detail(),
-                show_tree(&modelled),
-                show_tree(&pin_tree)
-            ),
-        );
-
-        // Adopt reality for this mount so the run keeps finding new things.
-        let cid = self.cid_for(pin, pin_tree);
-        self.model
-            .sessions
-            .get_mut(ns)
-            .expect("session")
-            .base
-            .insert(m.path.clone(), cid);
+        let rows = store.meta.list_mounts(ns).expect("mounts");
+        let obs = store.meta.observations(ns).expect("obs");
+        self.bail(&format!(
+            "{what}: {}\n    mount = {m:?}\n    rel = {rel:?}\n    \
+             real mounts = {rows:?}\n    real obs = {obs:?}",
+            detail()
+        ));
     }
 
     fn op_checkin(&mut self, rng: &mut Rng) {
@@ -1331,10 +1276,7 @@ impl World {
         let mount = rng.pick(&mounts).clone();
         let staged_before = s.staged_total();
         let staged_here = s.ov(&mount).len();
-        let (predicted, notes) = self.predict_checkin_detailed(&ns, &mount);
-        for (kind, detail) in notes {
-            self.record(kind, detail);
-        }
+        let predicted = self.predict_checkin(&ns, &mount);
         let cap = self.agent_cap(s.agent);
         let real = self.forge.checkin(&cap, &ns, &mount, "model-harness");
         self.say(format!(
@@ -1346,23 +1288,21 @@ impl World {
             }
         ));
 
-        // I18 / #326, stated directly and independently of the model: a
-        // checkin that reports success while the session still holds staged
-        // work has told the caller "done" and published nothing.
+        // I22, stated directly and independently of the model: `Noop` may
+        // never be reported while the session still holds staged work
+        // anywhere. This is the assertion #326 was about, and it is now a
+        // hard one rather than a characterisation.
         if let Ok(CasResult::Noop { .. }) = &real {
             if staged_before > 0 {
-                self.record(
-                    "F1-CHECKIN-NOOP-OVER-STAGED-WORK",
-                    format!(
-                        "checkin of mount {mount} in session {ns} returned Noop while \
-                         {staged_before} overlay entries were staged ({staged_here} of them \
-                         under {mount}); staged paths = {:?}",
-                        s.overlay
-                            .iter()
-                            .flat_map(|(mp, e)| e.keys().map(move |k| format!("{mp}:{k}")))
-                            .collect::<Vec<_>>()
-                    ),
-                );
+                self.bail(&format!(
+                    "I22: checkin of mount {mount} in session {ns} returned Noop while \
+                     {staged_before} overlay entries were staged ({staged_here} of them under \
+                     {mount}); staged paths = {:?}",
+                    s.overlay
+                        .iter()
+                        .flat_map(|(mp, e)| e.keys().map(move |k| format!("{mp}:{k}")))
+                        .collect::<Vec<_>>()
+                ));
             }
         }
 
@@ -1399,23 +1339,12 @@ impl World {
             | (Err(Refusal::OidMount), Err(Error::Invalid(_)))
             | (Err(Refusal::Denied), Err(Error::Denied(_)))
             | (Err(Refusal::Sealed), Err(Error::Sealed(_)))
-            | (Err(Refusal::Stale), Err(Error::StaleObservation { .. })) => {}
+            | (Err(Refusal::Stale), Err(Error::StaleObservation { .. }))
+            | (Err(Refusal::StagedElsewhere), Err(Error::Invalid(_))) => {}
             _ => {
-                // Is the difference explained by the real system folding onto
-                // the global pin rather than this mount's own base?
-                let m = longest_mount(&s.mounts, &mount).expect("mount").clone();
-                if m.rw && matches!(m.spec, SpecM::Ref(_)) {
-                    let detail = format!("model {predicted:?} vs real {real:?}");
-                    self.diverged_on_mount_view(&ns, &m, "", &format!("checkin {mount}"), || {
-                        detail.clone()
-                    });
-                    // Re-run the whole step's bookkeeping from reality.
-                    self.resync_after_unmodelled_checkin(&ns, &m.path, &real);
-                } else {
-                    self.bail(&format!(
-                        "checkin {mount}: model {predicted:?} but real {real:?}"
-                    ));
-                }
+                self.bail(&format!(
+                    "checkin {mount}: model {predicted:?} but real {real:?}"
+                ));
             }
         }
     }
@@ -1677,19 +1606,13 @@ impl World {
                     let outcome = self.forge.checkin(&cap, &ns, &mp, "drain");
                     match &outcome {
                         Ok(CasResult::Noop { .. }) => {
-                            // I18/#326: "nothing to do" while work is staged.
-                            errors.push(format!("checkin {mp} -> Noop (published nothing)"));
-                            self.record(
-                                "F1-CHECKIN-NOOP-OVER-STAGED-WORK",
-                                format!(
-                                    "draining session {ns}: checkin of mount {mp} returned \
-                                     Noop while {} entries were staged under {mp} itself",
-                                    self.model.sessions[&ns].ov(&mp).len()
-                                ),
-                            );
-                            // The catalog cleared this mount's overlay only if
-                            // it was the checkin mount; resync from reality.
-                            self.resync_after_unmodelled_checkin(&ns, &mp, &outcome);
+                            // I22: "there was nothing to do", said over this
+                            // mount's own staged entries. #326 exactly.
+                            let staged = self.model.sessions[&ns].ov(&mp).len();
+                            self.bail(&format!(
+                                "draining session {ns}: checkin of mount {mp} returned Noop \
+                                 while {staged} entries were staged under {mp} itself (I22)"
+                            ));
                         }
                         Ok(_) => {
                             progressed = true;
@@ -1815,16 +1738,20 @@ fn model_based_composition() {
     );
 }
 
-/// The `#326` composition, written out by hand so the failure is readable
+/// The `#326` composition, written out by hand so the behaviour is readable
 /// without running the generator. `mount` is correct, `write` is correct,
-/// `checkin` is correct, and composed they lose the write.
+/// `checkin` is correct -- and composed they used to lose the write: a checkin
+/// of `/` answered `Noop` with exit 0 while the entry sat under `/work` in no
+/// ref at all, and `abandon` refused the same session as holding work. I22
+/// makes that sentence impossible, and I19 makes the refusal actionable.
 #[test]
-fn i18_checkin_reports_success_while_staged_work_is_unpublished() {
+fn i22_checkin_refuses_a_noop_over_work_it_did_not_fold() {
     let dir = tempfile::tempdir().unwrap();
     let forge = Forge::init(dir.path()).unwrap();
     let root = forge.root_cap().unwrap();
+    forge.branch(&root, "main", "shared").unwrap();
     let ns = forge.session_open(&root, "main").unwrap();
-    forge.mount(&root, &ns, "/work", "ref:main", true).unwrap();
+    forge.mount(&root, &ns, "/work", "ref:shared", true).unwrap();
     forge
         .write(&root, &ns, "/work/a.txt", b"hello", false)
         .unwrap();
@@ -1836,21 +1763,29 @@ fn i18_checkin_reports_success_while_staged_work_is_unpublished() {
         ["a.txt"]
     );
 
-    let outcome = forge.checkin(&root, &ns, "/", "publish").unwrap();
-    let staged = staged_entries(dir.path(), &ns);
+    let refusal = forge
+        .checkin(&root, &ns, "/", "publish")
+        .expect_err("I22: a noop may not be reported over work the session holds");
     assert!(
-        matches!(outcome, CasResult::Noop { .. }) && staged == 1,
-        "characterising #326: expected the buggy Noop-over-staged-work, got {outcome:?} \
-         with {staged} staged entries. If checkin now refuses or publishes, this \
-         characterisation must be replaced by the correct assertion."
+        matches!(refusal, Error::Invalid(ref m) if m.contains("/work (1 staged entry)")),
+        "the refusal must name the mount that holds the work: {refusal:?}"
+    );
+    assert_eq!(
+        staged_entries(dir.path(), &ns),
+        1,
+        "I18: a refused checkin never destroys staged work"
     );
 
-    // ...and the session cannot walk it back without discarding the work.
-    let refused = forge.abandon_session(&root, &ns, false).unwrap_err();
-    assert!(
-        matches!(refused, Error::Invalid(ref m) if m.contains("staged")),
-        "abandon should refuse over staged work, got {refused:?}"
-    );
+    // And the escape the diagnostic advises is actually available (I19/I21):
+    // naming the mount publishes it, onto that mount's own base.
+    assert!(matches!(
+        forge.checkin(&root, &ns, "/work", "publish").unwrap(),
+        CasResult::Updated { .. } | CasResult::Forked { .. }
+    ));
+    assert_eq!(forge.read(&root, &ns, "/work/a.txt").unwrap(), b"hello");
+    forge
+        .abandon_session(&root, &ns, false)
+        .expect("a session whose work is published retires without discarding anything");
 }
 
 /// The liveness hole. `main` is protected, so a read-write mount on it can be
@@ -1883,9 +1818,12 @@ fn liveness_session_with_staged_work_can_be_stranded() {
     );
 }
 
-/// I8: a read-write `ref:R` mount at a non-root path does not show `R`.
+/// I19, the assertion that replaced this file's I8 characterisation: a
+/// read-write `ref:R` mount at a non-root path shows `R`, not the session's own
+/// base. Before per-mount pins it served the session's single global pin, so
+/// `ls /w` hid a file that `heads/topic` plainly held.
 #[test]
-fn i8_rw_mount_serves_the_session_pin_not_the_ref_it_names() {
+fn i19_rw_mount_serves_the_ref_it_names() {
     let dir = tempfile::tempdir().unwrap();
     let forge = Forge::init(dir.path()).unwrap();
     let root = forge.root_cap().unwrap();
@@ -1915,22 +1853,24 @@ fn i8_rw_mount_serves_the_session_pin_not_the_ref_it_names() {
     forge
         .mount(&root, &s2, "/w", "ref:heads/topic", true)
         .unwrap();
-    let names: Vec<String> = forge
+    let mut names: Vec<String> = forge
         .ls(&root, &s2, "/w")
         .unwrap()
         .into_iter()
         .map(|e| e.0)
         .collect();
+    names.sort();
     assert_eq!(
         names,
-        ["a.txt"],
-        "characterising I8 defect: a read-write mount of heads/topic listed \
-         {names:?}; heads/topic holds a.txt and t.txt, and the session's own \
-         pinned base holds only a.txt. If this now lists both, the defect is \
-         fixed and this characterisation must become the correct assertion."
+        ["a.txt", "t.txt"],
+        "I19: the mount must answer out of heads/topic, not out of the session's \
+         own pinned base, which holds only a.txt"
     );
+    assert_eq!(forge.read(&root, &s2, "/w/t.txt").unwrap(), b"T");
+
+    // And the session's own `/` is unaffected: one mount's pin is not another's.
     assert!(matches!(
-        forge.read(&root, &s2, "/w/t.txt").unwrap_err(),
+        forge.read(&root, &s2, "/t.txt").unwrap_err(),
         Error::NotFound(_)
     ));
 }
