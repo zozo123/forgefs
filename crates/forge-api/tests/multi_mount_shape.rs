@@ -182,15 +182,15 @@ fn a_lost_race_on_a_non_root_mount_forks_and_keeps_the_work() {
     assert_eq!(read_ref(&f, &root, &fork, "/mine.txt"), b"mine");
 }
 
-/// Characterisation, unchanged by I19 and still not what it should be: checkin
-/// is scoped to ONE mount, so it can report `Noop` -- "there was nothing to
-/// publish" -- while the session holds staged work on another mount. What I19
-/// changes is that the work is now reachable: `checkin /other` publishes it to
-/// `ref:other`. Making `Noop` mean "nothing staged anywhere" is the separate
-/// `fix/checkin-noop-drops-staged-work` change (#326), which composes with this
-/// one and is not duplicated here.
+/// I22, composed with I19: checkin is scoped to ONE mount, so a checkin of `/`
+/// has nothing of its own to publish while the session holds staged work on
+/// `/other`. It used to answer `Noop` -- "there was nothing to publish" -- which
+/// is the one sentence that may not be said over work that exists (#326). It now
+/// refuses, exit 1, and names the mount. I19 is what makes that refusal
+/// actionable rather than a wedge: `checkin /other` publishes the work to
+/// `ref:other`, from `/other`'s own pin.
 #[test]
-fn checkin_reports_noop_while_another_mount_holds_unpublished_work() {
+fn checkin_refuses_a_noop_while_another_mount_holds_unpublished_work() {
     let (_d, f, root) = diverged();
 
     let ns = f.session_open(&root, "base").unwrap();
@@ -199,8 +199,13 @@ fn checkin_reports_noop_while_another_mount_holds_unpublished_work() {
     f.write(&root, &ns, "/other/staged.txt", b"precious", false)
         .unwrap();
 
-    let result = f.checkin(&root, &ns, "/", "nothing here").unwrap();
-    assert!(matches!(result, CasResult::Noop { .. }), "{result:?}");
+    let error = f
+        .checkin(&root, &ns, "/", "nothing here")
+        .expect_err("I22: a noop may not be reported over work the session holds");
+    assert!(
+        matches!(error, Error::Invalid(ref m) if m.contains("/other (1 staged entry)")),
+        "the refusal must name the mount that holds the work: {error:?}"
+    );
 
     assert_eq!(
         f.read(&root, &ns, "/other/staged.txt").unwrap(),

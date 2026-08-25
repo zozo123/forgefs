@@ -61,7 +61,9 @@ Neither verb introduces an exit code. Both map onto the table above.
 | spec names a ref or object that does not resolve | 1 |
 | re-mounting a path at a different spec, or demoting it to read-only, while it holds staged overlay (I19) | 1 |
 | the capability may not read the spec, or may not write the ref for `--rw` | 1 |
-| `checkin --mount <path>` published, forked, or was a no-op | 0 |
+| `checkin --mount <path>` published (`updated`) or lost the CAS and forked (`forked`) | 0 |
+| `checkin --mount <path>` had nothing to publish and the session holds nothing anywhere (`noop`) | 0 |
+| `checkin --mount <path>` had nothing to publish while another mount holds staged entries (I22) | 1 |
 | `checkin` on a read-only mount, or on a ref the capability may not write | 1 |
 | `checkin` of a mount whose ref is protected | 1 |
 | `checkin` refused for a stale observation | 4 |
@@ -72,6 +74,20 @@ expected value; a lost CAS forks (I5/I18) and retargets that mount at the fork.
 A session holding read-write mounts on several refs therefore publishes them one
 `checkin --mount` at a time, and publishing one never moves what another mount
 reads.
+
+A `noop` is therefore a strong statement and callers may rely on it: it means the
+session holds no staged work anywhere, not merely that the named mount staged
+nothing. Staged work is a property of the namespace, not of one mount -- `forge
+abandon session` counts overlay rows across all of them -- so a checkin that
+folded only `/` used to answer `noop` with exit 0 for a session whose work sat
+under some other read-write mount, and `abandon` then refused the same session as
+holding work (#326). A checkin with nothing of its own to publish now refuses
+instead, exit 1, naming each other mount and its entry count, because the request
+as stated -- "tell me there was nothing to do" -- is unsatisfiable and no retry of
+it can succeed (I22). A checkin that DOES publish is unaffected: `updated` and
+`forked` are progress and may leave another mount staged, which is exactly how a
+session with several writable mounts drains them one `--mount` at a time.
+Automation that gets exit 1 from `checkin` re-runs it once per named mount.
 
 ## Reclamation: `forge abandon` and `forge gc`
 

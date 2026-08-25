@@ -322,6 +322,30 @@ impl Forge {
     /// up holding `base`'s content. I5 is unchanged and still the loser's
     /// contract: if the named ref has moved off this mount's pin the CAS loses
     /// and forks, and the fork carries this mount's completed work (I18).
+    ///
+    /// Checkin publishes exactly ONE mount -- the one named. Publishing every
+    /// read-write mount was the other candidate and was rejected: each mount
+    /// names its own ref, so "check in everything" is N independent ref CASes
+    /// with no atomicity across them. One of them updating while the next forks
+    /// is a half-published session that no single `CasResult`, exit code or
+    /// Contribution receipt can describe, and the VERSION 1 receipt is frozen
+    /// at one `base`, one `tree` and one parent list, so a multi-ref checkin is
+    /// not representable without a format change and its own gate. Implicitly
+    /// advancing refs the caller never named is also the wrong default for an
+    /// isolation substrate: a stray `--rw` mount on a shared ref would be
+    /// published by a bare `forge checkin`.
+    ///
+    /// What is indefensible is the third behaviour, the one this had: answer
+    /// `noop` with exit 0 while the session held work checkin never folded.
+    /// That is indistinguishable from "there was nothing to do", and
+    /// `abandon_session` -- which counts overlay rows across the whole
+    /// namespace -- then refused to retire the session, so the only way out of
+    /// the loop was to discard the work. I22 forbids exactly that sentence and
+    /// nothing wider: the refusal is scoped to the `Noop` outcome. `updated`
+    /// and `forked` are progress and may legitimately leave another mount
+    /// staged -- under I19 a session holds a pin per writable mount and drains
+    /// them one `--mount` at a time, so refusing those too would deny the very
+    /// escape the diagnostic advises and wedge the session (I21).
     pub fn checkin(&self, cap: &Cap, ns: &str, mount: &str, msg: &str) -> Result<CasResult> {
         self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
@@ -353,6 +377,39 @@ impl Forge {
         let batch = self.store.begin_publish_batch();
         let new_tree = apply_overlay(Some(base_commit.tree), &ov, &batch)?;
         if new_tree == base_commit.tree && pin == row.oid {
+            // I22: this mount stages nothing, so the only outcome left is
+            // `Noop` -- and `Noop` is the one answer that may never be given
+            // over work that exists. `overlay_mounts_outside` asks exactly what
+            // `abandon_session` asks -- overlay rows anywhere under this
+            // namespace -- so the two verbs can never disagree about whether
+            // the session still holds staged work.
+            //
+            // Scoped to this branch on purpose. Refusing `updated`/`forked` as
+            // well would wedge a session holding two writable mounts with work
+            // in both (I19, I21): publishing either would be refused on account
+            // of the other, and the escape this very diagnostic advises could
+            // never be taken.
+            //
+            // `Error::Invalid` is exit 1 in CLI_ABI.md, the same row abandon
+            // already uses for "the session holds staged work": the request as
+            // stated is unsatisfiable and no retry of it will ever succeed.
+            let stranded = self.store.meta.overlay_mounts_outside(ns, &m.path)?;
+            if !stranded.is_empty() {
+                let named = stranded
+                    .iter()
+                    .map(|(other, n)| {
+                        let noun = if *n == 1 { "entry" } else { "entries" };
+                        format!("{other} ({n} staged {noun})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Invalid(format!(
+                    "checkin {} has nothing to publish, but session {ns} holds staged work under \
+                     mounts it does not publish: {named}; check each mount in on its own \
+                     (checkin --mount <path>) or discard it with abandon session --discard-staged",
+                    m.path
+                )));
+            }
             batch.finish()?;
             self.store.meta.complete_noop_session(ns, &m.path, pin)?;
             return Ok(CasResult::Noop {

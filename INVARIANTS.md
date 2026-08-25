@@ -39,6 +39,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I19 | Every read-write mount carries its OWN pinned base, recorded when the mount is taken. Reads, `ls`, observation checks and checkin through a mount all resolve against that mount's pin, so the mount MODE never decides which ref you read and a mount of one ref never answers out of another's tree. Checkin folds one mount's overlay onto that mount's pin and CASes the ref THAT MOUNT names, from that pin, re-pinning only that mount. A read-only mount carries no pin and resolves live on purpose: that is what makes cross-mount staleness detectable (I9). Re-mounting a path whose overlay was staged against a different spec, or demoting one that holds staged work, is refused, never silently retargeted. |
 | I20 | A mount that accepts a write has a verb that can publish it. A read-write mount must name a ref holding a commit, so an immutable `oid:` spec and a non-commit ref are refused at mount time rather than accepting writes no capability and no verb could ever publish. |
 | I21 | A session holding write authority over a mount's base can always reach a terminal state for it: publish, fork, or `abandon`. No sequence of authorised reads may leave every checkin refused. A read-write mount is validated against the same pin its own reads came from, so an authorised read can never make the session's work unpublishable; a refusal a re-read cannot clear must name the mount that caused it, not only the observation. |
+| I22 | `Noop` is the one checkin outcome that may never be said over work that exists. A checkin that folds its mount and finds nothing to publish refuses -- exit 1 -- and names every other mount holding staged entries, instead of answering "there was nothing to do" for a session that plainly has something to do. `updated` and `forked` are progress and may legitimately leave another mount staged: under I19 a session holds a pin per writable mount and publishes them one `checkin --mount` at a time, so refusing those too would deny the very escape the refusal advises (I21). I18 forbids the failure path that destroys staged work; I22 forbids the success path that denies it exists, so `checkin` and `abandon` can never disagree about whether a session still holds work. |
 
 A composed Unicode name and its canonically equivalent decomposed spelling are distinct ForgeFS entries if their UTF-8 byte strings differ. Likewise `Foo` and `foo` are distinct. Export adapters must detect target-filesystem collisions and fail rather than silently normalize, fold, or overwrite names. `export_tar` refuses a directory whose sibling names collide under case folding or Unicode canonical equivalence and names both spellings with their bytes; `ExportOptions::allow_name_collisions` (`forge export --allow-name-collisions`) is the deliberate per-call opt-out for a case-sensitive destination, never a default and never inferred from the exporting host.
 
@@ -57,6 +58,7 @@ not diluted into a mock:
 | I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs`, `multi_mount_shape.rs` |
 | I18 | `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs` | `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `docs/GC.md` |
 | I19, I20, I21 | `forge-api/workspace.rs` (`mount`, `session_mount_tree`, `check_observations`, `checkin`), `forge-store/meta.rs` (`mounts.base_oid`, `insert_mount`, `cas_ref_session`, `MIGRATE_2_TO_3`), `forge-api/gc.rs`, `fsck.rs` | `multi_mount_shape.rs`, `multi_mount_concurrent.rs`, `cli_mount_pin.rs`, `schema_migration_fixtures.rs`, `testdata/schema/v2_pre_mount_pin.sql`, `session_atomicity.rs`, `docs/GC.md` |
+| I22 | `forge-api/workspace.rs` (`checkin`), `forge-store/meta.rs` (`overlay_mounts_outside`), `forge-cli/main.rs` | `checkin_staged_work.rs`, `cli_checkin_staged_work.rs`, `multi_mount_shape.rs`, `gc_and_abandon.rs`, `CLI_ABI.md` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs`, `rename_characterisation.rs`, `property_merge_symmetry.rs` |
 | I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs`, `property_attenuation.rs`, `fuzz/cap_token` |
 | I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs` |
@@ -83,27 +85,12 @@ happen. None required anything to eventually happen, and none required an
 operation to act on *everything* in front of it. Both P0s that reached
 production here sat in exactly those two blind spots -- #233 because nothing
 said where a read resolves FROM, #326 because nothing said checkin must publish
-or explicitly refuse everything staged. I19-I21 close the first blind spot and
-the reachable part of the second. What the audit on `docs/invariant-shape-audit`
-found and this change does **not** fix, stated so it is not mistaken for
-covered:
+or explicitly refuse everything staged. I19-I21 close the first blind spot;
+I22 closes the second, scoped to the `noop` outcome, because `updated` and
+`forked` are progress and may legitimately leave another mount staged. What the
+audit on `docs/invariant-shape-audit` found and these changes do **not** fix,
+stated so it is not mistaken for covered:
 
-* **Checkin still reports `Noop` while another mount holds staged work.** I19
-  makes that work publishable -- `checkin --mount <path>` folds it onto that
-  mount's own base and CASes that mount's ref -- but `Noop` on `/` still means
-  "this mount stages nothing", not "the session stages nothing anywhere", so
-  `checkin` and `abandon` can still disagree about whether a session holds work.
-  That is #326's remaining half and belongs to `fix/checkin-noop-drops-staged-work`.
-  `multi_mount_shape.rs::checkin_reports_noop_while_another_mount_holds_unpublished_work`
-  pins it. That branch and this one are independent in mechanism but NOT
-  compatible as written: it refuses **every** checkin -- not only a `noop` --
-  while any other mount holds staged work, which under I19 deadlocks a session
-  holding two writable mounts, because publishing either one is refused on
-  account of the other and its own advice ("check each mount in on its own")
-  can never be followed. `multi_mount_concurrent.rs` reproduces that on the
-  merge of the two. The reconciliation is to scope the refusal to the `noop`
-  outcome: `updated` and `forked` are progress and may leave other mounts
-  staged, and only "there was nothing to do" may never be said over work.
 * **The observation epoch is per-session while the overlay epoch is per-mount.**
   `Meta::cas_ref_session` deletes observations for the whole namespace while
   deleting overlay for the published mount alone, so a foreign-mount read stops
