@@ -254,6 +254,38 @@ F_PLAIN_FILE="$WORK/not-a-directory"
 : >"$F_PLAIN_FILE"
 F_MISSING_FILE="$WORK/definitely-absent.bin"
 
+# ---------------------------------------------------------------------------
+# Fixture G: a contended round that forked, plus a session holding staged work.
+# This is the #12 / #309 surface: `abandon` and `gc` exit codes.
+# ---------------------------------------------------------------------------
+G="$WORK/fixture-fork"
+mkdir -p "$G"
+run init "$G"
+G_ROOT="$G/.forge/keys/root.cap"
+run --dir "$G" --cap "$G_ROOT" branch main shared
+G_SEED="$(capture --dir "$G" --cap "$G_ROOT" session open --from=shared | tr -d '\n')"
+run --dir "$G" --cap "$G_ROOT" mount --ns "$G_SEED" / ref:shared --rw
+run --dir "$G" --cap "$G_ROOT" write --ns "$G_SEED" /seed.txt --text v0
+run --dir "$G" --cap "$G_ROOT" checkin --ns "$G_SEED" -m seed
+G_WIN="$(capture --dir "$G" --cap "$G_ROOT" session open --from=shared | tr -d '\n')"
+run --dir "$G" --cap "$G_ROOT" mount --ns "$G_WIN" / ref:shared --rw
+G_LOSE="$(capture --dir "$G" --cap "$G_ROOT" session open --from=shared | tr -d '\n')"
+run --dir "$G" --cap "$G_ROOT" mount --ns "$G_LOSE" / ref:shared --rw
+run --dir "$G" --cap "$G_ROOT" write --ns "$G_WIN" /w.txt --text w
+run --dir "$G" --cap "$G_ROOT" write --ns "$G_LOSE" /l.txt --text l
+run --dir "$G" --cap "$G_ROOT" checkin --ns "$G_WIN" -m w
+# "forked <requested> -> <fork> ours=<oid> theirs=<oid>"
+G_FORKLINE="$(capture --dir "$G" --cap "$G_ROOT" checkin --ns "$G_LOSE" -m l | tr -d '\r')"
+G_FORK="$(printf '%s\n' "$G_FORKLINE" | awk '/^forked /{print $4; exit}')"
+case "$G_FORK" in
+forks/shared/*) ;;
+*) die "expected the losing checkin to fork, got: $G_FORKLINE" ;;
+esac
+# A session that wrote but never checked in: staged work abandon must protect.
+G_STAGED="$(capture --dir "$G" --cap "$G_ROOT" session open --from=shared | tr -d '\n')"
+run --dir "$G" --cap "$G_ROOT" mount --ns "$G_STAGED" / ref:shared --rw
+run --dir "$G" --cap "$G_ROOT" write --ns "$G_STAGED" /staged.txt --text staged
+
 ZERO_OID="$(printf '0%.0s' $(seq 1 64))"
 
 echo "# CLI_ABI.md conformance, binary: $FORGE"
@@ -284,6 +316,39 @@ check abi/1-raw-merge-resolution blocking 1 "" -- \
 check abi/1-attenuated-cap-cannot-merge blocking 1 "" -- \
 	--dir "$A" --cap "$A_ALICE" merge --into=main --from "heads/agents/anon/$A_NS"
 check abi/1-attenuated-cap-cannot-fsck blocking 1 "" -- --dir "$A" --cap "$A_ALICE" fsck --full
+
+# --- #12 / #309: abandon and gc ------------------------------------------
+# Ordered: every refusal is exercised before the row that actually retires.
+check abi/1-abandon-non-fork-ref blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork main
+check abi/1-abandon-missing-fork blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork forks/shared/anon/01ARZ3NDEKTSV4RRFFQ69G5FAV
+check abi/1-abandon-mounted-fork blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork "$G_FORK"
+check abi/1-abandon-session-with-staged-work blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon session "$G_STAGED"
+check abi/0-abandon-session blocking 0 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon session "$G_LOSE"
+check abi/0-abandon-fork blocking 0 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork "$G_FORK"
+check abi/1-abandon-fork-twice blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" abandon fork "$G_FORK"
+# A retired name is retired for good; recreating it would corrupt the reflog chain.
+check abi/1-recreate-retired-fork blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" branch main "$G_FORK"
+# The tombstone must not read as catalog corruption.
+check abi/0-fsck-full-after-abandon blocking 0 "" -- \
+	--dir "$G" --cap "$G_ROOT" fsck --full
+check abi/0-gc-dry-run blocking 0 "" -- \
+	--dir "$G" --cap "$G_ROOT" gc --dry-run
+check abi/0-gc-dry-run-json blocking 0 "" -- \
+	--dir "$G" --cap "$G_ROOT" gc --dry-run --min-age-secs 0 --json
+# Collection is not implemented, so omitting --dry-run is an input error.
+check abi/1-gc-refuses-to-collect blocking 1 "" -- \
+	--dir "$G" --cap "$G_ROOT" gc
+# A filtered ref view is not a root set (I13/I14).
+check abi/1-gc-attenuated-cap blocking 1 "" -- \
+	--dir "$A" --cap "$A_ALICE" gc --dry-run
 
 # --- exit 2: corruption or sealed-state violation -------------------------
 check abi/2-bitrot-fails-closed blocking 2 "" -- --dir "$D" --cap "$D_ROOT" fsck --full

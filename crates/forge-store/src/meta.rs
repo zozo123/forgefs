@@ -12,6 +12,25 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// The durable record `abandon_ref` leaves behind for a retired ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredRef {
+    pub name: String,
+    pub oid: ObjectId,
+    pub kind: String,
+    pub agent_id: String,
+    pub ts_ms: i64,
+}
+
+/// What `abandon_session` removed from the root set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbandonedSession {
+    pub ns_id: String,
+    pub discarded_overlay: usize,
+    pub removed_mounts: usize,
+    pub removed_observations: usize,
+}
+
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS refs (
   name       TEXT PRIMARY KEY,
@@ -104,6 +123,19 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 "#;
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+
+/// Reflog `reason` that retires a ref name for good. See `ref_retired`.
+pub const REFLOG_ABANDON: &str = "abandon";
+
+/// The only ref namespace `abandon_ref` will retire.
+///
+/// A fork name is `forks/<ref>/<agent>/<ulid>`: it is minted once by a losing
+/// CAS and never recomputed, so retiring it cannot collide with a later ref of
+/// the same name. Every other namespace -- `main`, `heads/`, `tags/`,
+/// `conflicts/`, `inbox/` -- is published history, a live session head, or
+/// sealed, and none of them is the unbounded steady-state growth this verb
+/// exists to bound.
+pub const ABANDONABLE_PREFIX: &str = "forks/";
 
 const REFS_COLUMNS: &[&str] = &["name", "oid", "kind", "protected", "sealed", "updated_ms"];
 const REFS_VALUES: &str = "typeof(name)='text' AND typeof(oid)='blob' \
@@ -915,6 +947,39 @@ fn table_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
     Ok(found != 0)
 }
 
+/// True when `name` carries a terminal `abandon` reflog entry, i.e. the ref was
+/// explicitly retired by `abandon_ref` and its row deliberately removed.
+///
+/// The reflog is the tombstone. `abandon_ref` is the only operation in this
+/// store that deletes a `refs` row, and it always leaves an `abandon` entry
+/// behind, so a name in that state is retired rather than missing. Two
+/// consumers depend on that distinction: `audit_catalog` must not report the
+/// surviving reflog rows as REFLOG_ORPHAN, and no creation path may resurrect
+/// the name -- a resurrected ref would start a fresh `old_oid IS NULL` reflog
+/// row on top of a chain that already has a terminal entry, which
+/// `audit_catalog` correctly reports as REFLOG_CHAIN corruption.
+fn ref_retired(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
+    let reason: Option<String> = tx
+        .query_row(
+            "SELECT reason FROM reflog WHERE name=?1 ORDER BY id DESC LIMIT 1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sql)?;
+    Ok(reason.as_deref() == Some(REFLOG_ABANDON))
+}
+
+/// Fail closed on any attempt to recreate a retired ref name.
+fn deny_retired(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<()> {
+    if ref_retired(tx, name)? {
+        return Err(Error::Invalid(format!(
+            "ref {name} was abandoned; the name is retired and cannot be recreated"
+        )));
+    }
+    Ok(())
+}
+
 fn ref_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool> {
     let found: i64 = tx
         .query_row("SELECT COUNT(*) FROM refs WHERE name=?1", [name], |r| {
@@ -1511,7 +1576,7 @@ impl Meta {
                         _ => {}
                     }
                     previous_reflog.insert(name.clone(), new_oid);
-                    terminal_reflog.insert(name, new_oid);
+                    terminal_reflog.insert(name, (new_oid, reason));
                 }
 
                 for (name, (ref_oid, _, _, _)) in &refs {
@@ -1521,7 +1586,7 @@ impl Meta {
                             format!("catalog:ref:{name}"),
                             "current ref has no reflog entry",
                         ),
-                        Some(log_oid) if log_oid != ref_oid => audit.finding(
+                        Some((log_oid, _)) if log_oid != ref_oid => audit.finding(
                             "REFLOG_TERMINAL",
                             format!("catalog:ref:{name}"),
                             format!(
@@ -1532,7 +1597,14 @@ impl Meta {
                     }
                 }
                 for name in reflog_names {
-                    if !refs.contains_key(&name) {
+                    // A chain that ends in `abandon` has no `refs` row on
+                    // purpose: `abandon_ref` retired the name and left the
+                    // reflog as the durable tombstone. That is the one
+                    // legitimate way a reflog name outlives its ref.
+                    let retired = terminal_reflog
+                        .get(&name)
+                        .is_some_and(|(_, reason)| reason == REFLOG_ABANDON);
+                    if !refs.contains_key(&name) && !retired {
                         audit.finding(
                             "REFLOG_ORPHAN",
                             format!("catalog:reflog:{name}"),
@@ -2261,6 +2333,7 @@ impl Meta {
         if ref_exists(&tx, name)? {
             return Err(Error::Invalid(format!("ref {name} already exists")));
         }
+        deny_retired(&tx, name)?;
         tx.execute(
         "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
         params![name, oid.as_bytes().as_slice(), kind, protected as i64, sealed as i64, ts],
@@ -2295,6 +2368,7 @@ impl Meta {
         let mut conn = self.write.lock();
         let txn_timer = self.txn_timer();
         let tx = self.begin_tx(&mut conn)?;
+        deny_retired(&tx, name)?;
         let ts = now_ms() as i64;
         tx.execute(
         "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -2365,6 +2439,7 @@ impl Meta {
         let ts = now_ms() as i64;
 
         if row.is_none() {
+            deny_retired(&tx, name)?;
             tx.execute(
                 "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
                 params![name, new.as_bytes().as_slice(), kind, ts],
@@ -2511,6 +2586,7 @@ impl Meta {
         let ts = now_ms() as i64;
 
         if row.is_none() {
+            deny_retired(&tx, name)?;
             tx.execute(
                 "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,?3,0,0,?4)",
                 params![name, new.as_bytes().as_slice(), kind, ts],
@@ -3221,6 +3297,226 @@ impl Meta {
         )
         .optional()
         .map_err(map_sql)
+    }
+
+    /// Explicitly retire a fork ref, removing it from the GC root set.
+    ///
+    /// This is the only operation in ForgeFS that deletes a `refs` row, and it
+    /// is a deliberate act rather than a failure path, so I18 is untouched: a
+    /// refused checkin still forks and still keeps the work. What it adds is
+    /// the other half of I18 -- every losing CAS mints a fork ref that pins an
+    /// object closure forever, and until now nothing could retire one.
+    ///
+    /// The row is replaced by a terminal `abandon` reflog entry recording the
+    /// retired OID, the agent and the time, so the work stays addressable by
+    /// OID and auditable by name. `ref_retired` makes that entry load-bearing
+    /// for `audit_catalog` and for every ref-creation path.
+    ///
+    /// Refused, inside the same immediate transaction that would delete the
+    /// row, when the ref is protected, sealed, still the live head of a
+    /// namespace, or still named by a mount. Those are exactly the states in
+    /// which a concurrent session can still resolve the name, and a dangling
+    /// mount or live_ref is the corruption `fsck` reports as exit 2.
+    pub fn abandon_ref(&self, name: &str, agent_id: &str) -> Result<RetiredRef> {
+        validate_ref_name(name)?;
+        if !name.starts_with(ABANDONABLE_PREFIX) {
+            return Err(Error::Invalid(format!(
+                "only {ABANDONABLE_PREFIX}* refs may be abandoned, not {name}"
+            )));
+        }
+        let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
+        let row = tx
+            .query_row(
+                "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
+                [name],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| self.map_sql_counted(error))?;
+        let Some((oid, kind, protected, sealed)) = row else {
+            if ref_retired(&tx, name)? {
+                return Err(Error::Invalid(format!("ref {name} is already abandoned")));
+            }
+            return Err(Error::NotFound(format!("ref {name}")));
+        };
+        if sealed != 0 {
+            return Err(Error::Sealed(name.to_string()));
+        }
+        if protected != 0 {
+            return Err(Error::Denied(format!("ref {name} is protected")));
+        }
+        let oid = oid_from_blob(oid)?;
+        let live: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM namespaces WHERE live_ref=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if live != 0 {
+            return Err(Error::Invalid(format!(
+                "ref {name} is the live head of an open session"
+            )));
+        }
+        let mounted: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM mounts WHERE spec=?1 OR spec=?2",
+                params![name, format!("ref:{name}")],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if mounted != 0 {
+            return Err(Error::Invalid(format!(
+                "ref {name} is still mounted by an open session"
+            )));
+        }
+        let ts = now_ms() as i64;
+        // I6: the ref change and its reflog entry commit together. The entry
+        // chains old_oid -> new_oid on the same OID, because the ref did not
+        // move -- it stopped existing -- so REFLOG_CHAIN stays satisfied.
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                name,
+                oid.as_bytes().as_slice(),
+                oid.as_bytes().as_slice(),
+                agent_id,
+                REFLOG_ABANDON,
+                ts
+            ],
+        )
+        .map_err(|error| self.map_sql_counted(error))?;
+        let removed = tx
+            .execute("DELETE FROM refs WHERE name=?1", [name])
+            .map_err(|error| self.map_sql_counted(error))?;
+        if removed != 1 {
+            return Err(Error::Internal(format!(
+                "abandon removed {removed} rows for ref {name}"
+            )));
+        }
+        self.commit_ref_tx(tx)?;
+        txn_timer.finish();
+        Ok(RetiredRef {
+            name: name.to_string(),
+            oid,
+            kind,
+            agent_id: agent_id.to_string(),
+            ts_ms: ts,
+        })
+    }
+
+    /// Explicitly retire a session, removing its pin, mounts, overlay and
+    /// observations from the GC root set.
+    ///
+    /// Uncommitted overlay entries ARE staged work, so a session holding any is
+    /// refused unless the caller passes `discard_staged`. That keeps the I18
+    /// spirit -- work is never destroyed by a path the caller did not choose --
+    /// while giving a stranded session the escape hatch it never had.
+    ///
+    /// The session's live head ref is deliberately left alone: it is published
+    /// history under `heads/`, not the fork churn this verb exists to bound.
+    pub fn abandon_session(&self, ns_id: &str, discard_staged: bool) -> Result<AbandonedSession> {
+        let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
+        let exists: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM namespaces WHERE id=?1",
+                [ns_id],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("namespace {ns_id}")));
+        }
+        let staged: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM overlay WHERE ns_id=?1",
+                [ns_id],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if staged != 0 && !discard_staged {
+            return Err(Error::Invalid(format!(
+                "session {ns_id} has {staged} staged overlay entries; check in first or abandon with the explicit discard flag"
+            )));
+        }
+        let mounts = tx
+            .execute("DELETE FROM mounts WHERE ns_id=?1", [ns_id])
+            .map_err(|error| self.map_sql_counted(error))?;
+        let observations = tx
+            .execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
+            .map_err(|error| self.map_sql_counted(error))?;
+        tx.execute("DELETE FROM overlay WHERE ns_id=?1", [ns_id])
+            .map_err(|error| self.map_sql_counted(error))?;
+        tx.execute("DELETE FROM namespaces WHERE id=?1", [ns_id])
+            .map_err(|error| self.map_sql_counted(error))?;
+        self.commit_ref_tx(tx)?;
+        txn_timer.finish();
+        Ok(AbandonedSession {
+            ns_id: ns_id.to_string(),
+            discarded_overlay: staged as usize,
+            removed_mounts: mounts,
+            removed_observations: observations,
+        })
+    }
+
+    /// Every landmark OID with the kind it was recorded as. Landmarks are GC
+    /// roots by construction (#249), so this is a root reader, not a report.
+    pub fn list_landmarks(&self) -> Result<Vec<(ObjectId, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn
+            .prepare("SELECT oid, kind FROM landmarks ORDER BY oid")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (oid, kind) = row.map_err(map_sql)?;
+            out.push((oid_from_blob(oid)?, kind));
+        }
+        Ok(out)
+    }
+
+    /// Every sealed tag with the three OIDs its manifest binds.
+    pub fn list_seals(&self) -> Result<Vec<(String, ObjectId, ObjectId, ObjectId)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn
+            .prepare("SELECT tag, snap_oid, commit_oid, tree_oid FROM seals ORDER BY tag")
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (tag, snap, commit, tree) = row.map_err(map_sql)?;
+            out.push((
+                tag,
+                oid_from_blob(snap)?,
+                oid_from_blob(commit)?,
+                oid_from_blob(tree)?,
+            ));
+        }
+        Ok(out)
     }
 
     pub fn landmark(&self, oid: ObjectId, kind: &str, reason: &str) -> Result<()> {

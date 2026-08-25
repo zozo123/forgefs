@@ -108,6 +108,28 @@ enum Cmd {
     Landmark {
         oid: String,
     },
+    /// Explicitly retire a fork ref or a session so it stops being a GC root.
+    ///
+    /// This is the resolution half of I18: a refused checkin forks and keeps
+    /// the work, and nothing could ever retire the fork afterwards. It is also
+    /// the escape hatch for a session that can no longer make progress.
+    Abandon {
+        #[command(subcommand)]
+        cmd: AbandonCmd,
+    },
+    /// Report what garbage collection would reclaim. Never deletes.
+    Gc {
+        /// Required. Collection is not implemented; see docs/GC.md.
+        #[arg(long)]
+        dry_run: bool,
+        /// Unreachable objects younger than this are withheld, because an
+        /// object is durable before the catalog row that roots it (I4).
+        #[arg(long, default_value_t = forge_api::DEFAULT_MIN_AGE_SECS)]
+        min_age_secs: u64,
+        /// Emit the structured report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Seal {
         r#ref: String,
         #[arg(long)]
@@ -172,6 +194,21 @@ enum SessionCmd {
     Open {
         #[arg(long, default_value = "main")]
         from: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AbandonCmd {
+    /// Retire a `forks/*` ref. The commit stays addressable by OID and the
+    /// reflog keeps the record; only the root goes away.
+    Fork { r#ref: String },
+    /// Retire a session's pin, mounts, overlay and observations.
+    Session {
+        ns: String,
+        /// Required when the session still holds staged overlay entries.
+        /// Without it a session with staged work is refused, not emptied.
+        #[arg(long)]
+        discard_staged: bool,
     },
 }
 
@@ -460,6 +497,43 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
         } => {
             for row in f.inbox_list(cap)? {
                 println!("{} {}", row.name, row.oid);
+            }
+        }
+        Cmd::Abandon {
+            cmd: AbandonCmd::Fork { r#ref },
+        } => {
+            let retired = f.abandon_fork(cap, &r#ref)?;
+            println!(
+                "abandoned {} {} {}",
+                retired.name, retired.kind, retired.oid
+            );
+        }
+        Cmd::Abandon {
+            cmd: AbandonCmd::Session { ns, discard_staged },
+        } => {
+            let retired = f.abandon_session(cap, &ns, discard_staged)?;
+            println!(
+                "abandoned session {} discarded={} mounts={} observations={}",
+                retired.ns_id,
+                retired.discarded_overlay,
+                retired.removed_mounts,
+                retired.removed_observations
+            );
+        }
+        Cmd::Gc {
+            dry_run,
+            min_age_secs,
+            json,
+        } => {
+            let report = f.gc(cap, dry_run, min_age_secs)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| Error::Internal(e.to_string()))?
+                );
+            } else {
+                print!("{}", report.render());
             }
         }
         Cmd::Landmark { oid } => {
