@@ -7,9 +7,21 @@ use crate::cbor::{
 use crate::tree::{validate_name, Tree, TreeEntry};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 
-const MAX_TREE_ENTRIES: u64 = 100_000;
+/// Most entries one VERSION 1 Tree may hold.
+///
+/// The limit is enforced on BOTH sides of the byte boundary, and the two sides
+/// are deliberately different errors (#355). Entries a caller supplied that
+/// exceed it are `Invalid` -- exit 1, bad input, and the caller is told the
+/// limit so they can split the directory. An array header read back OUT of the
+/// store that exceeds it is `Corrupt` -- exit 2 -- because no encoder this
+/// binary contains can have produced it, so the bytes are damaged.
+pub const MAX_TREE_ENTRIES: u64 = 100_000;
 const MAX_COMMIT_PARENTS: u64 = 1_024;
-const MAX_CONFLICT_ITEMS: u64 = 100_000;
+/// Most paths, bases or causal ids one VERSION 1 Conflict may hold. Split the
+/// same way as `MAX_TREE_ENTRIES`: `Conflict::validate` is the caller-input
+/// side (`Invalid`), `id_array` and `Conflict::decode` the read-back side
+/// (`Corrupt`).
+pub const MAX_CONFLICT_ITEMS: u64 = 100_000;
 
 pub fn hash_bytes(bytes: &[u8]) -> ObjectId {
     ObjectId(*blake3::hash(bytes).as_bytes())
@@ -121,6 +133,21 @@ impl Blob {
 
 impl Tree {
     pub fn encode(&self) -> Result<Vec<u8>> {
+        // The floor under every caller-construction path (#355). `Tree::new`
+        // takes entries an importer collected and `apply_overlay` takes entries
+        // a session staged; both reach the store only through here, so this is
+        // the one place that can promise no over-fanout tree is ever WRITTEN.
+        // It is `Invalid`, not `Corrupt`: an over-large directory is input a
+        // caller handed us, and exit 2 means the repository is damaged.
+        // `Tree::decode` keeps `Corrupt` for the same limit, because bytes read
+        // back that no encoder could have produced really are damage.
+        if self.entries.len() as u64 > MAX_TREE_ENTRIES {
+            return Err(Error::Invalid(format!(
+                "directory has {} entries, more than the {MAX_TREE_ENTRIES} a tree may hold; \
+                 split it into subdirectories",
+                self.entries.len()
+            )));
+        }
         let mut entries_cbor = Vec::new();
         encode_array_header(&mut entries_cbor, self.entries.len() as u64);
         for e in &self.entries {
@@ -328,6 +355,31 @@ pub struct Conflict {
 }
 
 impl Conflict {
+    /// Refuse a conflict that exceeds what a VERSION 1 Conflict can hold.
+    ///
+    /// `Conflict::encode` cannot fail, so the caller-input side of
+    /// `MAX_CONFLICT_ITEMS` lives here and `Store::put_conflict` calls it
+    /// (#355). Without it a merge over more than `MAX_CONFLICT_ITEMS`
+    /// conflicting paths wrote an object that `Conflict::decode` then rejected
+    /// as `Corrupt`, reporting exit 2 -- damage -- for two intact trees a
+    /// caller asked to merge. `Contribution::validate` is the same shape and
+    /// was already `Invalid`.
+    pub fn validate(&self) -> Result<()> {
+        for (what, n) in [
+            ("paths", self.paths.len()),
+            ("merge bases", self.bases.len()),
+            ("causal ids", self.causal.len()),
+        ] {
+            if n as u64 > MAX_CONFLICT_ITEMS {
+                return Err(Error::Invalid(format!(
+                    "conflict has {n} {what}, more than the {MAX_CONFLICT_ITEMS} a conflict \
+                     object may hold"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut bases_v = Vec::new();
         encode_array_header(&mut bases_v, self.bases.len() as u64);

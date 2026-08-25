@@ -402,7 +402,7 @@ impl Forge {
     pub fn checkin(&self, cap: &Cap, ns: &str, mount: &str, msg: &str) -> Result<CasResult> {
         self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
-        let m = longest_mount(&mounts, mount)?;
+        let m = named_mount(&mounts, ns, mount)?;
         if m.mode != Mode::Rw {
             return Err(Error::Denied("checkin on ro mount".into()));
         }
@@ -481,6 +481,11 @@ impl Forge {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                // `m.path` is the mount the CALLER named: `named_mount` matches
+                // exactly, so this cannot report on a mount the request never
+                // mentioned. It used to: `--mount /rw-okk` fell through
+                // `longest_mount` onto `/` and the refusal read "checkin / has
+                // nothing to publish" for a request about `/rw-okk` (#353).
                 return Err(Error::Invalid(format!(
                     "checkin {} has nothing to publish, but session {ns} holds staged work under \
                      mounts it does not publish: {named}; check each mount in on its own \
@@ -663,6 +668,48 @@ impl Forge {
         }
         Ok(())
     }
+}
+
+/// The mount a verb NAMES, as opposed to the mount a path falls UNDER.
+///
+/// `longest_mount` resolves a PATH: `read`, `ls`, `write` and `delete` are
+/// given a path inside some mount and must find the mount containing it. Every
+/// session has a `/` mount and `/` is a prefix of everything, so `longest_mount`
+/// never fails to match -- which is correct for a path and wrong for a name.
+///
+/// `checkin --mount` names the mount itself. Routed through `longest_mount`, an
+/// unknown name silently became the default `/` mount (#353): a misspelt
+/// `--mount /rw-okk` published `/` and answered `updated`, exit 0, and on a
+/// session with nothing staged it answered `noop` -- the one outcome CLI_ABI.md
+/// says "is a strong statement and callers may rely on it" -- for a request
+/// naming a mount that does not exist. The same misspelling also made the I22
+/// refusal report on `/`, a mount the caller had not mentioned.
+///
+/// This is the CLI half of the daemon defect fixed in #332, where a field
+/// ForgeFS did not know was "never silently taken to mean its default". The
+/// daemon refuses by name and lists what it accepts; CLI_ABI.md specifies the
+/// daemon as a strict projection of the CLI, so the CLI cannot be the looser of
+/// the two. `NotFound` and not `Invalid`: the request is well formed, the mount
+/// it names simply is not there, and both are exit 1.
+fn named_mount<'a>(mounts: &'a [Mount], ns: &str, requested: &str) -> Result<&'a Mount> {
+    let want = normalize_abs(requested)?;
+    if let Some(m) = mounts
+        .iter()
+        .find(|m| m.path == want || normalize_abs(&m.path).ok().as_deref() == Some(want.as_str()))
+    {
+        return Ok(m);
+    }
+    let mut known: Vec<&str> = mounts.iter().map(|m| m.path.as_str()).collect();
+    known.sort_unstable();
+    let known = if known.is_empty() {
+        "none".to_string()
+    } else {
+        known.join(", ")
+    };
+    Err(Error::NotFound(format!(
+        "session {ns} has no mount at {want}; checkin folds exactly the mount it is given and \
+         publishes no other, so it will not fall back to a default. This session mounts: {known}"
+    )))
 }
 
 fn contribution_path(mount: &str, rel: &str) -> String {

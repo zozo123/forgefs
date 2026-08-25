@@ -1,3 +1,4 @@
+use crate::object::MAX_TREE_ENTRIES;
 use forge_types::{EntryKind, Error, ObjectId, Result};
 use std::collections::BTreeMap;
 
@@ -184,6 +185,18 @@ fn apply_level(
     }
 
     let entries = merge_sorted_entries(base_tree.entries, edits);
+    // Name the directory the caller over-filled (#355). `Tree::encode` refuses
+    // this too and is the floor, but it sees only a count; the fold is the last
+    // frame that still knows WHICH directory the staged writes landed in, and a
+    // refusal naming no path is barely more actionable than exit 2 was.
+    if entries.len() as u64 > MAX_TREE_ENTRIES {
+        let dir = if prefix.is_empty() { "/" } else { prefix };
+        return Err(Error::Invalid(format!(
+            "checkin would give {dir} {} entries, more than the {MAX_TREE_ENTRIES} a tree may \
+             hold; split it into subdirectories",
+            entries.len()
+        )));
+    }
     let tree = Tree::from_canonical(entries)?;
     store.put_tree(&tree)
 }
