@@ -1,0 +1,18 @@
+{
+  "agents": 32,
+  "durability_mode": "synchronous=FULL, object file+dir fsync",
+  "execs_per_agent_op": 3,
+  "fsck": "ok",
+  "latency": {
+    "max_us": 42270,
+    "n": 32,
+    "p50_us": 20802,
+    "p95_us": 33616,
+    "p99_us": 42270
+  },
+  "ops_s": 165.806784907951,
+  "side": "forgefs-cli",
+  "wall_s": 0.1929957209999884,
+  "workers": 4,
+  "workload": "W7 (ForgeFS W1 logical shape, one process per step)"
+}
