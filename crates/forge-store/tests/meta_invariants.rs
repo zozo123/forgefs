@@ -109,7 +109,7 @@ fn seal_ref_reflog_and_seal_row_publish_atomically() {
         .unwrap();
 
     assert!(meta
-        .commit_seal("v1", oid(1), oid(2), oid(3), "sealer")
+        .commit_seal("v1", oid(1), oid(2), oid(3), "sealer", None)
         .is_err());
 
     assert!(
