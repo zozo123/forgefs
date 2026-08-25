@@ -1033,6 +1033,26 @@ impl World {
         Some((abs, m.path.clone()))
     }
 
+    /// Whether the session's own capability still covers the ref the mount at
+    /// `abs` names, i.e. whether a write or delete through it can be accepted.
+    ///
+    /// A losing CAS retargets the mount at `forks/<ref>/<agent>/<ulid>` (I18),
+    /// and an agent capability scoped to `heads/agents/<id>/*` does not cover
+    /// `forks/**`. So an agent whose checkin lost a race can no longer write
+    /// through its own mount: the work I18 preserved is at a ref its own
+    /// capability cannot name. That is production behaviour and it is modelled
+    /// here rather than characterised, because a scoped capability genuinely
+    /// does not cover that pattern -- but see the commit message: whether I18's
+    /// "retargets the session to it" is meaningful when the session cannot then
+    /// act on it is a real question this harness raised and did not answer.
+    fn mount_ref_is_writable(&self, s: &SessionM, abs: &str) -> bool {
+        let m = longest_mount(&s.mounts, abs).expect("mount");
+        match &m.spec {
+            SpecM::Ref(r) => self.caps[s.agent].0.allows_ref(r),
+            SpecM::Oid(..) => true,
+        }
+    }
+
     fn op_write(&mut self, rng: &mut Rng) {
         let Some(ns) = self.pick_session(rng) else {
             return;
@@ -1044,15 +1064,24 @@ impl World {
         let content = format!("v{}", rng.below(6)).into_bytes();
         let exec = rng.chance(1, 5);
         let cap = self.agent_cap(s.agent);
+        let unwritable = !self.mount_ref_is_writable(&s, &abs);
         let res = self.forge.write(&cap, &ns, &abs, &content, exec);
         self.say(format!(
             "write ns={ns} {abs} = {:?} exec={exec} -> {}",
             String::from_utf8_lossy(&content),
             if res.is_ok() { "ok" } else { "err" }
         ));
-        match res {
-            Ok(_) => {}
-            Err(e) => self.bail(&format!("write {abs} was refused: {e:?}")),
+        match (&res, unwritable) {
+            (Ok(_), false) => {}
+            (Err(Error::Denied(_)), true) => return,
+            _ => self.bail(&format!(
+                "write {abs}: real {res:?}, model expected {}",
+                if unwritable {
+                    "a Denied -- the mount names a ref this capability does not cover"
+                } else {
+                    "success"
+                }
+            )),
         }
         let m = longest_mount(&s.mounts, &abs).expect("mount").clone();
         let rel = rel_of(&m.path, &abs);
@@ -1072,14 +1101,23 @@ impl World {
             return;
         };
         let cap = self.agent_cap(s.agent);
+        let unwritable = !self.mount_ref_is_writable(&s, &abs);
         let res = self.forge.delete(&cap, &ns, &abs);
         self.say(format!(
             "delete ns={ns} {abs} -> {}",
             if res.is_ok() { "ok" } else { "err" }
         ));
-        match res {
-            Ok(()) => {}
-            Err(e) => self.bail(&format!("delete {abs} was refused: {e:?}")),
+        match (&res, unwritable) {
+            (Ok(()), false) => {}
+            (Err(Error::Denied(_)), true) => return,
+            _ => self.bail(&format!(
+                "delete {abs}: real {res:?}, model expected {}",
+                if unwritable {
+                    "a Denied -- the mount names a ref this capability does not cover"
+                } else {
+                    "success"
+                }
+            )),
         }
         let m = longest_mount(&s.mounts, &abs).expect("mount").clone();
         let rel = rel_of(&m.path, &abs);
