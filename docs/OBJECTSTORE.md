@@ -59,8 +59,8 @@ Publication is two-phase, and both phases are in the signatures.
 
 `LocalBlobStore` chooses *how* it takes the `finish` barriers with
 `DirectoryBarrier` (`FORGEFS_DIR_BARRIER`): one `fsync` per touched directory
-as it is touched, one per distinct directory in a single phase at `finish`
-(the default), or one `syncfs(2)` for the whole batch shared with concurrent
+as it is touched (the default), one per distinct directory in a single phase at
+`finish`, or one `syncfs(2)` for the whole batch shared with concurrent
 batches. That is a backend implementation choice and not a seam contract: every
 setting makes the same set of edges durable before `finish` returns, so the
 table above is what a caller may rely on. `docs/BENCH.md` has the measured cost

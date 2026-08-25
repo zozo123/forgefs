@@ -443,12 +443,12 @@ distinct leaf directories, so within-batch deduplication almost never fires.
 
 `DirectoryBarrier` selects how a `PublishBatch` proves its edges.
 `FORGEFS_DIR_BARRIER=per-directory|deferred|collapsed` overrides the default,
-which is `deferred`.
+which is `per-directory`.
 
 | Policy | Barriers | Portable |
 |---|---|---|
-| `per-directory` | one `fsync` per touched directory, taken as the batch touches it (the shape before #177) | yes |
-| `deferred` (default) | one `fsync` per *distinct* touched directory, all of them in a single phase immediately before `finish` returns | yes |
+| `per-directory` (default) | one `fsync` per touched directory, taken as the batch touches it (the shape before #177) | yes |
+| `deferred` | one `fsync` per *distinct* touched directory, all of them in a single phase immediately before `finish` returns | yes |
 | `collapsed` | one `syncfs(2)` for the whole batch, shared with any concurrent batch also waiting for one | Linux only |
 
 All three publish the same durable state, and the argument is an ordering one.
@@ -546,11 +546,17 @@ directory barriers look like nine sixteenths of the cost:
   the filesystem, including the peers' — so trading ten cheap merged barriers
   for seven expensive serialised ones loses.
 
-`deferred` is the default because it is the honest shape rather than because it
-is fast: it proves the same edges with the same primitive, deduplicates them,
-takes them all in one phase immediately before the ref CAS, and measures within
-noise of `per-directory` at every point (+7.1% at W=1, +8.4% at W=16, -0.5% at
-W=8). No throughput claim is made for it.
+`per-directory` stays the default, and the same table is why. `deferred` is
+the tidier shape — it proves the same edges with the same primitive,
+deduplicates them, and takes them all in one phase immediately before the ref
+CAS — but it measures *within noise* of `per-directory` at every point (+7.1%
+at W=1, +8.4% at W=16, -0.5% at W=8), so no throughput claim is made for it.
+The rule in *Interpretation rules* below applies to a default as much as to a
+new knob: a change that does not materially improve is not worth its risk, and
+this one lands in the durability-critical path, where the shape that has been
+exercised the longest is worth more than a delta the instrument cannot
+distinguish from drift. `deferred` remains selectable, and is the setting to
+reach for on a filesystem whose journal commit dominates its device flush.
 
 `collapsed` remains available and is the right setting where a barrier is
 genuinely expensive relative to filesystem writeback — a device whose flush

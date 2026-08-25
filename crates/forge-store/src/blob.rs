@@ -135,13 +135,18 @@ const DURABLE_OID_CACHE_CAPACITY: usize = 65_536;
 
 /// How a [`PublishBatch`] proves the directory edges that reach its objects.
 ///
-/// Both settings satisfy I4 identically: when `finish` returns, every object
-/// file the batch published or joined *and* every directory entry on the path
-/// to it is durable, and only then may a ref name it. They differ solely in
-/// how many barriers the kernel is asked for to establish that.
+/// All three settings satisfy I4 identically: when `finish` returns, every
+/// object file the batch published or joined *and* every directory entry on
+/// the path to it is durable, and only then may a ref name it. They differ
+/// solely in how many barriers the kernel is asked for to establish that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryBarrier {
     /// One `fsync` per touched directory, taken as the batch touches it.
+    ///
+    /// The default, and the shape this store has always had. `Deferred`
+    /// measures within noise of it rather than beating it (docs/BENCH.md), so
+    /// the durability-critical path keeps the shape that has been exercised
+    /// the longest.
     PerDirectory,
     /// One `fsync` per *distinct* touched directory, all of them taken in a
     /// single phase immediately before `finish` returns.
@@ -180,14 +185,16 @@ impl DirectoryBarrier {
         }
     }
 
-    /// `Deferred` everywhere: it is portable, it proves exactly the edges
-    /// `PerDirectory` proves with exactly the same primitive, and it is never
-    /// slower. `Collapsed` is not the default because a filesystem-wide
-    /// barrier costs far more than one `fsync` and is a global serialisation
-    /// point, so it loses under concurrency even though it issues fewer
-    /// barriers -- see docs/BENCH.md.
+    /// `PerDirectory` everywhere. `Deferred` proves exactly the same edges
+    /// with exactly the same primitive and is portable, but it measures within
+    /// noise of `PerDirectory` at every concurrency point (docs/BENCH.md), and
+    /// a behaviour change that does not materially improve is not worth taking
+    /// in the durability-critical path. `Collapsed` is not the default because
+    /// a filesystem-wide barrier costs far more than one `fsync` and is a
+    /// global serialisation point, so it loses 15-22% under concurrency even
+    /// though it issues fewer barriers -- see docs/BENCH.md.
     const fn platform_default() -> Self {
-        Self::Deferred
+        Self::PerDirectory
     }
 
     /// Whether every directory barrier waits for the single phase before
@@ -610,10 +617,12 @@ impl PublishBatch<'_> {
     /// Make `child` exist under `parent` and arrange for the barrier that
     /// proves that entry.
     ///
-    /// Under [`DirectoryBarrier::PerDirectory`] the barrier is taken here, as
-    /// it always was. Under [`DirectoryBarrier::Collapsed`] it is deferred to
-    /// `finish`, where one filesystem-wide barrier covers it along with every
-    /// other edge the batch touched. Deferral cannot weaken I4 because
+    /// Under [`DirectoryBarrier::PerDirectory`], the default, the barrier is
+    /// taken here, as it always was. Under [`DirectoryBarrier::Deferred`] it
+    /// waits for the single phase before `finish` returns, and under
+    /// [`DirectoryBarrier::Collapsed`] for the one filesystem-wide barrier
+    /// that covers it along with every other edge the batch touched.
+    /// Deferral cannot weaken I4 because
     /// nothing between here and `finish` may publish a ref, and the positive
     /// proof that lets a *later* batch skip the barrier is likewise recorded
     /// only after `finish` succeeds.
