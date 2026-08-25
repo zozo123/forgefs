@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use forge_api::{ExportOptions, Forge};
+use forge_api::{ExportOptions, Forge, ImportOptions};
 use forge_cap::Cap;
 use forge_types::{CasResult, Error, ObjectId};
 use std::path::{Path, PathBuf};
@@ -84,6 +84,13 @@ enum Cmd {
         source: PathBuf,
         #[arg(long)]
         r#ref: String,
+        /// Materialise each symlink as the CONTENT of its target: a file link
+        /// becomes a regular file, a directory link becomes a directory. Off by
+        /// default because a VERSION 1 tree cannot represent a symlink, so this
+        /// is a lossy conversion the operator has to ask for. Targets that
+        /// resolve outside the import root are still refused.
+        #[arg(long)]
+        follow_symlinks: bool,
     },
     Branch {
         from: String,
@@ -435,14 +442,18 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
             CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
         },
-        Cmd::Import { source, r#ref } => {
+        Cmd::Import {
+            source,
+            r#ref,
+            follow_symlinks,
+        } => {
             if !source.is_dir() {
                 return Err(Error::Invalid(format!(
                     "import source {} is not a directory",
                     source.display()
                 )));
             }
-            match f.import_dir(cap, &source, &r#ref)? {
+            match f.import_dir_with(cap, &source, &r#ref, ImportOptions { follow_symlinks })? {
                 CasResult::Updated { name, oid } => println!("imported {oid} -> {name}"),
                 CasResult::Forked {
                     requested,
