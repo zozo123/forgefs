@@ -22,7 +22,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I2 | One logical object ⇒ one byte string ⇒ one ObjectId. |
 | I3 | Put is idempotent iff bytes match; never overwrite. |
 | I4 | A committed ref implies fsynced object bytes and every directory edge needed to reach them; visibility alone is never a durability proof. |
-| I5 | Refs move only expected→new. Lost CAS forks or denies. Protected refs deny. |
+| I5 | Refs move only expected→new. Lost CAS forks or denies. Protected refs deny. A `seal` is a claim ABOUT a ref, so it publishes only while that ref still holds the commit the snapshot names, and refuses a moved head (exit 4) rather than naming a commit the ref no longer holds. |
 | I6 | Ref + reflog (+ seal) commit together. |
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Reads through a session resolve against a pinned base -- per mount, see I19 -- and its overlay, never a live ref another agent can move. Checkin CASes that oid, never a moving head. |
@@ -55,7 +55,7 @@ not diluted into a mock:
 |---|---|---|
 | I1, I2, I10, I17 | `forge-core`, `forge-store/graph.rs`, `forge-store/meta.rs`, `forge-api/import.rs`, `integration.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `provenance.rs`, `checkin_contribution.rs`, `typed_graph.rs`, `api_contract.rs`, `bootstrap_contract.rs`, `schema_migrations.rs`, `schema_migration_fixtures.rs`, `schema_migration_objects.rs`, `testdata/schema/README.md`, `property_canonical.rs`, `large_blob_memory.rs`, `fuzz/tree_name` |
 | I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `group_commit.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `forge-store/objectstore/conformance.rs`, `docs/RECOVERY.md`, `docs/OBJECTSTORE.md` |
-| I5, I7, I8 | `forge-store/meta.rs`, `forge-api/workspace.rs`, `refs.rs` | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `multi_mount_shape.rs`, `model_composition.rs`, `fuzz/ref_name` |
+| I5, I7, I8 | `forge-store/meta.rs` (`cas_ref*`, `commit_seal`), `forge-api/workspace.rs`, `refs.rs`, `integration.rs` (`seal`) | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `multi_mount_shape.rs`, `model_composition.rs`, `cli_seal_head_moves.rs`, `fuzz/ref_name` |
 | I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs`, `multi_mount_shape.rs`, `model_composition.rs` |
 | I18 | `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs` | `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `model_composition.rs`, `docs/GC.md` |
 | I19, I20, I21 | `forge-api/workspace.rs` (`mount`, `session_mount_tree`, `check_observations`, `checkin`), `forge-store/meta.rs` (`mounts.base_oid`, `insert_mount`, `cas_ref_session`, `MIGRATE_2_TO_3`), `forge-api/gc.rs`, `fsck.rs` | `multi_mount_shape.rs`, `multi_mount_concurrent.rs`, `cli_mount_pin.rs`, `schema_migration_fixtures.rs`, `testdata/schema/v2_pre_mount_pin.sql`, `session_atomicity.rs`, `model_composition.rs`, `docs/GC.md` |
@@ -63,7 +63,7 @@ not diluted into a mock:
 | I23 | `forge-api/gc.rs` (`gc_collect`, `schedule_catalog_roots`), `forge-store/meta.rs` (`gc_sweep`, `GcCatalogRoots`), `forge-store/blob.rs` (`refresh_dedup_mtime`) | `gc_collect_concurrent.rs`, `gc_collect.rs`, `gc_and_abandon.rs`, `cache_trust.rs`, `docs/GC.md` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs`, `rename_characterisation.rs`, `property_merge_symmetry.rs` |
 | I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs`, `property_attenuation.rs`, `fuzz/cap_token` |
-| I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs` |
+| I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs`, `cli_seal_head_moves.rs`, `cli_seal_race.rs` |
 | I16 | `forge-core/tree.rs`, `forge-api/export.rs` | `path_identity.rs`, `export_long_names.rs`, `export_name_collisions.rs`, `fuzz/tar_roundtrip` |
 
 Tests are named after these IDs or state the invariant in a one-line rationale.
@@ -117,9 +117,6 @@ stated so it is not mistaken for covered:
   the way `DELETE FROM overlay` is.
   `multi_mount_shape.rs::a_checkin_of_one_mount_forgets_every_other_mounts_observations`
   pins it.
-* **`Meta::commit_seal` performs no compare-and-swap against the ref it seals.**
-  The snapshot is internally consistent, but `seal main v1` can publish a tag
-  naming a commit `main` no longer held when the tag became visible.
 * **A read-write mount on a PROTECTED ref accepts writes nothing can publish.**
   I20 requires a mount that accepts a write to have a verb that can publish it,
   and it refuses a read-write `oid:` spec and a ref not holding a commit for
@@ -132,16 +129,6 @@ stated so it is not mistaken for covered:
   `liveness_session_with_staged_work_can_be_stranded` states it by hand. The fix
   is the same shape as the other two: refuse the mount, since write authority
   over a protected ref is authority checkin can never exercise.
-* **`serve` is outside the contract entirely (#332).** No invariant names it,
-  `CLI_ABI.md` does not describe it, and `scripts/cli-abi-conformance.sh`
-  exercises the CLI binary alone -- so the daemon's exit codes, error mapping
-  and argument surface are unspecified and untested. The specific superset
-  #332 reported is closed: `ns.checkin` takes a caller-chosen `mount`, and the
-  CLI can now express it too (`checkin --mount`). The contract gap is not.
-  Either document the daemon as its own ABI with its own conformance rows, or
-  constrain `dispatch` to what the CLI can express -- before anyone builds
-  against `serve` and today's undocumented behaviour becomes tomorrow's
-  compatibility obligation.
 
 ### Which operations an invariant actually constrains
 
@@ -159,19 +146,22 @@ an operation no rule names is a bug class nothing prevents. As of I23:
 | `abandon` | I18 (a fork stays a root until deliberately retired) |
 | `gc` | I23 (collection unlinks only unreachable bytes) |
 | `merge` | I11 (overlap is a Conflict object), I12 (order comes from the DAG) |
-| `seal`, `verify`, `fsck` | I6, I10, I15 |
+| `seal`, `verify`, `fsck` | I5 (a seal CASes the ref it names), I6, I10, I15 |
 | `import`, `export` | I1, I2, I16 |
 | `grant` | I13, I14 |
 | **`write`** | **nothing** -- staging is constrained only downstream, by what I22 makes checkin say about it |
 | **`branch`** | **nothing.** `Forge::branch` calls `Meta::insert_ref`, not a CAS, so I5 -- which governs how refs *move* -- does not cover ref *creation* at all |
-| **`serve`** | **nothing** (#332, above) |
+| `serve` | nothing directly, but `CLI_ABI.md` now specifies the daemon as a strict projection of the CLI -- every op is a CLI verb with that verb's own arguments and defaults, so whatever constrains the verb constrains the daemon call (#332). `daemon_abi.rs` is its conformance suite |
 | **`inbox`, `landmark`, `init`, `refs`, `log`, `show`, `stats`** | **nothing** |
 
 The unconstrained rows are not all equally alarming -- `log` and `show` are
-read-only projections -- but `write`, `branch` and `serve` each move or create
-durable state, and each is a place where the next unstated-invariant defect can
-sit. `mount` and `gc` were on this list until I19/I20 and I23; both had live
-defects (#327, #328, #330, #333, #12) waiting in exactly that silence.
+read-only projections -- but `write` and `branch` each move or create durable
+state, and each is a place where the next unstated-invariant defect can sit.
+`mount` and `gc` were on this list until I19/I20 and I23, and `seal` had an
+unstated CAS until #331; all three had live defects (#327, #328, #330, #333,
+#12, #331) waiting in exactly that silence. `serve` left the list by being
+defined in terms of rows that already have one, rather than by acquiring an
+invariant of its own.
 
 ### Shape of the set
 

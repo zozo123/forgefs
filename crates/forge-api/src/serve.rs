@@ -1,6 +1,6 @@
 use crate::Forge;
 use forge_protocol::{read_frame_body, read_frame_len_after, write_frame, Request, Response};
-use forge_types::{Error, Result};
+use forge_types::{CasResult, Error, Result};
 use serde_json::{json, Value};
 use std::io::{BufReader, BufWriter, Read};
 use std::net::{Shutdown, SocketAddr};
@@ -323,7 +323,14 @@ fn http_accept_loop(forge: Arc<Forge>, server: tiny_http::Server) -> Result<()> 
     Ok(())
 }
 
-fn http_status(resp: &Response) -> u16 {
+/// The daemon's HTTP status for a response.
+///
+/// Public so the daemon-ABI conformance test can pin one status per error
+/// class instead of restating the mapping. HTTP is lossier than the exit-code
+/// table on purpose -- 409 covers `sealed`, `conflict`, `stale_observation`
+/// and `invalid_base` alike -- so a client that needs the CLI's classification
+/// reads `err.code`, never the status. CLI_ABI.md states this.
+pub fn http_status(resp: &Response) -> u16 {
     if resp.ok {
         return 200;
     }
@@ -338,6 +345,40 @@ fn http_status(resp: &Response) -> u16 {
     }
 }
 
+/// Every op the daemon serves, and every request-body field each one accepts.
+///
+/// This table IS the daemon ABI's argument surface, and it exists so that
+/// surface is a projection of the CLI rather than a second, wider one (#332).
+/// Each row names a CLI verb and lists exactly the inputs that verb takes;
+/// anything else is refused, so a daemon client can ask for precisely what a
+/// CLI user can ask for and no more. A field ForgeFS does not know is an
+/// error, never a silent default -- `{"mnt": "/x"}` used to be accepted as a
+/// checkin of the DEFAULT mount, and `{"attest": true}` used to seal without
+/// attesting and answer 200.
+///
+/// Adding an op or a field here is the deliberate act of widening the daemon
+/// ABI. `daemon_abi.rs` pins this table against CLI_ABI.md, so it cannot be
+/// widened by accident.
+pub const DAEMON_OPS: &[(&str, &[&str])] = &[
+    // `forge session open [--from]`
+    ("session.open", &["from"]),
+    // `forge write --ns <path> --file|--text`; `hex` is the wire form of
+    // `--file`, since a daemon client has no path on the server's filesystem.
+    ("ns.write", &["ns", "path", "text", "hex"]),
+    // `forge read --ns <path>`
+    ("ns.read", &["ns", "path"]),
+    // `forge ls --ns [path]`
+    ("ns.ls", &["ns", "path"]),
+    // `forge checkin --ns [--mount] [-m]`
+    ("ns.checkin", &["ns", "mount", "msg"]),
+    // `forge mount --ns <path> <spec> [--rw]`
+    ("ns.mount", &["ns", "path", "spec", "rw"]),
+    // `forge refs`
+    ("refs", &[]),
+    // `forge seal <ref> --tag [--attest]`
+    ("seal", &["ref", "tag", "attest"]),
+];
+
 pub fn dispatch(forge: &Forge, req: Request) -> Response {
     match dispatch_inner(forge, &req) {
         Ok(v) => Response::ok(req.id, v),
@@ -345,10 +386,89 @@ pub fn dispatch(forge: &Forge, req: Request) -> Response {
     }
 }
 
+/// Refuse an op this daemon does not serve, and any field its CLI verb cannot
+/// express, before the op runs.
+fn check_request_shape(op: &str, body: &Value) -> Result<()> {
+    let Some((_, accepted)) = DAEMON_OPS.iter().find(|(name, _)| *name == op) else {
+        return Err(Error::Invalid(format!("unknown op {op}")));
+    };
+    let fields = match body {
+        Value::Object(fields) => fields,
+        // An absent body is the empty body; anything else is not a request.
+        Value::Null => return Ok(()),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "op {op} body must be a JSON object"
+            )))
+        }
+    };
+    for key in fields.keys() {
+        if !accepted.contains(&key.as_str()) {
+            return Err(Error::Invalid(format!(
+                "unknown field {key:?} for op {op}; accepted: {}",
+                if accepted.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    accepted.join(", ")
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn s<'a>(body: &'a Value, k: &str) -> Result<&'a str> {
     body.get(k)
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::Invalid(format!("missing {k}")))
+}
+
+/// An optional string field with the CLI default for the same argument.
+fn opt<'a>(body: &'a Value, k: &str, default: &'a str) -> Result<&'a str> {
+    match body.get(k) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(v)) => Ok(v),
+        Some(_) => Err(Error::Invalid(format!("{k} must be a string"))),
+    }
+}
+
+/// A boolean field standing for a CLI flag: a flag is present or absent, so
+/// anything that is not a JSON boolean is an input error rather than `false`.
+fn flag(body: &Value, k: &str) -> Result<bool> {
+    match body.get(k) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(v)) => Ok(*v),
+        Some(_) => Err(Error::Invalid(format!("{k} must be a boolean"))),
+    }
+}
+
+/// A CAS outcome in the CLI's own three-word vocabulary.
+///
+/// This body used to be `format!("{r:?}")` -- a Rust `Debug` rendering, e.g.
+/// `Updated { name: "heads/...", oid: ObjectId(b392...) }`. Nothing documented
+/// it, nothing tested it, and any client that parsed it would have pinned
+/// ForgeFS to a derived formatter.
+fn cas_result(result: CasResult) -> Value {
+    match result {
+        CasResult::Updated { name, oid } => {
+            json!({"result": "updated", "name": name, "oid": oid.hex()})
+        }
+        CasResult::Forked {
+            requested,
+            fork,
+            ours,
+            theirs,
+        } => json!({
+            "result": "forked",
+            "requested": requested,
+            "fork": fork,
+            "ours": ours.hex(),
+            "theirs": theirs.hex(),
+        }),
+        CasResult::Noop { name, oid } => {
+            json!({"result": "noop", "name": name, "oid": oid.hex()})
+        }
+    }
 }
 
 fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
@@ -359,9 +479,11 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
         )));
     }
     let cap = forge.load_cap(&req.cap)?;
+    check_request_shape(&req.op, &req.body)?;
     match req.op.as_str() {
         "session.open" => {
-            let ns = forge.session_open(&cap, s(&req.body, "from")?)?;
+            // `forge session open` defaults --from to main; so does this.
+            let ns = forge.session_open(&cap, opt(&req.body, "from", "main")?)?;
             Ok(json!({ "ns": ns }))
         }
         "ns.write" => {
@@ -386,27 +508,21 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
             Ok(json!({ "hex": forge_types::hex_encode(&data) }))
         }
         "ns.ls" => {
-            let ents = forge.ls(
-                &cap,
-                s(&req.body, "ns")?,
-                req.body.get("path").and_then(|v| v.as_str()).unwrap_or("/"),
-            )?;
+            let ents = forge.ls(&cap, s(&req.body, "ns")?, opt(&req.body, "path", "/")?)?;
             Ok(json!(ents
                 .into_iter()
                 .map(|(n, k, id, x)| json!({"name": n, "kind": k, "id": id, "exec": x}))
                 .collect::<Vec<_>>()))
         }
         "ns.checkin" => {
+            // Exactly `forge checkin --ns [--mount] [-m]`, defaults included.
             let r = forge.checkin(
                 &cap,
                 s(&req.body, "ns")?,
-                req.body
-                    .get("mount")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/"),
-                req.body.get("msg").and_then(|v| v.as_str()).unwrap_or(""),
+                opt(&req.body, "mount", "/")?,
+                opt(&req.body, "msg", "")?,
             )?;
-            Ok(json!(format!("{r:?}")))
+            Ok(cas_result(r))
         }
         "ns.mount" => {
             forge.mount(
@@ -414,23 +530,36 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
                 s(&req.body, "ns")?,
                 s(&req.body, "path")?,
                 s(&req.body, "spec")?,
-                req.body
-                    .get("rw")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                flag(&req.body, "rw")?,
             )?;
             Ok(json!({"ok": true}))
         }
         "refs" => {
+            // Same rows and the same authority filtering as `forge refs`,
+            // including the P/S flags that listing prints.
             let refs = forge.refs(&cap)?;
             Ok(json!(refs
                 .into_iter()
-                .map(|r| json!({"name": r.name, "oid": r.oid.hex(), "kind": r.kind}))
+                .map(|r| json!({
+                    "name": r.name,
+                    "oid": r.oid.hex(),
+                    "kind": r.kind,
+                    "protected": r.protected,
+                    "sealed": r.sealed,
+                }))
                 .collect::<Vec<_>>()))
         }
         "seal" => {
-            let oid = forge.seal(&cap, s(&req.body, "ref")?, s(&req.body, "tag")?)?;
-            Ok(json!({"oid": oid.hex()}))
+            let tag = s(&req.body, "tag")?;
+            let attest = flag(&req.body, "attest")?;
+            let oid = forge.seal(&cap, s(&req.body, "ref")?, tag)?;
+            // `forge seal --attest` re-reads the durable bytes before it
+            // reports success. A daemon client asking for the same thing used
+            // to be answered 200 with no attestation performed at all.
+            if attest {
+                forge.verify_tag(&cap, tag)?;
+            }
+            Ok(json!({"oid": oid.hex(), "attested": attest}))
         }
         other => Err(Error::Invalid(format!("unknown op {other}"))),
     }

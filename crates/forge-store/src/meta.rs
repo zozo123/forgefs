@@ -4342,10 +4342,23 @@ impl Meta {
         commit: ObjectId,
         tree: ObjectId,
     ) -> Result<()> {
-        self.commit_seal(tag, snap, commit, tree, "seal")
+        self.commit_seal(tag, snap, commit, tree, "seal", None)
     }
 
     /// Atomically publish a sealed tag: refs row + seals row + landmarks.
+    ///
+    /// `expect_ref` is the seal's compare-and-swap against the ref the tag
+    /// claims to name: `Some((name, oid))` publishes only while `name` still
+    /// holds `oid`, checked inside this very transaction. I5 says refs move
+    /// only expected -> new, and a seal is a claim ABOUT a ref -- "this ref was
+    /// this commit at this moment" -- so a seal that reads a head and then
+    /// publishes whatever it read, with the head free to move in between,
+    /// states that claim without ever checking it.
+    ///
+    /// `None` is the raw catalog primitive: it publishes a seals row that is
+    /// about no ref at all, which is what [`Meta::insert_seal`] and the
+    /// tamper fixtures need. It is the only way to opt out, and it is
+    /// deliberately explicit at every call site.
     pub fn commit_seal(
         &self,
         tag: &str,
@@ -4353,6 +4366,7 @@ impl Meta {
         commit: ObjectId,
         tree: ObjectId,
         agent_id: &str,
+        expect_ref: Option<(&str, ObjectId)>,
     ) -> Result<()> {
         let mut conn = self.write.lock();
         let txn_timer = self.txn_timer();
@@ -4362,8 +4376,32 @@ impl Meta {
         validate_ref_kind(&tag_ref, "snapshot")?;
         // A frozen tag is sealed state, so re-sealing must surface as
         // Error::Sealed (exit 2), not as a PRIMARY KEY violation.
+        //
+        // Checked BEFORE the head CAS on purpose: a tag that already exists can
+        // never be published again from any head, so that is the stronger and
+        // more useful refusal. A moved head is retryable; a frozen tag is not.
         if ref_exists(&tx, &tag_ref)? {
             return Err(Error::Sealed(tag_ref));
+        }
+        if let Some((name, expected)) = expect_ref {
+            // BEGIN IMMEDIATE, so this read and the inserts below are one
+            // atomic observation: no other process can move `name` between
+            // them, in this process or any other.
+            let found: Option<Vec<u8>> = tx
+                .query_row("SELECT oid FROM refs WHERE name=?1", [name], |r| r.get(0))
+                .optional()
+                .map_err(map_sql)?;
+            let Some(found) = found else {
+                return Err(Error::NotFound(format!("ref {name}")));
+            };
+            let found = oid_from_blob(found)?;
+            if found != expected {
+                return Err(Error::StaleObservation {
+                    path: name.to_string(),
+                    expected: expected.hex(),
+                    found: found.hex(),
+                });
+            }
         }
         tx.execute(
             "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'snapshot',1,1,?3)",

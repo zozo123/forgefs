@@ -158,9 +158,22 @@ impl Forge {
         let sig: Signature = sk.sign(h.as_bytes());
         snap.sig = sig.to_bytes();
         let snap_oid = self.store.put_snapshot(&snap)?;
-        self.store
-            .meta
-            .commit_seal(tag, snap_oid, row.oid, commit.tree, cap.agent_id())?;
+        // Everything above read `row.oid` and is now durable; the seal
+        // transaction below is the first and only point at which the tag is
+        // published. This is exactly the window in which another process can
+        // move the head this snapshot names, so it is where the seal-side
+        // barrier belongs -- the analogue of the checkin CAS barrier.
+        crate::test_hooks::process_barrier("FORGEFS_TEST_SEAL_CAS_BARRIER", 2, "seal CAS")?;
+        self.store.meta.commit_seal(
+            tag,
+            snap_oid,
+            row.oid,
+            commit.tree,
+            cap.agent_id(),
+            // I5 for seal: publish only while the ref still holds exactly
+            // the commit this snapshot was built from.
+            Some((r#ref, row.oid)),
+        )?;
         Ok(snap_oid)
     }
 
