@@ -50,6 +50,29 @@ writer half-updated. Refusing to enter the band is the only safe answer.
 `scripts/enospc-sigbus-probe.sh` reproduces and asserts this contract. It needs
 Linux, root and `mkfs.ext4`, so it is not part of `scripts/release-gate.sh`.
 
+## Mounts and checkin: `forge mount`, `forge checkin`
+
+Neither verb introduces an exit code. Both map onto the table above.
+
+| Outcome | Exit |
+|---|---:|
+| mount taken; a `--rw` mount is pinned to the commit its ref holds now (I19) | 0 |
+| `--rw` with an `oid:` spec, or a ref that does not hold a commit: refused, because checkin would have nothing to advance (I20) | 1 |
+| spec names a ref or object that does not resolve | 1 |
+| re-mounting a path at a different spec, or demoting it to read-only, while it holds staged overlay (I19) | 1 |
+| the capability may not read the spec, or may not write the ref for `--rw` | 1 |
+| `checkin --mount <path>` published, forked, or was a no-op | 0 |
+| `checkin` on a read-only mount, or on a ref the capability may not write | 1 |
+| `checkin` of a mount whose ref is protected | 1 |
+| `checkin` refused for a stale observation | 4 |
+
+`forge checkin --mount` defaults to `/`. Checkin folds exactly the named mount
+and CASes the ref THAT MOUNT names, using that mount's own pinned base as the
+expected value; a lost CAS forks (I5/I18) and retargets that mount at the fork.
+A session holding read-write mounts on several refs therefore publishes them one
+`checkin --mount` at a time, and publishing one never moves what another mount
+reads.
+
 ## Reclamation: `forge abandon` and `forge gc`
 
 Neither verb introduces an exit code. Both map onto the table above:

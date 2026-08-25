@@ -10,6 +10,10 @@ pub struct Mount {
     pub path: String,
     pub spec: String,
     pub mode: Mode,
+    /// I19: the commit a read-write mount is pinned to. `None` for a read-only
+    /// mount, which resolves live on purpose, and for a raw `oid:` mount, whose
+    /// spec already names immutable bytes.
+    pub base_oid: Option<ObjectId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +45,7 @@ impl From<MountRow> for Mount {
             path: r.path,
             spec: r.spec,
             mode: Mode::parse(&r.mode).unwrap_or(Mode::Ro),
+            base_oid: r.base_oid,
         }
     }
 }
@@ -281,11 +286,13 @@ mod tests {
                 path: "/".into(),
                 spec: "ref:heads/a".into(),
                 mode: Mode::Rw,
+                base_oid: None,
             },
             Mount {
                 path: "/main".into(),
                 spec: "ref:main".into(),
                 mode: Mode::Ro,
+                base_oid: None,
             },
         ];
         let m = longest_mount(&mounts, "/main/src/a.rs").unwrap();

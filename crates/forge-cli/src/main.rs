@@ -68,6 +68,11 @@ enum Cmd {
     Checkin {
         #[arg(long)]
         ns: String,
+        /// Mount to publish. Checkin folds exactly this one mount and CASes the
+        /// ref that mount names, from that mount's own pinned base (I19), so a
+        /// session that wrote through a `--rw` mount elsewhere names it here.
+        #[arg(long, default_value = "/")]
+        mount: String,
         #[arg(short, long, default_value = "")]
         message: String,
     },
@@ -427,7 +432,7 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             let id = f.write(cap, &ns, &path, &data, false)?;
             println!("{id}");
         }
-        Cmd::Checkin { ns, message } => match f.checkin(cap, &ns, "/", &message)? {
+        Cmd::Checkin { ns, mount, message } => match f.checkin(cap, &ns, &mount, &message)? {
             CasResult::Updated { name, oid } => println!("updated {name} {oid}"),
             CasResult::Forked {
                 requested,
