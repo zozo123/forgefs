@@ -8,7 +8,8 @@ pub mod tree;
 
 pub use contribution::{Contribution, ContributionRead};
 pub use object::{
-    decode_object_type, hash_bytes, parse_file, Blob, Commit, Conflict, ConflictPath, Snapshot,
+    blob_frame_prefix, decode_object_type, hash_bytes, hash_parts, parse_file, Blob, Commit,
+    Conflict, ConflictPath, Snapshot,
 };
 pub use provenance::ProvenanceManifest;
 pub use tree::{apply_overlay, split_path, validate_name, Overlay, Tree, TreeEntry, TreeStore};

@@ -291,6 +291,12 @@ impl Store {
         self.blobs.put(bytes)
     }
 
+    /// Publish the object file formed by concatenating `parts`. Same bytes,
+    /// same ObjectId and same barriers as `put_raw(&parts.concat())`.
+    pub fn put_raw_parts(&self, parts: &[&[u8]]) -> Result<ObjectId> {
+        self.blobs.put_parts(parts)
+    }
+
     pub fn get_raw(&self, id: ObjectId) -> Result<Vec<u8>> {
         {
             let mut c = self.blob_cache.lock();
@@ -310,12 +316,15 @@ impl Store {
         self.blobs.get(id)
     }
 
+    /// Publish `data` as a Blob without copying it. The published bytes are
+    /// identical to `Blob { data }.encode()`; what is gone is the pair of
+    /// full-payload allocations that shape used (`to_vec`, then the encode
+    /// buffer), so publishing costs the caller's buffer plus a 16-byte frame
+    /// instead of three times the payload. Identity is unchanged (I2), and so
+    /// is the VERSION 1 encoding (FORMAT.md).
     pub fn put_blob_data(&self, data: &[u8]) -> Result<ObjectId> {
-        let file = Blob {
-            data: data.to_vec(),
-        }
-        .encode();
-        self.put_raw(&file)
+        let prefix = forge_core::blob_frame_prefix(data.len() as u64);
+        self.put_raw_parts(&[&prefix, data])
     }
 
     pub fn get_blob_data(&self, id: ObjectId) -> Result<Vec<u8>> {
