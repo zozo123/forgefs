@@ -355,11 +355,13 @@ fn checkin_answers_in_the_cli_outcome_vocabulary() {
     let forked = ok(&f, &token, "ns.checkin", json!({"ns": lose, "msg": "l"}));
     assert_eq!(forked["result"], "forked", "{forked}");
     assert_eq!(forked["requested"], "shared");
+    // A SESSION checkin forks inside the losing agent's own scope --
+    // `heads/agents/<agent>/forks/<ref>/<ulid>` (I5/I18, #343) -- because I18
+    // retargets that session's mount at the fork. The daemon reports the name
+    // the CLI prints, so it reports that shape too.
+    let fork = forked["fork"].as_str().unwrap_or_default();
     assert!(
-        forked["fork"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("forks/shared/"),
+        fork.starts_with("heads/agents/") && fork.contains("/forks/shared/"),
         "{forked}"
     );
     assert_eq!(forked["ours"].as_str().map(str::len), Some(64));
