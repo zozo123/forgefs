@@ -1267,6 +1267,19 @@ impl World {
         ));
     }
 
+    /// Overlay rows the repository itself still holds for `ns`, across every
+    /// mount -- the same question `abandon_session` asks.
+    fn staged_in_reality(&self, ns: &str) -> usize {
+        let store = self.store();
+        store
+            .meta
+            .list_mounts(ns)
+            .expect("mounts")
+            .iter()
+            .map(|m| store.meta.overlay_list(ns, &m.path).expect("overlay").len())
+            .sum()
+    }
+
     fn op_checkin(&mut self, rng: &mut Rng) {
         let Some(ns) = self.pick_session(rng) else {
             return;
@@ -1288,20 +1301,25 @@ impl World {
             }
         ));
 
-        // I22, stated directly and independently of the model: `Noop` may
-        // never be reported while the session still holds staged work
-        // anywhere. This is the assertion #326 was about, and it is now a
-        // hard one rather than a characterisation.
+        // I22, stated directly against reality rather than against the model:
+        // after a checkin has said "there was nothing to do", the session must
+        // hold nothing anywhere -- which is precisely what `abandon_session`
+        // asks, so the two verbs cannot disagree. This is #326 as an assertion
+        // rather than a characterisation.
+        //
+        // Row counts alone would be the wrong predicate. An overlay entry can
+        // fold to no effect at all -- a delete of a path the base does not
+        // have, a write of bytes already there -- and a no-op checkin consumes
+        // exactly those, so "there was nothing to do" is true and nothing is
+        // lost. What may never survive a `Noop` is an entry the checkin did
+        // not account for.
         if let Ok(CasResult::Noop { .. }) = &real {
-            if staged_before > 0 {
+            let left = self.staged_in_reality(&ns);
+            if left > 0 {
                 self.bail(&format!(
-                    "I22: checkin of mount {mount} in session {ns} returned Noop while \
-                     {staged_before} overlay entries were staged ({staged_here} of them under \
-                     {mount}); staged paths = {:?}",
-                    s.overlay
-                        .iter()
-                        .flat_map(|(mp, e)| e.keys().map(move |k| format!("{mp}:{k}")))
-                        .collect::<Vec<_>>()
+                    "I22: checkin of mount {mount} in session {ns} returned Noop, but {left} \
+                     overlay entries are still staged afterwards (staged before: \
+                     {staged_before}, {staged_here} of them under {mount})"
                 ));
             }
         }
@@ -1606,13 +1624,19 @@ impl World {
                     let outcome = self.forge.checkin(&cap, &ns, &mp, "drain");
                     match &outcome {
                         Ok(CasResult::Noop { .. }) => {
-                            // I22: "there was nothing to do", said over this
-                            // mount's own staged entries. #326 exactly.
-                            let staged = self.model.sessions[&ns].ov(&mp).len();
-                            self.bail(&format!(
-                                "draining session {ns}: checkin of mount {mp} returned Noop \
-                                 while {staged} entries were staged under {mp} itself (I22)"
-                            ));
+                            // I22, same predicate as in `op_checkin`: a no-op
+                            // checkin consumes the entries that folded to no
+                            // effect, so what may never remain afterwards is
+                            // an entry it did not account for.
+                            let left = self.staged_in_reality(&ns);
+                            if left > 0 {
+                                self.bail(&format!(
+                                    "draining session {ns}: checkin of mount {mp} returned \
+                                     Noop but {left} overlay entries remain staged (I22)"
+                                ));
+                            }
+                            progressed = true;
+                            self.resync_after_unmodelled_checkin(&ns, &mp, &outcome);
                         }
                         Ok(_) => {
                             progressed = true;
