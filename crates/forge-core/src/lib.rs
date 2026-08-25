@@ -9,7 +9,7 @@ pub mod tree;
 pub use contribution::{Contribution, ContributionRead};
 pub use object::{
     blob_frame_prefix, decode_object_type, hash_bytes, hash_parts, parse_file, Blob, Commit,
-    Conflict, ConflictPath, Snapshot,
+    Conflict, ConflictPath, Snapshot, MAX_CONFLICT_ITEMS, MAX_TREE_ENTRIES,
 };
 pub use provenance::ProvenanceManifest;
 pub use tree::{apply_overlay, split_path, validate_name, Overlay, Tree, TreeEntry, TreeStore};

@@ -61,6 +61,7 @@ Neither verb introduces an exit code. Both map onto the table above.
 | spec names a ref or object that does not resolve | 1 |
 | re-mounting a path at a different spec, or demoting it to read-only, while it holds staged overlay (I19) | 1 |
 | the capability may not read the spec, or may not write the ref for `--rw` | 1 |
+| `checkin --mount <path>` naming no mount of this session, including a path that merely lies INSIDE one | 1 |
 | `checkin --mount <path>` published (`updated`) or lost the CAS and forked (`forked`) | 0 |
 | `checkin --mount <path>` had nothing to publish and the session holds nothing anywhere (`noop`) | 0 |
 | `checkin --mount <path>` had nothing to publish while another mount holds staged entries (I22) | 1 |
@@ -75,6 +76,21 @@ A session holding read-write mounts on several refs therefore publishes them one
 `checkin --mount` at a time, and publishing one never moves what another mount
 reads.
 
+"Exactly" is literal. `--mount` names a MOUNT, not a path inside one, and a
+value naming no mount of the session is refused -- exit 1 -- naming the value the
+caller gave and listing the mounts the session has. It is deliberately not
+resolved the way `read`, `ls` and `write` resolve a PATH, which is to the longest
+mount that is a prefix of it. Until #353 it was: every session has a `/` mount
+and `/` is a prefix of everything, so a misspelt `--mount` became `/` silently.
+It published `/` and answered `updated` for a request about a mount that does not
+exist; on a session with nothing staged it answered `noop`, which the paragraph
+below says callers may rely on; and the I22 refusal read "checkin / has nothing
+to publish" for a request that had named some other mount. That is the CLI form
+of the daemon rule stated under `forge serve` below -- a field ForgeFS does not
+know is refused, never silently taken to mean its default (#332) -- and the
+daemon may not be the stricter of the two. Spelling still normalises: a trailing
+slash and a missing leading slash name the same mount.
+
 A `noop` is therefore a strong statement and callers may rely on it: it means the
 session holds no staged work anywhere, not merely that the named mount staged
 nothing. Staged work is a property of the namespace, not of one mount -- `forge
@@ -87,7 +103,9 @@ as stated -- "tell me there was nothing to do" -- is unsatisfiable and no retry 
 it can succeed (I22). A checkin that DOES publish is unaffected: `updated` and
 `forked` are progress and may leave another mount staged, which is exactly how a
 session with several writable mounts drains them one `--mount` at a time.
-Automation that gets exit 1 from `checkin` re-runs it once per named mount.
+Automation that gets exit 1 from `checkin` re-runs it once per named mount. The
+refusal names the mount the CALLER named, never another one: the mount is
+resolved by exact name before any of this is decided.
 
 ## Read-only checking: `forge fsck` and `forge verify`
 
@@ -122,6 +140,35 @@ ledger -- a hole, a duplicate, an empty ledger, a missing or reshaped
 a `SCHEMA_LEDGER` finding with exit 2. Admitting that one case is the reason
 `fsck --full` opens the catalog with its schema-compatibility check deferred at
 all.
+
+## Input that is too large: `forge import`, `forge write`, `forge checkin`
+
+A VERSION 1 tree holds at most 100_000 entries and a VERSION 1 conflict object
+at most 100_000 in each of its paths, merge bases and causal ids
+(`MAX_TREE_ENTRIES` and `MAX_CONFLICT_ITEMS` in
+`crates/forge-core/src/object.rs`). No verb introduces an exit code:
+
+| Outcome | Exit |
+|---|---:|
+| a source directory with more than 100_000 entries; the refusal names the directory, its size and the limit | 1 |
+| an overlay fold that would give one directory more than 100_000 entries | 1 |
+| a merge whose conflict object would carry more than 100_000 paths, merge bases or causal ids; the refusal names which of the three broke the limit | 1 |
+| a tree or conflict object READ BACK from the store whose fanout exceeds the same limit | 2 |
+
+The first three rows and the last are the same number and deliberately not the
+same exit code (issue #355). A directory a caller asked ForgeFS to import is
+input: nothing on disk is wrong, the repository may be brand new, and the caller
+can act on the refusal by splitting the directory -- so it is exit 1, the same
+row as any other bad argument. The last row is genuine damage: no encoder in this
+binary can produce those bytes, so finding them in the store means the object
+file is corrupt, and it keeps exit 2.
+
+`forge import` used to report the first row as `corrupt: tree fanout exceeds
+limit`, exit 2, having first walked and stored every blob in the doomed
+directory. The check now happens on the directory entries, before a single blob
+is read. This is the same rule as the un-migrated catalog under `fsck` above:
+exit 2 means CORRUPTION, and neither a repository's age nor a caller's own
+oversized input is corruption.
 
 ## Sealing: `forge seal`
 

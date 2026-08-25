@@ -408,6 +408,11 @@ impl<O: ObjectStore> Store<O> {
     }
 
     pub fn put_conflict(&self, c: &Conflict) -> Result<ObjectId> {
+        // #355: an over-large conflict is a merge a caller asked for, not a
+        // damaged object. `Conflict::encode` cannot fail, so this is the one
+        // gate between caller input and bytes `Conflict::decode` would later
+        // reject as `Corrupt`.
+        c.validate()?;
         self.put_raw(&c.encode())
     }
 

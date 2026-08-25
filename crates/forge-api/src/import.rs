@@ -2,7 +2,7 @@
 
 use crate::Forge;
 use forge_cap::{Cap, Op};
-use forge_core::{now_ms, Commit, Tree};
+use forge_core::{now_ms, Commit, Tree, MAX_TREE_ENTRIES};
 use forge_store::Store;
 use forge_types::{CasResult, Error, ObjectId, Result};
 use std::fs::{self, OpenOptions};
@@ -156,6 +156,24 @@ impl ImportWalk<'_> {
         // import rather than an allegedly exact partial snapshot.
         let kids = import_dir_entries(dir)?;
         let expected_names = import_scoped_names(&kids, dir, source_root)?;
+        // #355: a directory with more entries than a VERSION 1 tree can hold is
+        // the caller passing us something too big, not a damaged repository, so
+        // it is `Invalid` (exit 1) and the refusal names the directory, its
+        // size and the limit. It used to be discovered on the way back OUT of
+        // the store, as `Corrupt` -- exit 2, "this repository is damaged" -- for
+        // an untouched repository and an intact source directory.
+        //
+        // Checked here, on the dirents, rather than on the assembled entries:
+        // this is before a single blob of the doomed directory is read or put,
+        // so the refusal costs one readdir instead of a full walk.
+        if expected_names.len() as u64 > MAX_TREE_ENTRIES {
+            return Err(Error::Invalid(format!(
+                "import refuses {}: it holds {} entries, more than the {MAX_TREE_ENTRIES} a \
+                 tree may hold; split it into subdirectories",
+                dir.display(),
+                expected_names.len()
+            )));
+        }
         if let Some(id) = pinned {
             self.stack.push(id);
         }
