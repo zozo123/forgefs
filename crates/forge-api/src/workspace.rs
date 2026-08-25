@@ -213,6 +213,28 @@ impl Forge {
         Ok(())
     }
 
+    /// Publish one mount's staged overlay onto that mount's ref.
+    ///
+    /// Checkin publishes exactly ONE mount -- the one named -- and refuses
+    /// outright when the session holds staged work under any other mount
+    /// (#326, I19). Publishing every read-write mount was the other candidate
+    /// and was rejected: each mount names its own ref, so "check in
+    /// everything" is N independent ref CASes with no atomicity across them.
+    /// One of them updating while the next forks is a half-published session
+    /// that no single `CasResult`, exit code or Contribution receipt can
+    /// describe, and the VERSION 1 receipt is frozen at one `base`, one `tree`
+    /// and one parent list, so a multi-ref checkin is not representable
+    /// without a format change and its own gate. Implicitly advancing refs the
+    /// caller never named is also the wrong default for an isolation
+    /// substrate: a stray `--rw` mount on a shared ref would be published by a
+    /// bare `forge checkin`.
+    ///
+    /// What is indefensible is the third behaviour, the one this had: answer
+    /// `noop` with exit 0 while the session held work checkin never folded.
+    /// That is indistinguishable from "there was nothing to do", and
+    /// `abandon_session` -- which counts overlay rows across the whole
+    /// namespace -- then refused to retire the session, so the only way out of
+    /// the loop was to discard the work.
     pub fn checkin(&self, cap: &Cap, ns: &str, mount: &str, msg: &str) -> Result<CasResult> {
         self.require_ns(cap, ns)?;
         let mounts = self.mounts(ns)?;
@@ -225,6 +247,30 @@ impl Forge {
             Spec::Oid(_) => return Err(Error::Invalid("cannot checkin an oid mount".into())),
         };
         self.check(cap, Op::Write, Some(&ref_name))?;
+        // #326: never report an outcome over work this checkin did not fold.
+        // `overlay_mounts_outside` asks exactly what `abandon_session` asks --
+        // overlay rows anywhere under this namespace -- so checkin and abandon
+        // can no longer disagree about whether the session holds staged work.
+        // Error::Invalid is exit 1 in CLI_ABI.md, the same row abandon already
+        // uses for "the session holds staged work": the request is
+        // unsatisfiable as stated and no retry of it will ever succeed.
+        let stranded = self.store.meta.overlay_mounts_outside(ns, &m.path)?;
+        if !stranded.is_empty() {
+            let named = stranded
+                .iter()
+                .map(|(other, n)| {
+                    let noun = if *n == 1 { "entry" } else { "entries" };
+                    format!("{other} ({n} staged {noun})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Invalid(format!(
+                "session {ns} holds staged work under mounts that checkin {} does not publish: {named}; \
+                 check each mount in on its own (checkin --mount <path>) or discard it with \
+                 abandon session --discard-staged",
+                m.path
+            )));
+        }
         let nsrow = self.store.meta.get_namespace(ns)?;
         let pin = nsrow.pinned_oid.ok_or(Error::InvalidBase)?;
         let row = self

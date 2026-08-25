@@ -3248,6 +3248,37 @@ impl Meta {
         Ok(out)
     }
 
+    /// Every mount of `ns_id` other than `except` that still holds staged
+    /// overlay entries, with its entry count, ordered by mount path.
+    ///
+    /// #326: `checkin` folds exactly one mount, but staged work is a property
+    /// of the whole namespace -- `abandon_session` counts every overlay row
+    /// under `ns_id` and refuses while any remain. Without this query checkin
+    /// could not see the rows it was about to leave behind, so it answered
+    /// `noop` and exit 0 for a session that `abandon` then refused as holding
+    /// work. This is the read that lets the two verbs agree (I19).
+    pub fn overlay_mounts_outside(&self, ns_id: &str, except: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT mount, COUNT(*) FROM overlay
+                 WHERE ns_id=?1 AND mount<>?2
+                 GROUP BY mount ORDER BY mount",
+            )
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map(params![ns_id, except], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(map_sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mount, count) = row.map_err(map_sql)?;
+            out.push((mount, count.max(0) as u64));
+        }
+        Ok(out)
+    }
+
     pub fn overlay_clear(&self, ns_id: &str, mount: &str) -> Result<()> {
         let conn = self.write.lock();
         conn.execute(

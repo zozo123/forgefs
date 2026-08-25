@@ -50,6 +50,29 @@ writer half-updated. Refusing to enter the band is the only safe answer.
 `scripts/enospc-sigbus-probe.sh` reproduces and asserts this contract. It needs
 Linux, root and `mkfs.ext4`, so it is not part of `scripts/release-gate.sh`.
 
+## Checkin: one mount, or a refusal
+
+`forge checkin` publishes exactly one mount -- `--mount`, default `/` -- onto
+that mount's ref, and introduces no exit code:
+
+| Outcome | Exit |
+|---|---:|
+| the named mount published (`updated`) or lost the CAS and forked (`forked`) | 0 |
+| the named mount had nothing staged and the session holds nothing anywhere (`noop`) | 0 |
+| the session holds staged entries under a mount other than the one named | 1 |
+| the named mount is read-only, names an OID, or its ref is protected | 1 |
+| the session observed a path that has since moved | 4 |
+
+The third row is why a caller may trust the second. Staged work is a property of
+the namespace, not of one mount -- `forge abandon session` counts overlay rows
+across all of them -- so a checkin that folded only `/` used to answer `noop`
+with exit 0 for a session whose work sat under some other read-write mount, and
+`abandon` then refused the same session as holding work (#326). Checkin now
+refuses first, exit 1, naming each mount and its entry count, because the
+request is unsatisfiable as stated and no retry of it can succeed. Automation
+that gets exit 1 from `checkin` re-runs it once per named mount; it must never
+read `noop` as "the work is safe" without that guarantee (I19).
+
 ## Reclamation: `forge abandon` and `forge gc`
 
 Neither verb introduces an exit code. Both map onto the table above:
