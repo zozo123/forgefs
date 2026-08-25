@@ -47,9 +47,9 @@ not diluted into a mock:
 |---|---|---|
 | I1, I2, I10, I17 | `forge-core`, `forge-store/graph.rs`, `forge-store/meta.rs`, `forge-api/import.rs`, `integration.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `provenance.rs`, `checkin_contribution.rs`, `typed_graph.rs`, `api_contract.rs`, `bootstrap_contract.rs`, `schema_migrations.rs`, `schema_migration_fixtures.rs`, `schema_migration_objects.rs`, `testdata/schema/README.md`, `property_canonical.rs`, `large_blob_memory.rs`, `fuzz/tree_name` |
 | I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `forge-store/objectstore/conformance.rs`, `docs/RECOVERY.md`, `docs/OBJECTSTORE.md` |
-| I5, I7, I8 | `forge-store/meta.rs`, `forge-api/workspace.rs`, `refs.rs` | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `fuzz/ref_name` |
-| I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs` |
-| I18 | `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs` | `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `docs/GC.md` |
+| I5, I7, I8 | `forge-store/meta.rs`, `forge-api/workspace.rs`, `refs.rs` | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `model_composition.rs`, `fuzz/ref_name` |
+| I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs`, `model_composition.rs` |
+| I18 | `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs` | `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `model_composition.rs`, `docs/GC.md` |
 | I11, I12 | `forge-merge`, `forge-api/integration.rs` | `api_contract.rs`, `merge_bases.rs`, `clock_causality.rs`, `show_conflict.rs`, `cli_merge_race.rs`, `rename_characterisation.rs`, `property_merge_symmetry.rs` |
 | I13, I14 | `forge-cap`, `forge-api/authority.rs` | `api_contract.rs`, `capability_boundary.rs`, `p0_authority_history.rs`, `cli_cross_cell.rs`, `property_attenuation.rs`, `fuzz/cap_token` |
 | I15 | `forge-api/integration.rs`, `fsck.rs`, `forge-store/graph.rs`, `forge-store/meta.rs` | `api_contract.rs`, `typed_graph.rs`, `seal_trust_root.rs`, `trust_boundary.rs`, `cli_recovery_and_corruption.rs` |
@@ -68,6 +68,21 @@ reproducible):
 | `forge-core/tests/property_canonical.rs` | decode(encode(x)) is x, re-encoding reproduces the same bytes, and the encoding does not depend on incidental input order (I1, I2) |
 | `forge-merge/tests/property_merge_symmetry.rs` | the merged TREE and the conflicting-path set do not depend on which side is `ours` (I12) |
 | `forge-cap/tests/property_attenuation.rs` | appending caveats can only shrink the reachable (op, ref, clock) set, and the attenuated token still verifies (I13) |
+| `forge-api/tests/model_composition.rs` | a naive in-memory model of refs, per-mount pinned bases, staged overlays and observations agrees with the real repository after every operation of a random sequence, and staged work is neither silently ignored nor strandable (I8, I9, I18) |
+
+The last row is a different evidence shape from the other three. The first
+three state one algebraic law about one component. The model-based harness
+drives random sequences of
+`session open`, `mount`, `write`, `delete`, `read`, `ls`, `checkin`, `branch`,
+`abandon` and `seal` against a real `Forge` and compares the whole repository
+against the model after every single step, plus `fsck --full` and a reread and
+rehash of every object reachable from every ref. That is what catches
+composition defects: `#326` is a bug in no single operation, so no
+single-operation test can see it. Defects the harness reproduces on the current
+tree are listed in its `KNOWN` table with the invariant each one breaks; the
+table is asserted to be exactly what the default run observes, so fixing one
+fails the test until its row is removed and the model is allowed to assert the
+correct behaviour instead.
 
 The `fuzz/` targets cover the same boundaries with untrusted bytes: typed
 decoders (`object_decode`), the capability parser (`cap_token`), daemon framing
