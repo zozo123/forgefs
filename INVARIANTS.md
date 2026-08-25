@@ -105,6 +105,56 @@ stated so it is not mistaken for covered:
 * **`Meta::commit_seal` performs no compare-and-swap against the ref it seals.**
   The snapshot is internally consistent, but `seal main v1` can publish a tag
   naming a commit `main` no longer held when the tag became visible.
+* **`serve` is outside the contract entirely (#332).** No invariant names it,
+  `CLI_ABI.md` does not describe it, and `scripts/cli-abi-conformance.sh`
+  exercises the CLI binary alone -- so the daemon's exit codes, error mapping
+  and argument surface are unspecified and untested. The specific superset
+  #332 reported is closed: `ns.checkin` takes a caller-chosen `mount`, and the
+  CLI can now express it too (`checkin --mount`). The contract gap is not.
+  Either document the daemon as its own ABI with its own conformance rows, or
+  constrain `dispatch` to what the CLI can express -- before anyone builds
+  against `serve` and today's undocumented behaviour becomes tomorrow's
+  compatibility obligation.
+
+### Which operations an invariant actually constrains
+
+The audit that produced I19-I22 worked by asking, of every verb, *which rule
+would catch this being wrong*. That question is worth keeping answerable, since
+this project merges on "a PR that cannot name an invariant does not merge" and
+an operation no rule names is a bug class nothing prevents. As of I23:
+
+| Operation | Constrained by |
+|---|---|
+| `session open` | I8 (pins a base), I19 (the root mount is pinned with it) |
+| `mount` | I19 (a read-write mount carries its own pin), I20 (it must be publishable) |
+| `read`, `ls` | I8, I9 (every read is recorded), I19 (resolved against the mount's pin) |
+| `checkin` | I5, I8, I9, I10, I18, I19, I21, I22 |
+| `abandon` | I18 (a fork stays a root until deliberately retired) |
+| `gc` | I23 (collection unlinks only unreachable bytes) |
+| `merge` | I11 (overlap is a Conflict object), I12 (order comes from the DAG) |
+| `seal`, `verify`, `fsck` | I6, I10, I15 |
+| `import`, `export` | I1, I2, I16 |
+| `grant` | I13, I14 |
+| **`write`** | **nothing** -- staging is constrained only downstream, by what I22 makes checkin say about it |
+| **`branch`** | **nothing.** `Forge::branch` calls `Meta::insert_ref`, not a CAS, so I5 -- which governs how refs *move* -- does not cover ref *creation* at all |
+| **`serve`** | **nothing** (#332, above) |
+| **`inbox`, `landmark`, `init`, `refs`, `log`, `show`, `stats`** | **nothing** |
+
+The unconstrained rows are not all equally alarming -- `log` and `show` are
+read-only projections -- but `write`, `branch` and `serve` each move or create
+durable state, and each is a place where the next unstated-invariant defect can
+sit. `mount` and `gc` were on this list until I19/I20 and I23; both had live
+defects (#327, #328, #330, #333, #12) waiting in exactly that silence.
+
+### Shape of the set
+
+The audit's original headline -- *all eighteen rules are safety properties, none
+is liveness* -- was true of I1-I18 and is no longer true of the set as a whole.
+I21 is a genuine liveness rule: it requires that a session with write authority
+can always *reach* a terminal state, not merely that it never reaches a wrong
+one. Totality rules -- the ones that require an operation to act on everything
+in front of it rather than on some of it -- are I18, I22, and the I16 export
+collision paragraph. Everything else remains safety.
 
 The `fuzz/` targets cover the same boundaries with untrusted bytes: typed
 decoders (`object_decode`), the capability parser (`cap_token`), daemon framing
