@@ -2,7 +2,7 @@ use crate::metrics::TimingCounter;
 use forge_core::{hash_bytes, hash_parts};
 use forge_types::{Error, ObjectId, Result};
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -133,6 +133,186 @@ const STALE_TMP_MS: u64 = 24 * 60 * 60 * 1000;
 const DURABLE_DIR_CACHE_CAPACITY: usize = 65_536;
 const DURABLE_OID_CACHE_CAPACITY: usize = 65_536;
 
+/// How a [`PublishBatch`] proves the directory edges that reach its objects.
+///
+/// Both settings satisfy I4 identically: when `finish` returns, every object
+/// file the batch published or joined *and* every directory entry on the path
+/// to it is durable, and only then may a ref name it. They differ solely in
+/// how many barriers the kernel is asked for to establish that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryBarrier {
+    /// One `fsync` per touched directory, taken as the batch touches it.
+    PerDirectory,
+    /// One `fsync` per *distinct* touched directory, all of them taken in a
+    /// single phase immediately before `finish` returns.
+    ///
+    /// Same primitive and same count of proved edges as `PerDirectory`, and
+    /// portable to every platform. What changes is when they are issued: a
+    /// journaling filesystem commits its running transaction on the first
+    /// barrier of the phase, so the rest find nothing left to commit and cost
+    /// a bare device flush instead of a journal commit each.
+    Deferred,
+    /// One filesystem-wide barrier for the whole batch, shared with every
+    /// concurrent batch that is also waiting for one.
+    ///
+    /// This is a *stronger* barrier than the set it replaces, not a weaker
+    /// one: `syncfs(2)` forces every dirty inode and page on the filesystem
+    /// and ends in the same device cache flush, so it makes durable a strict
+    /// superset of `{this batch's object bytes} ∪ {this batch's directory
+    /// edges}`. The saving is in barrier count, never in coverage.
+    ///
+    /// The cost of that strength is that a repository sharing a filesystem
+    /// with an unrelated heavy writer pays for that writer's dirty data on
+    /// every checkin. Set `FORGEFS_DIR_BARRIER=per-directory` there.
+    Collapsed,
+}
+
+impl DirectoryBarrier {
+    /// `FORGEFS_DIR_BARRIER` selects the policy explicitly; an unset or
+    /// unrecognised value takes the platform default. The variable is read
+    /// once per object-store open and never on a barrier path.
+    fn from_env() -> Self {
+        match std::env::var("FORGEFS_DIR_BARRIER").ok().as_deref() {
+            Some("per-directory") => Self::PerDirectory,
+            Some("deferred") => Self::Deferred,
+            Some("collapsed") => Self::Collapsed,
+            _ => Self::platform_default(),
+        }
+    }
+
+    /// `Deferred` everywhere: it is portable, it proves exactly the edges
+    /// `PerDirectory` proves with exactly the same primitive, and it is never
+    /// slower. `Collapsed` is not the default because a filesystem-wide
+    /// barrier costs far more than one `fsync` and is a global serialisation
+    /// point, so it loses under concurrency even though it issues fewer
+    /// barriers -- see docs/BENCH.md.
+    const fn platform_default() -> Self {
+        Self::Deferred
+    }
+
+    /// Whether every directory barrier waits for the single phase before
+    /// `finish` returns.
+    fn defers(self) -> bool {
+        matches!(self, Self::Deferred | Self::Collapsed)
+    }
+}
+
+/// The completion state of the shared filesystem-wide barrier.
+///
+/// `completed` counts barriers that ran to completion and is monotone;
+/// `in_flight` names the generation currently executing. A batch that needs a
+/// barrier computes the first generation that is guaranteed to *start* after
+/// its own writes were already in the kernel, and waits for exactly that
+/// generation. That is why a follower can never be acknowledged by a barrier
+/// that began before its own `link(2)` returned.
+#[derive(Debug, Default)]
+struct BarrierGate {
+    completed: u64,
+    in_flight: Option<u64>,
+}
+
+/// One filesystem-wide durability barrier, shared by every batch of one
+/// object store that is waiting for one.
+#[derive(Debug)]
+struct FsBarrier {
+    /// Any descriptor on the object store's filesystem selects the filesystem
+    /// to force. The store root is held open for the store's lifetime so a
+    /// barrier costs one syscall and no path walk.
+    anchor: fs::File,
+    state: Mutex<BarrierGate>,
+    ready: Condvar,
+}
+
+impl FsBarrier {
+    fn open(root: &Path) -> Option<Arc<Self>> {
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            return None;
+        }
+        let anchor = fs::File::open(root).ok()?;
+        Some(Arc::new(Self {
+            anchor,
+            state: Mutex::new(BarrierGate::default()),
+            ready: Condvar::new(),
+        }))
+    }
+
+    /// Return only once a filesystem-wide barrier that *started after this
+    /// call* has completed successfully.
+    ///
+    /// The ordering argument, which is the whole correctness case:
+    ///
+    /// * `target` is read after the caller's last `write`/`link`/`mkdir` has
+    ///   returned, so those are already visible to the kernel.
+    /// * `completed` only ever advances by one, to the generation a leader
+    ///   just finished, so `completed >= target` proves generation `target`
+    ///   itself ran to completion.
+    /// * generation `target` cannot have started before `target` was read:
+    ///   at that instant either `completed == target - 1` and nothing was in
+    ///   flight, or `target - 1` was the generation in flight. Either way the
+    ///   leader of `target` had not yet called into the kernel.
+    ///
+    /// So the barrier this call waits for began after this caller's bytes and
+    /// directory entries existed, and a caller is never told "durable" by a
+    /// barrier that could not have seen its work.
+    fn wait(&self, stats: &BlobStoreCounters) -> Result<()> {
+        let target = {
+            let state = self.state.lock();
+            state.in_flight.unwrap_or(state.completed) + 1
+        };
+        loop {
+            let generation = {
+                let mut state = self.state.lock();
+                if state.completed >= target {
+                    stats.barrier_fs_batches.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                if state.in_flight.is_some() {
+                    self.ready.wait(&mut state);
+                    continue;
+                }
+                let generation = state.completed + 1;
+                state.in_flight = Some(generation);
+                generation
+            };
+            let started = Instant::now();
+            let outcome = sync_filesystem(&self.anchor);
+            let elapsed = started.elapsed();
+            {
+                let mut state = self.state.lock();
+                state.in_flight = None;
+                // A failed barrier publishes nothing. `completed` does not
+                // advance, so every waiter stays unacknowledged and the next
+                // one retries rather than inheriting a proof that does not
+                // exist.
+                if outcome.is_ok() {
+                    state.completed = generation;
+                }
+                self.ready.notify_all();
+            }
+            outcome?;
+            stats.barrier_fs.observe(elapsed);
+        }
+    }
+}
+
+/// Force every dirty inode and data page on the filesystem holding `anchor`,
+/// ending in a device cache flush.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sync_filesystem(anchor: &fs::File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::syncfs(anchor.as_raw_fd()) } == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn sync_filesystem(_anchor: &fs::File) -> Result<()> {
+    Err(Error::Internal(
+        "no filesystem-wide durability barrier on this platform".into(),
+    ))
+}
+
 /// Monotonic process-local counters for physical durability work.
 /// `puts` counts newly published OIDs; dedup hits do not increment it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -150,13 +330,32 @@ pub struct BlobStoreStats {
     pub fsync_dir: u64,
     /// Cumulative elapsed time for successful directory durability barriers.
     pub fsync_dir_us: u64,
+    /// Successful filesystem-wide durability barriers this store executed.
+    /// One of these stands in for the whole per-directory set of one or more
+    /// batches, so it is counted once per barrier and never once per batch.
+    pub barrier_fs: u64,
+    /// Cumulative elapsed time for successful filesystem-wide barriers.
+    pub barrier_fs_us: u64,
+    /// Batches whose directory phase was satisfied by a filesystem-wide
+    /// barrier, counting followers as well as the leader that ran it.
+    /// `barrier_fs_batches / barrier_fs` is the achieved sharing depth.
+    pub barrier_fs_batches: u64,
 }
 
 impl BlobStoreStats {
     /// Saturating sum over this process-lifetime snapshot. It is not a
     /// per-publication or per-checkin measurement.
     pub fn barrier_us(&self) -> u64 {
-        self.fsync_file_us.saturating_add(self.fsync_dir_us)
+        self.fsync_file_us
+            .saturating_add(self.fsync_dir_us)
+            .saturating_add(self.barrier_fs_us)
+    }
+
+    /// Every barrier that proved a directory edge durable, whichever policy
+    /// took it. This is the count to compare across
+    /// [`DirectoryBarrier`] settings; `fsync_dir` alone is policy-specific.
+    pub fn directory_barriers(&self) -> u64 {
+        self.fsync_dir.saturating_add(self.barrier_fs)
     }
 }
 
@@ -166,6 +365,8 @@ struct BlobStoreCounters {
     dedup_hits: AtomicU64,
     fsync_file: TimingCounter,
     fsync_dir: TimingCounter,
+    barrier_fs: TimingCounter,
+    barrier_fs_batches: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +382,9 @@ pub struct LocalBlobStore {
     // so a new process re-proves state left visible by a crashed peer.
     durable_dirs: Arc<Mutex<LruCache<PathBuf, ()>>>,
     durable_oids: Arc<Mutex<LruCache<ObjectId, ()>>>,
+    dir_barrier: DirectoryBarrier,
+    /// Present exactly when `dir_barrier` is [`DirectoryBarrier::Collapsed`].
+    fs_barrier: Option<Arc<FsBarrier>>,
 }
 
 /// Checkin-scoped durable publication. Every object is file-fsynced before its
@@ -190,6 +394,15 @@ pub struct LocalBlobStore {
 pub struct PublishBatch<'a> {
     store: &'a LocalBlobStore,
     dirs: BTreeSet<PathBuf>,
+    /// Ancestor directories whose entry set this batch changed, deferred for
+    /// the single barrier phase. Always empty under
+    /// [`DirectoryBarrier::PerDirectory`], where the barrier is taken as the
+    /// entry is created.
+    path_dirs: BTreeSet<PathBuf>,
+    /// Directories whose existence the `path_dirs` barriers prove. They enter
+    /// the process-wide positive-proof cache only after that phase succeeds,
+    /// for the same reason `oids` do.
+    proofs: BTreeSet<PathBuf>,
     oids: BTreeSet<ObjectId>,
     new_puts: u64,
     new_dedup: u64,
@@ -197,6 +410,12 @@ pub struct PublishBatch<'a> {
 
 impl LocalBlobStore {
     pub fn new(root: PathBuf) -> Result<Self> {
+        Self::with_directory_barrier(root, DirectoryBarrier::from_env())
+    }
+
+    /// Open with an explicit directory-barrier policy. Every policy publishes
+    /// the same durable state; see [`DirectoryBarrier`].
+    pub fn with_directory_barrier(root: PathBuf, dir_barrier: DirectoryBarrier) -> Result<Self> {
         let stats = Arc::new(BlobStoreCounters::default());
         let durable_dirs = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(DURABLE_DIR_CACHE_CAPACITY).expect("non-zero directory cache"),
@@ -209,12 +428,28 @@ impl LocalBlobStore {
         ensure_dir_durable(&root, &objects, &stats, &durable_dirs)?;
         ensure_dir_durable(&root, &tmp, &stats, &durable_dirs)?;
         cleanup_stale_tmp(&tmp, &stats)?;
+        let fs_barrier = match dir_barrier {
+            DirectoryBarrier::Collapsed => FsBarrier::open(&root),
+            DirectoryBarrier::PerDirectory | DirectoryBarrier::Deferred => None,
+        };
+        // A store that cannot hold a descriptor on its own filesystem, or is
+        // on a platform without `syncfs`, falls back to the deferred phase of
+        // ordinary directory barriers rather than discovering that on a
+        // barrier path. That proves the same edges with the portable
+        // primitive.
+        let dir_barrier = if dir_barrier == DirectoryBarrier::Collapsed && fs_barrier.is_none() {
+            DirectoryBarrier::Deferred
+        } else {
+            dir_barrier
+        };
         Ok(Self {
             root,
             read_only: false,
             stats,
             durable_dirs,
             durable_oids,
+            dir_barrier,
+            fs_barrier,
         })
     }
 
@@ -239,7 +474,16 @@ impl LocalBlobStore {
             durable_oids: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(DURABLE_OID_CACHE_CAPACITY).expect("non-zero OID cache"),
             ))),
+            // A read-only store publishes nothing, so it needs no barrier.
+            dir_barrier: DirectoryBarrier::PerDirectory,
+            fs_barrier: None,
         })
+    }
+
+    /// The policy this store actually settled on, after any platform or
+    /// descriptor fallback.
+    pub fn directory_barrier(&self) -> DirectoryBarrier {
+        self.dir_barrier
     }
 
     pub fn read_only(&self) -> bool {
@@ -259,6 +503,8 @@ impl LocalBlobStore {
         PublishBatch {
             store: self,
             dirs: BTreeSet::new(),
+            path_dirs: BTreeSet::new(),
+            proofs: BTreeSet::new(),
             oids: BTreeSet::new(),
             new_puts: 0,
             new_dedup: 0,
@@ -341,6 +587,7 @@ impl LocalBlobStore {
     pub fn stats(&self) -> BlobStoreStats {
         let fsync_file = self.stats.fsync_file.snapshot();
         let fsync_dir = self.stats.fsync_dir.snapshot();
+        let barrier_fs = self.stats.barrier_fs.snapshot();
         BlobStoreStats {
             puts: self.stats.puts.load(Ordering::Relaxed),
             dedup_hits: self.stats.dedup_hits.load(Ordering::Relaxed),
@@ -348,6 +595,9 @@ impl LocalBlobStore {
             fsync_file_us: fsync_file.total_us,
             fsync_dir: fsync_dir.count,
             fsync_dir_us: fsync_dir.total_us,
+            barrier_fs: barrier_fs.count,
+            barrier_fs_us: barrier_fs.total_us,
+            barrier_fs_batches: self.stats.barrier_fs_batches.load(Ordering::Relaxed),
         }
     }
 }
@@ -355,6 +605,35 @@ impl LocalBlobStore {
 impl PublishBatch<'_> {
     pub fn put(&mut self, bytes: &[u8]) -> Result<ObjectId> {
         self.put_parts(&[bytes])
+    }
+
+    /// Make `child` exist under `parent` and arrange for the barrier that
+    /// proves that entry.
+    ///
+    /// Under [`DirectoryBarrier::PerDirectory`] the barrier is taken here, as
+    /// it always was. Under [`DirectoryBarrier::Collapsed`] it is deferred to
+    /// `finish`, where one filesystem-wide barrier covers it along with every
+    /// other edge the batch touched. Deferral cannot weaken I4 because
+    /// nothing between here and `finish` may publish a ref, and the positive
+    /// proof that lets a *later* batch skip the barrier is likewise recorded
+    /// only after `finish` succeeds.
+    fn ensure_path_dir(&mut self, parent: &Path, child: &Path) -> Result<()> {
+        if self.store.durable_dirs.lock().get(child).is_some() {
+            return Ok(());
+        }
+        ensure_dir_present(child)?;
+        if self.store.dir_barrier.defers() {
+            self.path_dirs.insert(parent.to_path_buf());
+            self.proofs.insert(child.to_path_buf());
+        } else {
+            sync_dir_counted(
+                parent,
+                &self.store.stats,
+                crate::DurabilityBarrier::ObjectPathDirectory,
+            )?;
+            self.store.durable_dirs.lock().put(child.to_path_buf(), ());
+        }
+        Ok(())
     }
 
     /// Publish the object file formed by concatenating `parts`. Identity,
@@ -380,18 +659,8 @@ impl PublishBatch<'_> {
         // Prove the complete pathname before trusting either an existing link
         // or a link we are about to publish. A cold Store cannot inherit a
         // crashed or older VERSION=1 process's unforced shard ancestors.
-        ensure_dir_durable(
-            &objects,
-            &shard_a,
-            &self.store.stats,
-            &self.store.durable_dirs,
-        )?;
-        ensure_dir_durable(
-            &shard_a,
-            &shard_b,
-            &self.store.stats,
-            &self.store.durable_dirs,
-        )?;
+        self.ensure_path_dir(&objects, &shard_a)?;
+        self.ensure_path_dir(&shard_a, &shard_b)?;
 
         // The age refresh comes first, because it is what decides whether this
         // is a dedup at all: an object a sweep unlinked while we were looking
@@ -474,32 +743,81 @@ impl PublishBatch<'_> {
     }
 
     pub fn finish(self) -> Result<()> {
-        for dir in &self.dirs {
-            sync_dir_counted(
-                dir,
-                &self.store.stats,
-                crate::DurabilityBarrier::ObjectPublicationDirectory,
-            )?;
+        let PublishBatch {
+            store,
+            dirs,
+            path_dirs,
+            proofs,
+            oids,
+            new_puts,
+            new_dedup,
+        } = self;
+
+        // One filesystem-wide barrier is only the cheaper proof when it
+        // replaces more than one directory barrier. A batch that touched a
+        // single directory takes the ordinary `fsync` on it.
+        let collapse = store.dir_barrier == DirectoryBarrier::Collapsed
+            && store.fs_barrier.is_some()
+            && path_dirs.len() + dirs.len() > 1;
+        if collapse {
+            // The collapsed barrier stands in for exactly these per-directory
+            // barriers, so it presents the same failpoints, once per edge it
+            // subsumes and in the same order. An armed fault therefore still
+            // refuses the batch before any ref can move.
+            for _ in &path_dirs {
+                crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectPathDirectory)?;
+            }
+            for _ in &dirs {
+                crate::inject_barrier_failure(
+                    crate::DurabilityBarrier::ObjectPublicationDirectory,
+                )?;
+            }
+            let barrier = store.fs_barrier.as_ref().expect("collapse implies barrier");
+            barrier.wait(&store.stats)?;
             crate::inject_barrier_failure(
                 crate::DurabilityBarrier::ObjectPublicationDirectoryAfter,
             )?;
+        } else {
+            // `path_dirs` is empty under `PerDirectory`; its barriers were
+            // taken as each entry was created.
+            for dir in &path_dirs {
+                sync_dir_counted(
+                    dir,
+                    &store.stats,
+                    crate::DurabilityBarrier::ObjectPathDirectory,
+                )?;
+            }
+            for dir in &dirs {
+                sync_dir_counted(
+                    dir,
+                    &store.stats,
+                    crate::DurabilityBarrier::ObjectPublicationDirectory,
+                )?;
+                crate::inject_barrier_failure(
+                    crate::DurabilityBarrier::ObjectPublicationDirectoryAfter,
+                )?;
+            }
         }
-        // This is the sole OID-proof publication point. A dropped or failed
-        // batch never teaches later callers that its visible links are durable.
+        // This is the sole proof publication point. A dropped or failed batch
+        // never teaches later callers that its visible links or its shard
+        // ancestors are durable.
         {
-            let mut durable_oids = self.store.durable_oids.lock();
-            for id in self.oids {
+            let mut durable_dirs = store.durable_dirs.lock();
+            for dir in proofs {
+                durable_dirs.put(dir, ());
+            }
+        }
+        {
+            let mut durable_oids = store.durable_oids.lock();
+            for id in oids {
                 durable_oids.put(id, ());
             }
         }
-        self.store
-            .stats
-            .puts
-            .fetch_add(self.new_puts, Ordering::Relaxed);
-        self.store
+        store.stats.puts.fetch_add(new_puts, Ordering::Relaxed);
+        store
             .stats
             .dedup_hits
-            .fetch_add(self.new_dedup, Ordering::Relaxed);
+            .fetch_add(new_dedup, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -583,6 +901,28 @@ fn require_regular_file(path: &Path, id: ObjectId) -> Result<()> {
     }
 }
 
+/// Make `child` exist and be a directory, taking no barrier. Existence is
+/// never a durability proof: the caller still owes the parent barrier that
+/// proves the entry before any ref may name an object beneath it.
+fn ensure_dir_present(child: &Path) -> Result<()> {
+    match fs::create_dir(child) {
+        Ok(()) => Ok(()),
+        // Existence is not proof that another process durably published the
+        // directory entry. The caller reproduces the parent barrier anyway.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(child)?;
+            if !metadata.file_type().is_dir() {
+                return Err(Error::Invalid(format!(
+                    "object-store path is not a directory: {}",
+                    child.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(e) => Err(Error::Io(e.to_string())),
+    }
+}
+
 fn ensure_dir_durable(
     parent: &Path,
     child: &Path,
@@ -592,21 +932,7 @@ fn ensure_dir_durable(
     if durable_dirs.lock().get(child).is_some() {
         return Ok(());
     }
-    match fs::create_dir(child) {
-        Ok(()) => {}
-        // Existence is not proof that another process durably published the
-        // directory entry. Reproduce the parent barrier before depending on it.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(child)?;
-            if !metadata.file_type().is_dir() {
-                return Err(Error::Invalid(format!(
-                    "object-store path is not a directory: {}",
-                    child.display()
-                )));
-            }
-        }
-        Err(e) => return Err(Error::Io(e.to_string())),
-    }
+    ensure_dir_present(child)?;
     sync_dir_counted(parent, stats, crate::DurabilityBarrier::ObjectPathDirectory)?;
     durable_dirs.lock().put(child.to_path_buf(), ());
     Ok(())
@@ -681,6 +1007,29 @@ mod tests {
     use std::thread;
     use tempfile::tempdir;
 
+    /// Barrier-accounting tests name the policy they are counting. The
+    /// per-directory proof obligations below are the portable contract and
+    /// are asserted exactly as they always were; the collapsed policy has its
+    /// own tests, because one barrier there proves what several prove here.
+    fn per_dir_store(root: &Path) -> LocalBlobStore {
+        LocalBlobStore::with_directory_barrier(root.to_path_buf(), DirectoryBarrier::PerDirectory)
+            .unwrap()
+    }
+
+    fn deferred_store(root: &Path) -> LocalBlobStore {
+        LocalBlobStore::with_directory_barrier(root.to_path_buf(), DirectoryBarrier::Deferred)
+            .unwrap()
+    }
+
+    /// `None` when this platform has no filesystem-wide barrier, so the
+    /// collapsed-policy tests skip instead of asserting a fallback.
+    fn collapsed_store(root: &Path) -> Option<LocalBlobStore> {
+        let store =
+            LocalBlobStore::with_directory_barrier(root.to_path_buf(), DirectoryBarrier::Collapsed)
+                .unwrap();
+        (store.directory_barrier() == DirectoryBarrier::Collapsed).then_some(store)
+    }
+
     #[test]
     fn put_get_idempotent() {
         let d = tempdir().unwrap();
@@ -739,7 +1088,7 @@ mod tests {
     #[test]
     fn stats_count_new_durable_publications_not_dedup_hits() {
         let d = tempdir().unwrap();
-        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let s = per_dir_store(d.path());
         let before = s.stats();
         let id = s.put(b"measured").unwrap();
         let after = s.stats();
@@ -784,7 +1133,7 @@ mod tests {
     #[test]
     fn dedup_batch_reproduces_an_unfinished_publishers_directory_barrier() {
         let d = tempdir().unwrap();
-        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let s = per_dir_store(d.path());
         let mut first = s.begin_batch();
         let id = first.put(b"race-safe durable object").unwrap();
         let before = s.stats();
@@ -814,13 +1163,13 @@ mod tests {
     #[test]
     fn cold_store_dedup_reproves_file_and_full_path() {
         let d = tempdir().unwrap();
-        let first = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let first = per_dir_store(d.path());
         let mut unfinished = first.begin_batch();
         let id = unfinished.put(b"cross-process durability join").unwrap();
 
         // A newly opened Store has no inherited proof cache. Model a second
         // process joining the visible link after the first dies before finish.
-        let second = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let second = per_dir_store(d.path());
         let before = second.stats();
         let mut joining = second.begin_batch();
         assert_eq!(joining.put(b"cross-process durability join").unwrap(), id);
@@ -859,7 +1208,7 @@ mod tests {
 
         let serial_root = d.path().join("serial");
         std::fs::create_dir(&serial_root).unwrap();
-        let serial = LocalBlobStore::new(serial_root).unwrap();
+        let serial = per_dir_store(&serial_root);
         let serial_before = serial.stats();
         serial.put(&a).unwrap();
         serial.put(&b).unwrap();
@@ -868,7 +1217,7 @@ mod tests {
 
         let batched_root = d.path().join("batched");
         std::fs::create_dir(&batched_root).unwrap();
-        let batched = LocalBlobStore::new(batched_root).unwrap();
+        let batched = per_dir_store(&batched_root);
         let batch_before = batched.stats();
         let mut batch = batched.begin_batch();
         batch.put(&a).unwrap();
@@ -888,7 +1237,7 @@ mod tests {
     fn warm_same_shard_put_pays_only_the_new_leaf_barrier() {
         let d = tempdir().unwrap();
         let (a, b) = same_shard_pair();
-        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let s = per_dir_store(d.path());
         s.put(&a).unwrap();
         let before = s.stats();
 
@@ -903,7 +1252,7 @@ mod tests {
     #[test]
     fn legacy_visible_object_reproves_uncached_ancestors() {
         let d = tempdir().unwrap();
-        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let s = per_dir_store(d.path());
         let bytes = b"legacy visible object";
         let id = hash_bytes(bytes);
         let dest = s.object_path(id);
@@ -948,6 +1297,267 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(matches!(s.get(id), Err(Error::Corrupt(_))));
+    }
+
+    /// The default policy's proof obligation, and the reason the positive
+    /// proof cache is published in `finish` and nowhere else (I4).
+    ///
+    /// A batch that dies after `mkdir` and `link` made a whole shard path
+    /// *visible*, but before any barrier proved it, must teach a later batch
+    /// nothing. If the deferred proof were recorded when the directory was
+    /// created, the next batch would skip the barrier for an edge that was
+    /// never durable -- and its caller would then CAS a ref onto an object a
+    /// crash can still lose. That is exactly the I4 violation deferral must
+    /// not introduce, and it is invisible to any test that only kills a
+    /// process with the page cache intact.
+    #[test]
+    fn deferred_unfinished_batch_publishes_no_directory_proof() {
+        let d = tempdir().unwrap();
+        let s = deferred_store(d.path());
+
+        let mut abandoned = s.begin_batch();
+        abandoned.put(b"visible but never proven").unwrap();
+        drop(abandoned);
+        let before = s.stats();
+
+        let mut second = s.begin_batch();
+        second.put(b"visible but never proven").unwrap();
+        second.finish().unwrap();
+        let after = s.stats();
+
+        assert_eq!(
+            after.fsync_dir - before.fsync_dir,
+            3,
+            "objects->aa, aa->bb and bb->OID must all be proved by the batch \
+             that is about to let a ref name the object"
+        );
+    }
+
+    /// The deferred phase proves the same edges as `PerDirectory`, only later
+    /// and deduplicated: nothing is durable before `finish`, everything is
+    /// after it.
+    #[test]
+    fn deferred_takes_every_directory_barrier_in_one_phase_at_finish() {
+        let d = tempdir().unwrap();
+        let s = deferred_store(d.path());
+        let before = s.stats();
+
+        let mut batch = s.begin_batch();
+        let a = batch.put(b"deferred one").unwrap();
+        let b = batch.put(b"deferred two").unwrap();
+        let mid = s.stats();
+        assert_eq!(
+            mid.directory_barriers(),
+            before.directory_barriers(),
+            "no directory edge may be proved before the batch is complete"
+        );
+
+        batch.finish().unwrap();
+        let after = s.stats();
+        assert_eq!(after.fsync_file, before.fsync_file + 2);
+        assert!(
+            after.fsync_dir > before.fsync_dir,
+            "the phase proves every edge it deferred"
+        );
+        let reopened = LocalBlobStore::open_read_only(d.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.get(a).unwrap(), b"deferred one");
+        assert_eq!(reopened.get(b).unwrap(), b"deferred two");
+    }
+
+    /// I4 under `Collapsed`: one filesystem-wide barrier stands in for every
+    /// directory edge the batch touched -- the two shard ancestors and the
+    /// leaf that names each object -- and the batch is acknowledged only
+    /// after it returns.
+    #[test]
+    fn collapsed_batch_takes_one_barrier_for_every_edge_it_touched() {
+        let d = tempdir().unwrap();
+        let Some(s) = collapsed_store(d.path()) else {
+            return;
+        };
+        let before = s.stats();
+
+        let mut batch = s.begin_batch();
+        let a = batch.put(b"collapsed one").unwrap();
+        let b = batch.put(b"collapsed two").unwrap();
+        let c = batch.put(b"collapsed three").unwrap();
+        let mid = s.stats();
+        assert_eq!(
+            mid.directory_barriers(),
+            before.directory_barriers(),
+            "no directory edge may be proved before the batch is complete"
+        );
+        batch.finish().unwrap();
+        let after = s.stats();
+
+        assert_eq!(after.puts, before.puts + 3);
+        assert_eq!(after.fsync_file, before.fsync_file + 3);
+        assert_eq!(
+            after.fsync_dir, before.fsync_dir,
+            "the collapsed policy takes no per-directory barrier"
+        );
+        assert_eq!(
+            after.barrier_fs,
+            before.barrier_fs + 1,
+            "three objects across three shard paths cost one barrier"
+        );
+        assert_eq!(after.barrier_fs_batches, before.barrier_fs_batches + 1);
+        for id in [a, b, c] {
+            let reopened = LocalBlobStore::open_read_only(d.path().to_path_buf()).unwrap();
+            assert!(reopened.get(id).is_ok());
+        }
+    }
+
+    /// A single touched directory is cheaper to prove with the ordinary
+    /// `fsync` than with a whole-filesystem barrier, and the collapsed policy
+    /// says so.
+    #[test]
+    fn collapsed_policy_still_uses_a_plain_barrier_for_one_directory() {
+        let d = tempdir().unwrap();
+        let Some(s) = collapsed_store(d.path()) else {
+            return;
+        };
+        let (a, b) = same_shard_pair();
+        s.put(&a).unwrap();
+        let before = s.stats();
+
+        s.put(&b).unwrap();
+        let after = s.stats();
+
+        assert_eq!(after.fsync_dir, before.fsync_dir + 1);
+        assert_eq!(after.barrier_fs, before.barrier_fs);
+    }
+
+    /// The positive proofs are published only after the barrier, so a batch
+    /// that dies before `finish` teaches a later batch nothing -- for shard
+    /// ancestors exactly as for OIDs.
+    #[test]
+    fn collapsed_unfinished_batch_publishes_no_directory_proof() {
+        let d = tempdir().unwrap();
+        let Some(s) = collapsed_store(d.path()) else {
+            return;
+        };
+        let mut abandoned = s.begin_batch();
+        abandoned.put(b"never acknowledged").unwrap();
+        drop(abandoned);
+        let before = s.stats();
+
+        // The shard ancestors this object created are visible but unproven.
+        // A second batch that lands in the same shards must barrier again.
+        let mut second = s.begin_batch();
+        assert_eq!(
+            second.put(b"never acknowledged").unwrap(),
+            hash_bytes(b"never acknowledged")
+        );
+        second.finish().unwrap();
+        let after = s.stats();
+
+        assert_eq!(after.barrier_fs, before.barrier_fs + 1);
+    }
+
+    /// A cold store joining another publisher's visible-but-unproven link
+    /// must reproduce the file barrier and the whole pathname before its
+    /// caller may name the object from a ref (I4).
+    #[test]
+    fn collapsed_cold_store_dedup_reproves_file_and_full_path() {
+        let d = tempdir().unwrap();
+        let Some(first) = collapsed_store(d.path()) else {
+            return;
+        };
+        let mut unfinished = first.begin_batch();
+        let id = unfinished.put(b"cross-process durability join").unwrap();
+
+        let second = collapsed_store(d.path()).unwrap();
+        let before = second.stats();
+        let mut joining = second.begin_batch();
+        assert_eq!(joining.put(b"cross-process durability join").unwrap(), id);
+        drop(unfinished);
+        joining.finish().unwrap();
+        let after = second.stats();
+
+        assert_eq!(after.puts, before.puts);
+        assert_eq!(
+            after.fsync_file,
+            before.fsync_file + 1,
+            "the joined object's bytes are re-forced"
+        );
+        assert_eq!(
+            after.barrier_fs,
+            before.barrier_fs + 1,
+            "objects->aa, aa->bb and bb->OID are all re-proved, in one barrier"
+        );
+        assert_eq!(second.get(id).unwrap(), b"cross-process durability join");
+    }
+
+    /// Concurrent batches share one barrier. The accounting identity is the
+    /// assertion: every batch is accounted, and no batch is acknowledged by
+    /// fewer than one completed barrier.
+    #[test]
+    fn collapsed_barrier_is_shared_across_concurrent_batches() {
+        let d = tempdir().unwrap();
+        let Some(s) = collapsed_store(d.path()) else {
+            return;
+        };
+        let s = Arc::new(s);
+        let writers = 8usize;
+        let start = Arc::new(std::sync::Barrier::new(writers));
+        let mut joins = Vec::new();
+        for i in 0..writers {
+            let s = s.clone();
+            let start = start.clone();
+            joins.push(thread::spawn(move || {
+                let mut batch = s.begin_batch();
+                batch
+                    .put(format!("shared barrier {i} a").as_bytes())
+                    .unwrap();
+                batch
+                    .put(format!("shared barrier {i} b").as_bytes())
+                    .unwrap();
+                start.wait();
+                batch.finish().unwrap();
+            }));
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        let after = s.stats();
+        assert_eq!(after.barrier_fs_batches, writers as u64);
+        assert!(after.barrier_fs >= 1);
+        assert!(
+            after.barrier_fs <= writers as u64,
+            "a batch never runs more than one barrier: {after:?}"
+        );
+    }
+
+    /// The gate's ordering rule, stated directly: a barrier that started
+    /// before a caller asked for one never satisfies that caller.
+    #[test]
+    fn collapsed_gate_never_acknowledges_a_barrier_that_started_first() {
+        let d = tempdir().unwrap();
+        let Some(s) = collapsed_store(d.path()) else {
+            return;
+        };
+        let gate = s.fs_barrier.clone().unwrap();
+        // Model a barrier that is already running when a new caller arrives.
+        {
+            let mut state = gate.state.lock();
+            state.in_flight = Some(1);
+        }
+        let waiting = {
+            let state = gate.state.lock();
+            state.in_flight.unwrap_or(state.completed) + 1
+        };
+        assert_eq!(
+            waiting, 2,
+            "a caller behind an in-flight barrier waits for the next one"
+        );
+        // Completing generation 1 must not release that caller.
+        {
+            let mut state = gate.state.lock();
+            state.in_flight = None;
+            state.completed = 1;
+        }
+        let state = gate.state.lock();
+        assert!(state.completed < waiting);
     }
 
     #[test]

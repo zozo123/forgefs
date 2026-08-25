@@ -6,7 +6,7 @@ pub mod meta;
 mod metrics;
 pub mod objectstore;
 
-pub use blob::{GcObjectGuard, LocalBlobStore, PublishBatch};
+pub use blob::{BlobStoreStats, DirectoryBarrier, GcObjectGuard, LocalBlobStore, PublishBatch};
 pub use graph::{
     decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, GraphWorkQueue,
     VerifiedGraphObject, MAX_GRAPH_OBJECTS,

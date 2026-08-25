@@ -57,6 +57,15 @@ Publication is two-phase, and both phases are in the signatures.
 | `ObjectBatch::finish` | every object the batch published **or joined**, and every naming edge required to reach each one, is durable. This is the only point at which a caller may CAS-publish a ref naming those OIDs. |
 | dropping a batch | nothing is published. No proof may be recorded. A crash here leaves durable orphan objects, which is safe. |
 
+`LocalBlobStore` chooses *how* it takes the `finish` barriers with
+`DirectoryBarrier` (`FORGEFS_DIR_BARRIER`): one `fsync` per touched directory
+as it is touched, one per distinct directory in a single phase at `finish`
+(the default), or one `syncfs(2)` for the whole batch shared with concurrent
+batches. That is a backend implementation choice and not a seam contract: every
+setting makes the same set of edges durable before `finish` returns, so the
+table above is what a caller may rely on. `docs/BENCH.md` has the measured cost
+of each and why the barrier-count winner is not the throughput winner.
+
 "Joined" is the load-bearing word. If a batch deduplicates against an object
 that some *other, unfinished* batch made visible, it inherits no proof at all
 and must reproduce both barriers itself -- because the peer that made the

@@ -138,12 +138,15 @@ impl BenchReport {
         }
         if let Some(stats) = self.store {
             s.push_str(&format!(
-                "storage lifetime puts={} bytes=unavailable fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} lifetime_barrier_us={}\n",
+                "storage lifetime puts={} bytes=unavailable fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_fs={} barrier_fs_us={} barrier_fs_batches={} lifetime_barrier_us={}\n",
                 stats.puts,
                 stats.fsync_file,
                 stats.fsync_file_us,
                 stats.fsync_dir,
                 stats.fsync_dir_us,
+                stats.barrier_fs,
+                stats.barrier_fs_us,
+                stats.barrier_fs_batches,
                 stats.barrier_us(),
             ));
         }
@@ -167,9 +170,10 @@ impl BenchReport {
                 .barrier_us()
                 .saturating_add(meta.sqlite_accounted_us());
             s.push_str(&format!(
-                "lifetime phases  fsync_file_us={} + fsync_dir_us={} + sqlite_lock_wait_us={} + sqlite_txn_us={} = cumulative_phase_us={}\n",
+                "lifetime phases  fsync_file_us={} + fsync_dir_us={} + barrier_fs_us={} + sqlite_lock_wait_us={} + sqlite_txn_us={} = cumulative_phase_us={}\n",
                 store.fsync_file_us,
                 store.fsync_dir_us,
+                store.barrier_fs_us,
                 meta.lock_wait_us,
                 meta.txn_us,
                 cumulative_phase_us,
@@ -394,6 +398,9 @@ mod tests {
                 fsync_file_us: 11,
                 fsync_dir: 4,
                 fsync_dir_us: 13,
+                barrier_fs: 2,
+                barrier_fs_us: 31,
+                barrier_fs_batches: 5,
             }),
             meta: Some(MetaStats {
                 txn_us: 17,
@@ -428,13 +435,13 @@ mod tests {
             "counter end   = after init + all workloads + merge/seal + verify (+ worker fsck)"
         ));
         assert!(rendered.contains(
-            "storage lifetime puts=2 bytes=unavailable fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 lifetime_barrier_us=24"
+            "storage lifetime puts=2 bytes=unavailable fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 barrier_fs=2 barrier_fs_us=31 barrier_fs_batches=5 lifetime_barrier_us=55"
         ));
         assert!(rendered.contains(
             "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=9 explicit_txn_count=5 txn_us=17 lifetime_accounted_us=36 busy=0 updated=7 forked=1 denied=0"
         ));
         assert!(rendered.contains(
-            "fsync_file_us=11 + fsync_dir_us=13 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=60"
+            "fsync_file_us=11 + fsync_dir_us=13 + barrier_fs_us=31 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=91"
         ));
         assert!(rendered.contains(
             "per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals"

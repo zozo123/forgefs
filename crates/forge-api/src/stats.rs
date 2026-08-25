@@ -44,7 +44,17 @@ pub struct StoreCounterReport {
     pub fsync_file_us: u64,
     pub fsync_dir: u64,
     pub fsync_dir_us: u64,
-    /// Saturating `fsync_file_us + fsync_dir_us`. Not wall time.
+    /// Filesystem-wide barriers this store executed. One of them stands in
+    /// for the whole per-directory set of one or more batches, so it is a
+    /// barrier count and never a batch count.
+    pub barrier_fs: u64,
+    pub barrier_fs_us: u64,
+    /// Batches whose directory phase was satisfied by a filesystem-wide
+    /// barrier, leader and followers alike. Divided by `barrier_fs` it is the
+    /// achieved sharing depth.
+    pub barrier_fs_batches: u64,
+    /// Saturating `fsync_file_us + fsync_dir_us + barrier_fs_us`. Not wall
+    /// time.
     pub barrier_us: u64,
 }
 
@@ -136,6 +146,9 @@ impl StatsReport {
                 fsync_file_us: store.fsync_file_us,
                 fsync_dir: store.fsync_dir,
                 fsync_dir_us: store.fsync_dir_us,
+                barrier_fs: store.barrier_fs,
+                barrier_fs_us: store.barrier_fs_us,
+                barrier_fs_batches: store.barrier_fs_batches,
                 barrier_us: store.barrier_us(),
             },
             sqlite: MetaCounterReport {
@@ -176,7 +189,7 @@ impl StatsReport {
             "forge stats schema={} scope={}\n\
              {}\n\
              durability       journal_mode={} synchronous={} fullfsync={} read_only={}\n\
-             storage lifetime puts={} dedup_hits={} fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_us={}\n\
+             storage lifetime puts={} dedup_hits={} fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_fs={} barrier_fs_us={} barrier_fs_batches={} barrier_us={}\n\
              sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} txn_us={} explicit_txn_count={} accounted_us={} busy={} updated={} forked={} denied={} noop={}\n\
              sqlite locks     write_acquires={} write_wait_us={} read_acquires={} read_wait_us={}\n\
              api lifetime     sessions_opened={} stale={} merge_applied={} conflict={}\n",
@@ -193,6 +206,9 @@ impl StatsReport {
             self.store.fsync_file_us,
             self.store.fsync_dir,
             self.store.fsync_dir_us,
+            self.store.barrier_fs,
+            self.store.barrier_fs_us,
+            self.store.barrier_fs_batches,
             self.store.barrier_us,
             self.sqlite.lock_acquires,
             self.sqlite.lock_wait_us,
@@ -247,6 +263,9 @@ mod tests {
                 fsync_file_us: 11,
                 fsync_dir: 4,
                 fsync_dir_us: 13,
+                barrier_fs: 2,
+                barrier_fs_us: 31,
+                barrier_fs_batches: 5,
             },
             MetaStats {
                 txn_us: 17,
@@ -283,7 +302,7 @@ mod tests {
     #[test]
     fn derived_totals_are_sums_of_their_components() {
         let report = sample();
-        assert_eq!(report.store.barrier_us, 11 + 13);
+        assert_eq!(report.store.barrier_us, 11 + 13 + 31);
         assert_eq!(report.sqlite.accounted_us, 19 + 17);
     }
 

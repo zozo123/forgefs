@@ -135,7 +135,8 @@ scope            "process-lifetime"
 note             prose restating scope
 durability       journal_mode, synchronous, fullfsync, read_only
 store            puts, dedup_hits, fsync_file, fsync_file_us,
-                 fsync_dir, fsync_dir_us, barrier_us
+                 fsync_dir, fsync_dir_us, barrier_fs, barrier_fs_us,
+                 barrier_fs_batches, barrier_us
 sqlite           txn_count, txn_us, explicit_txn_count, lock_acquires,
                  lock_wait_us, write_lock_acquires, write_lock_wait_us,
                  read_lock_acquires, read_lock_wait_us, busy, cas_updated,
@@ -146,7 +147,16 @@ api              sessions_opened, stale_observation, merge_applied, merge_confli
 Stability rules for consumers:
 
 - Keys are added, never renamed or removed, while `schema_version` is 2. A
-  consumer must ignore keys it does not know.
+  consumer must ignore keys it does not know. `barrier_fs`, `barrier_fs_us`
+  and `barrier_fs_batches` were added this way.
+- `fsync_dir` counts per-directory barriers and `barrier_fs` counts
+  filesystem-wide ones, which the object store may take instead when its
+  directory-barrier policy is `collapsed`. Neither is the directory-barrier
+  total on its own; their sum is. `barrier_fs_batches` counts the batches a
+  filesystem-wide barrier satisfied, leader and followers alike, so
+  `barrier_fs_batches / barrier_fs` is the achieved sharing depth and is never
+  a barrier count. `barrier_us` is the saturating sum of all three duration
+  fields.
 - `txn_count` is every write transaction SQLite committed on the catalog: each
   explicit `BEGIN IMMEDIATE` that committed, and each autocommit statement that
   wrote, since SQLite gives every such statement its own implicit transaction.
