@@ -1,5 +1,5 @@
-//! Stateful model-based composition testing (I8, I9, I18, plus the liveness
-//! property the invariant set does not yet state).
+//! Stateful model-based composition testing (I8, I9, I18, I19-I22, plus the
+//! liveness property the invariant set still does not fully state).
 //!
 //! Every other test in this repository drives one operation, or one race, and
 //! checks one invariant. `#326` is the proof that this is not enough: `mount`
@@ -54,18 +54,16 @@ use tempfile::TempDir;
 /// Each entry must still be observed by the default run. When one is fixed the
 /// "every known defect was observed" assertion fails and names it, which is the
 /// signal to delete the row rather than to relax the check.
-const KNOWN: &[(&str, &str)] = &[
-    (
-        "F4-SESSION-WEDGED-WITH-STAGED-WORK",
-        "I20/I21 liveness, NOT closed: a read-write mount on a PROTECTED ref \
+const KNOWN: &[(&str, &str)] = &[(
+    "F4-SESSION-WEDGED-WITH-STAGED-WORK",
+    "I20/I21 liveness, NOT closed: a read-write mount on a PROTECTED ref \
          accepts writes that `checkin` then denies (`ref R is protected`), and \
          `abandon` without an explicit discard refuses because work is staged. \
          Neither publish nor explicit abandon is possible. I20 refuses a \
          read-write `oid:` mount and a ref not holding a commit, which closed \
          the other two shapes of this; a protected ref is still accepted at \
          mount time and is still unpublishable.",
-    ),
-];
+)];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {
@@ -1198,7 +1196,9 @@ impl World {
         let unreachable = !self.mount_ref_is_reachable(&s, &abs);
         let real = self.forge.read(&cap, &ns, &abs);
         if unreachable {
-            self.say(format!("read ns={ns} {abs} -> {real:?} (mount ref outside the cap)"));
+            self.say(format!(
+                "read ns={ns} {abs} -> {real:?} (mount ref outside the cap)"
+            ));
             match &real {
                 Err(Error::Denied(_)) => return,
                 _ => self.bail(&format!(
@@ -1272,7 +1272,9 @@ impl World {
         let unreachable = !self.mount_ref_is_reachable(&s, &abs);
         let real = self.forge.ls(&cap, &ns, &abs);
         if unreachable {
-            self.say(format!("ls ns={ns} {abs} -> {real:?} (mount ref outside the cap)"));
+            self.say(format!(
+                "ls ns={ns} {abs} -> {real:?} (mount ref outside the cap)"
+            ));
             match &real {
                 Err(Error::Denied(_)) => return,
                 _ => self.bail(&format!(
@@ -1852,7 +1854,9 @@ fn i22_checkin_refuses_a_noop_over_work_it_did_not_fold() {
     let root = forge.root_cap().unwrap();
     forge.branch(&root, "main", "shared").unwrap();
     let ns = forge.session_open(&root, "main").unwrap();
-    forge.mount(&root, &ns, "/work", "ref:shared", true).unwrap();
+    forge
+        .mount(&root, &ns, "/work", "ref:shared", true)
+        .unwrap();
     forge
         .write(&root, &ns, "/work/a.txt", b"hello", false)
         .unwrap();
