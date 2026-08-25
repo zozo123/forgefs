@@ -40,10 +40,15 @@ const SQLITE_KEYS: &[&str] = &[
     "cas_forked",
     "cas_noop",
     "cas_updated",
+    "explicit_txn_count",
     "lock_acquires",
     "lock_wait_us",
+    "read_lock_acquires",
+    "read_lock_wait_us",
     "txn_count",
     "txn_us",
+    "write_lock_acquires",
+    "write_lock_wait_us",
 ];
 const API_KEYS: &[&str] = &[
     "merge_applied",
@@ -111,7 +116,7 @@ fn stats_json_emits_one_stable_document_for_every_counter() {
     let doc = stats_json(d.path(), &cap);
 
     assert_eq!(keys(&doc), TOP_KEYS, "top-level key set is a CLI contract");
-    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["schema_version"], 2);
 
     // The scope is inside the document so no consumer has to infer it, and so
     // nothing can quietly reread these totals as per-operation measurements.

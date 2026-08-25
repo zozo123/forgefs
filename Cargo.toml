@@ -40,7 +40,10 @@ libc = "0.2"
 lru = "0.18.2"
 parking_lot = "0.12.3"
 rand = "0.8.5"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# `hooks`: SQLite's commit hook is how `MetaStats::txn_count` counts every
+# committed write transaction, autocommit ones included (issue #311). It
+# pulls in no additional package.
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
 sha2 = "0.10.8"
