@@ -393,7 +393,32 @@ impl Forge {
             // `Error::Invalid` is exit 1 in CLI_ABI.md, the same row abandon
             // already uses for "the session holds staged work": the request as
             // stated is unsatisfiable and no retry of it will ever succeed.
-            let stranded = self.store.meta.overlay_mounts_outside(ns, &m.path)?;
+            // Only work that EXISTS may block a "there was nothing to do".
+            // An overlay entry that folds to its own mount's base -- a delete
+            // of a path that mount does not have, a write of bytes already
+            // there -- is a ROW, not work, and `abandon --discard` is the only
+            // thing that ever cared about the difference.
+            //
+            // Counting rows instead wedges the session all of whose mounts
+            // hold only such rows: every checkin lands here, every one refuses
+            // on account of every other, `abandon` without a discard refuses
+            // because rows exist, and the escape this diagnostic advises can
+            // never be taken (I21). `model_composition.rs` found that; the
+            // regression test is `checkin_staged_work.rs`.
+            let stranded: Vec<(String, u64)> = self
+                .store
+                .meta
+                .overlay_mounts_outside(ns, &m.path)?
+                .into_iter()
+                .map(|(other, count)| {
+                    let real = self.mount_overlay_changes_its_base(ns, &other, &mounts, &batch)?;
+                    Ok((other, count, real))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, _, real)| *real)
+                .map(|(other, count, _)| (other, count))
+                .collect();
             if !stranded.is_empty() {
                 let named = stranded
                     .iter()
@@ -487,6 +512,40 @@ impl Forge {
             &intro_oids,
         )?;
         Ok(result)
+    }
+
+    /// Does the overlay staged under `path` fold to anything other than that
+    /// mount's own base?
+    ///
+    /// I22 asks whether the session holds WORK, not whether it holds rows, and
+    /// the two differ exactly when an overlay entry reproduces what the base
+    /// already has. Answering it costs one fold per other mount, on the `Noop`
+    /// path only -- the path that was about to do nothing anyway.
+    ///
+    /// Fails SAFE in both unusual directions: a mount this session does not
+    /// have, or a read-write mount with no pin, counts as holding work, so an
+    /// unexpected shape produces a refusal that names it rather than a silent
+    /// `Noop` over it.
+    fn mount_overlay_changes_its_base(
+        &self,
+        ns: &str,
+        path: &str,
+        mounts: &[Mount],
+        batch: &impl forge_core::tree::TreeStore,
+    ) -> Result<bool> {
+        let Some(om) = mounts.iter().find(|x| x.path == path) else {
+            return Ok(true);
+        };
+        let Some(base) = om.base_oid else {
+            return Ok(true);
+        };
+        let rows = self.store.meta.overlay_list(ns, path)?;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let base_tree = self.store.get_commit(base)?.tree;
+        let folded = apply_overlay(Some(base_tree), &overlay_map(&rows), batch)?;
+        Ok(folded != base_tree)
     }
 
     /// Re-validate every recorded observation against the tree the mount that
