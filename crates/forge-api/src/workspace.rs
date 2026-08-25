@@ -433,3 +433,71 @@ fn observed_at(
     }
     current_at(store, tree, rel)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Forge;
+    use tempfile::tempdir;
+
+    /// #308/I9: a read records what it saw. Reading the same path again sees
+    /// the same thing, so the row is already correct and must not be rewritten.
+    /// Measured with `sqlite3_total_changes`, not `MetaStats::txn_count`, which
+    /// counts explicit transactions only and is blind to the autocommit
+    /// `INSERT OR REPLACE` this path used to issue once per read.
+    #[test]
+    fn rereading_a_path_costs_exactly_one_row_mutation() {
+        let dir = tempdir().unwrap();
+        let forge = Forge::init(dir.path()).unwrap();
+        let root = forge.root_cap().unwrap();
+        let ns = forge.session_open(&root, "main").unwrap();
+        forge.mount(&root, &ns, "/", "ref:main", true).unwrap();
+        forge.write(&root, &ns, "/a.txt", b"v0", false).unwrap();
+
+        let before = forge.store.meta.row_mutations();
+        assert_eq!(forge.read(&root, &ns, "/a.txt").unwrap(), b"v0");
+        let after_first = forge.store.meta.row_mutations();
+        assert_eq!(forge.read(&root, &ns, "/a.txt").unwrap(), b"v0");
+        let after_second = forge.store.meta.row_mutations();
+
+        assert_eq!(
+            after_first - before,
+            1,
+            "one read of a new path must record exactly one observation row"
+        );
+        assert_eq!(
+            after_second - after_first,
+            0,
+            "the second read of an unchanged path rewrote its observation row"
+        );
+
+        // The observation I9 validates is still there, and there is one of it.
+        let observations = forge.store.meta.observations(&ns).unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].path, "a.txt");
+
+        // A directory listing is an observation too, and repeats the same way.
+        let after_reads = forge.store.meta.row_mutations();
+        forge.ls(&root, &ns, "/").unwrap();
+        let after_first_ls = forge.store.meta.row_mutations();
+        forge.ls(&root, &ns, "/").unwrap();
+        assert_eq!(
+            after_first_ls - after_reads,
+            1,
+            "the first listing of a directory must record one row"
+        );
+        assert_eq!(
+            forge.store.meta.row_mutations(),
+            after_first_ls,
+            "the second listing of an unchanged directory rewrote its row"
+        );
+
+        // A path whose content moved is a different observation and is written.
+        forge.write(&root, &ns, "/a.txt", b"v1", false).unwrap();
+        let before_moved = forge.store.meta.row_mutations();
+        assert_eq!(forge.read(&root, &ns, "/a.txt").unwrap(), b"v1");
+        assert!(
+            forge.store.meta.row_mutations() > before_moved,
+            "a read that saw a new OID must record it"
+        );
+    }
+}
