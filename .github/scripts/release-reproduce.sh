@@ -6,6 +6,11 @@
 # own empty target directory. Every file the packaging step produces must be
 # byte-identical. A difference fails the release rather than being explained
 # away in a document.
+#
+# DESTRUCTIVE, and deliberately so: a second build is only evidence if the
+# first one left nothing behind, so this removes ./out and ./target before it
+# starts. It is meant for a fresh CI checkout, not for a working tree you care
+# about.
 set -euo pipefail
 
 : "${TARGET:?TARGET is required}"
