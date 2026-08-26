@@ -20,6 +20,11 @@ gated_targets=(
   x86_64-apple-darwin
   aarch64-apple-darwin
 )
+# Targets whose packaging is proved reproducible by a second clean build.
+# A target belongs here only once that proof runs in the release workflow.
+reproduced_targets=(
+  x86_64-unknown-linux-gnu
+)
 evidence=(
   abi-conformance.json
   conflict-object.txt
@@ -32,7 +37,11 @@ evidence=(
 
 for target in "${targets[@]}"; do
   printf 'forge-%s-%s.BUILD-INFO.txt\n' "$version" "$target"
+  printf 'forge-%s-%s.cdx.json\n' "$version" "$target"
   printf 'forge-%s-%s.tar.gz\n' "$version" "$target"
+done
+for target in "${reproduced_targets[@]}"; do
+  printf 'forge-%s-%s.REPRODUCE.txt\n' "$version" "$target"
 done
 for target in "${gated_targets[@]}"; do
   for file in "${evidence[@]}"; do

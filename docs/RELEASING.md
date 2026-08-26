@@ -9,14 +9,19 @@ The model is intentionally small:
 3. A release-preparation workflow opens the version-bump PR.
 4. The release tag must exactly equal `v<workspace version>` and its commit must already be reachable from `origin/main`.
 5. Four target artifacts are built from that exact commit.
-6. All four target artifacts run the end-to-end ForgeFS release gate on their native hosted architecture, from the packaged binary rather than a rebuild.
-7. Release build, gate and audit jobs start without a shared compilation cache.
-8. All binaries, BUILD-INFO files and gate evidence are assembled into one `release-payload` artifact.
-9. `SHA256SUMS` covers every file in that payload.
-10. The exact checksum manifest is attested.
-11. The publish job downloads only that immutable payload, re-verifies it, and hands exactly those files to `gh release create`.
+6. Each target emits a CycloneDX SBOM for its own resolved dependency graph, cross-checked against the crates the shipped binary demonstrably links.
+7. All four target artifacts run the end-to-end ForgeFS release gate on their native hosted architecture, from the packaged binary rather than a rebuild.
+8. `x86_64-unknown-linux-gnu` is built and packaged twice, in two clean trees at different paths, and the bytes must match.
+9. Release build, gate and audit jobs start without a shared compilation cache.
+10. All binaries, BUILD-INFO files, SBOMs, reproducibility evidence and gate evidence are assembled into one `release-payload` artifact.
+11. `SHA256SUMS` covers every file in that payload.
+12. The exact checksum manifest is attested.
+13. The publish job downloads only that immutable payload, re-verifies it, and hands exactly those files to `gh release create`.
 
 No other workflow may create ForgeFS releases.
+
+`docs/SUPPLY-CHAIN.md` records the SBOM tool choice, the reproducibility
+result and its exact scope, and the dependency policy.
 
 ## Prepare the next version
 
@@ -62,7 +67,9 @@ The workflow refuses publication unless all of the following are true:
 - no release gate, audit or artifact build restores a shared Cargo/target cache;
 - every natively runnable packaged binary reports the expected version;
 - all four native target packages pass `scripts/release-gate.sh`;
-- the 36 non-manifest payload files exactly match the audited asset/evidence catalog, with no extra or non-regular entries;
+- every target SBOM lists every crate recovered from that target's shipped binary;
+- two clean builds of the tagged commit produce byte-identical packaged files for `x86_64-unknown-linux-gnu`;
+- the 41 non-manifest payload files exactly match the audited asset/evidence catalog, with no extra or non-regular entries;
 - `SHA256SUMS` covers that exact catalog and every payload file verifies against it;
 - provenance attestation succeeds;
 - the `release` GitHub Environment approves the publishing jobs.
@@ -91,6 +98,8 @@ The payload contains:
 
 - `forge-<version>-<target>.tar.gz` for all four supported targets;
 - one `BUILD-INFO` per target;
+- one CycloneDX SBOM per target, `forge-<version>-<target>.cdx.json`;
+- `forge-<version>-x86_64-unknown-linux-gnu.REPRODUCE.txt`, the double-build evidence;
 - release-gate evidence for every target: gate summary, full fsck, CLI ABI, seal attestation, conflict object and environment lines;
 - `SHA256SUMS` covering every regular payload file except itself.
 
@@ -123,6 +132,8 @@ A release is fail-closed:
 - a non-main tag is rejected before expensive build work;
 - a version mismatch is rejected before build work;
 - missing evidence prevents payload assembly;
+- an SBOM that omits a crate the binary links fails its build job;
+- a packaging difference between two builds of the same commit fails the release;
 - a checksum mismatch prevents attestation and publication;
 - a failed gate never produces a release.
 
