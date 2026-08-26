@@ -110,12 +110,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: power-loss
+      - name: Refresh package index
+        run: sudo apt-get update -qq
       - name: Install strace
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
-      - name: Build forge and the multi-batch workload
-        run: |
-          cargo build --locked -p forge-cli
-          cargo build --locked -p forge-api --example powerloss_multibatch
+        run: sudo apt-get install -y -qq strace
+      - name: Build forge
+        run: cargo build --locked -p forge-cli
+      - name: Build the multi-batch workload
+        run: cargo build --locked -p forge-api --example powerloss_multibatch
       # kill -9 leaves the page cache intact, so the crash suite cannot see a
       # ref published over bytes no barrier forced. This drops them. Small cut
       # count here; docs/DURABILITY.md has the wide invocation.
