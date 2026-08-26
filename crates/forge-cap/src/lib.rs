@@ -179,21 +179,37 @@ fn caveat_mac_input(c: &str) -> Vec<u8> {
     v
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+fn mac(key: &[u8], data: &[u8]) -> HmacSha256 {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
     mac.update(data);
+    mac
+}
+
+fn finalize_mac(mac: HmacSha256) -> [u8; 32] {
     let out = mac.finalize().into_bytes();
     let mut sig = [0u8; 32];
     sig.copy_from_slice(&out);
     sig
 }
 
-fn sign_chain(root: &[u8], loc: &str, id: &str, caveats: &[String]) -> [u8; 32] {
+fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    finalize_mac(mac(key, data))
+}
+
+fn final_chain_mac(root: &[u8], loc: &str, id: &str, caveats: &[String]) -> HmacSha256 {
+    let Some((last, prior)) = caveats.split_last() else {
+        return mac(root, &prefix_bytes(loc, id));
+    };
+
     let mut sig = hmac(root, &prefix_bytes(loc, id));
-    for c in caveats {
+    for c in prior {
         sig = hmac(&sig, &caveat_mac_input(c));
     }
-    sig
+    mac(&sig, &caveat_mac_input(last))
+}
+
+fn sign_chain(root: &[u8], loc: &str, id: &str, caveats: &[String]) -> [u8; 32] {
+    finalize_mac(final_chain_mac(root, loc, id, caveats))
 }
 
 struct ParsedCaveats {
@@ -355,11 +371,9 @@ fn decode_cap(raw: &[u8]) -> Result<Cap> {
 }
 
 pub fn verify(root: &[u8], cap: &Cap) -> Result<()> {
-    let expect = sign_chain(root, &cap.loc, &cap.id, &cap.caveats);
-    if expect != cap.sig {
-        return Err(Error::Cap("bad signature".into()));
-    }
-    Ok(())
+    final_chain_mac(root, &cap.loc, &cap.id, &cap.caveats)
+        .verify_slice(&cap.sig)
+        .map_err(|_| Error::Cap("bad signature".into()))
 }
 
 pub fn mint(root: &[u8], loc: &str, id: &str, caveats: Vec<String>) -> Result<Cap> {
@@ -594,5 +608,14 @@ mod tests {
     fn bad_key_fails() {
         let cap = mint_root(&[1u8; 32]).unwrap();
         assert!(verify(&[2u8; 32], &cap).is_err());
+    }
+
+    #[test]
+    fn one_bit_forged_signature_fails() {
+        let key = [11u8; 32];
+        let mut cap = mint_root(&key).unwrap();
+        verify(&key, &cap).unwrap();
+        cap.sig[0] ^= 1;
+        assert!(verify(&key, &cap).is_err());
     }
 }
