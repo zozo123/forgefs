@@ -17,6 +17,8 @@ Each fact has one owner. Link to it instead of copying it:
 | `docs/OBJECTSTORE.md` | The `ObjectStore` seam and the durability a backend must prove itself |
 | `docs/BENCH.md` | Reproducible benchmark protocol and claim boundaries |
 | `docs/CHUNKING.md` | Measured object-size ceiling and the chunked-file design decision |
+| `docs/CONFLICTS.md` | Conflict lifecycle, resolution decision, and merge drivers |
+| `docs/REPLICATION.md` | Object-plane / ref-plane replication decision |
 | `docs/RELEASING.md` | Release, artifact, and verification procedure |
 | `SECURITY.md` | Threat model, supported reporting path, and non-goals |
 
