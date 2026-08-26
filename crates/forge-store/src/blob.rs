@@ -347,6 +347,22 @@ pub struct BlobStoreStats {
     /// barrier, counting followers as well as the leader that ran it.
     /// `barrier_fs_batches / barrier_fs` is the achieved sharing depth.
     pub barrier_fs_batches: u64,
+    /// Object-file bytes this process actually wrote, summed over `puts`. It
+    /// is the payload length, not the on-disk allocation.
+    pub put_bytes: u64,
+    /// Object-file bytes a publication did NOT have to write because the
+    /// object was already present, summed over `dedup_hits`. Paired with
+    /// `put_bytes` it is the storage amplification content addressing avoided,
+    /// which is the number issue #42 asks for and `puts` alone cannot give.
+    pub dedup_bytes: u64,
+    /// Object-file bytes read back from durable storage. Reads served from a
+    /// `Store` cache never reach here, so `get_bytes` is physical read volume
+    /// and the cache counters are what explain the difference.
+    pub get_bytes: u64,
+    /// Objects whose durable bytes did not rehash to the id that named them.
+    /// Every one is a refused read (I1, I3, I15); the counter exists so a
+    /// corrupt store is visible as a rate and not only as one error string.
+    pub hash_failures: u64,
 }
 
 impl BlobStoreStats {
@@ -369,7 +385,11 @@ impl BlobStoreStats {
 #[derive(Debug, Default)]
 struct BlobStoreCounters {
     puts: AtomicU64,
+    put_bytes: AtomicU64,
     dedup_hits: AtomicU64,
+    dedup_bytes: AtomicU64,
+    get_bytes: AtomicU64,
+    hash_failures: AtomicU64,
     fsync_file: TimingCounter,
     fsync_dir: TimingCounter,
     barrier_fs: TimingCounter,
@@ -412,7 +432,9 @@ pub struct PublishBatch<'a> {
     proofs: BTreeSet<PathBuf>,
     oids: BTreeSet<ObjectId>,
     new_puts: u64,
+    new_put_bytes: u64,
     new_dedup: u64,
+    new_dedup_bytes: u64,
 }
 
 impl LocalBlobStore {
@@ -514,7 +536,9 @@ impl LocalBlobStore {
             proofs: BTreeSet::new(),
             oids: BTreeSet::new(),
             new_puts: 0,
+            new_put_bytes: 0,
             new_dedup: 0,
+            new_dedup_bytes: 0,
         }
     }
 
@@ -571,8 +595,15 @@ impl LocalBlobStore {
         require_regular_file(&p, id)?;
         let bytes = fs::read(&p).map_err(|_| Error::NotFound(format!("object {id}")))?;
         if hash_bytes(&bytes) != id {
+            // Counted before the refusal, so a store that is corrupting reads
+            // is visible in `forge stats` and not only in whichever command
+            // happened to touch the object first.
+            self.stats.hash_failures.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Corrupt(format!("hash mismatch {id}")));
         }
+        self.stats
+            .get_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(bytes)
     }
 
@@ -605,6 +636,10 @@ impl LocalBlobStore {
             barrier_fs: barrier_fs.count,
             barrier_fs_us: barrier_fs.total_us,
             barrier_fs_batches: self.stats.barrier_fs_batches.load(Ordering::Relaxed),
+            put_bytes: self.stats.put_bytes.load(Ordering::Relaxed),
+            dedup_bytes: self.stats.dedup_bytes.load(Ordering::Relaxed),
+            get_bytes: self.stats.get_bytes.load(Ordering::Relaxed),
+            hash_failures: self.stats.hash_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -650,6 +685,24 @@ impl PublishBatch<'_> {
     /// `put(&parts.concat())`; the concatenation is never allocated, so a
     /// caller that already holds a payload does not need a second copy of it
     /// in order to publish one (I2, I3, I4).
+    /// The one place a publication outcome is counted.
+    ///
+    /// Outcome and byte volume move together here so a new branch in
+    /// `put_parts` -- and it has six -- cannot record one and forget the
+    /// other. That is the standard #311 established for `txn_count`: source
+    /// the count where the work happens, not where someone remembers to.
+    fn count_put(&mut self, bytes: u64) {
+        self.new_puts += 1;
+        self.new_put_bytes = self.new_put_bytes.saturating_add(bytes);
+    }
+
+    /// A publication satisfied by bytes that were already durable. `bytes` is
+    /// what was NOT written, which is the storage-amplification signal.
+    fn count_dedup(&mut self, bytes: u64) {
+        self.new_dedup += 1;
+        self.new_dedup_bytes = self.new_dedup_bytes.saturating_add(bytes);
+    }
+
     pub fn put_parts(&mut self, parts: &[&[u8]]) -> Result<ObjectId> {
         // Every object write in the process funnels through here, so this is
         // the whole write boundary for a read-only store.
@@ -658,6 +711,7 @@ impl PublishBatch<'_> {
                 "repository is open read-only; objects cannot be published".into(),
             ));
         }
+        let payload_bytes: u64 = parts.iter().map(|p| p.len() as u64).sum();
         let id = hash_parts(parts);
         let dest = self.store.object_path(id);
         let (a, b) = id.shard_dirs();
@@ -680,7 +734,7 @@ impl PublishBatch<'_> {
                 // Rehash at every trust boundary even when a process-local
                 // durability proof lets us avoid another physical barrier.
                 self.store.verify_existing(id, &dest)?;
-                self.new_dedup += 1;
+                self.count_dedup(payload_bytes);
                 return Ok(id);
             }
             self.store.verify_and_sync_existing(id, &dest)?;
@@ -690,7 +744,7 @@ impl PublishBatch<'_> {
             // before allowing our caller to publish metadata that names it.
             self.dirs.insert(shard_b);
             self.oids.insert(id);
-            self.new_dedup += 1;
+            self.count_dedup(payload_bytes);
             return Ok(id);
         }
 
@@ -710,7 +764,7 @@ impl PublishBatch<'_> {
                 crate::inject_barrier_failure(crate::DurabilityBarrier::ObjectLinkAfter)?;
                 self.dirs.insert(shard_b);
                 self.oids.insert(id);
-                self.new_puts += 1;
+                self.count_put(payload_bytes);
                 let _ = fs::remove_file(&tmp);
                 Ok(id)
             }
@@ -724,7 +778,7 @@ impl PublishBatch<'_> {
                     } else {
                         self.store.verify_existing(id, &dest)?;
                     }
-                    self.new_dedup += 1;
+                    self.count_dedup(payload_bytes);
                     // Another publisher won after our existence check. Its file
                     // and directory barriers may still be pending, so this batch
                     // joins the proof unless another completed batch cached it.
@@ -734,10 +788,10 @@ impl PublishBatch<'_> {
                 // refresh. Our tmp file still holds the exact bytes, so link
                 // them back rather than naming something that is not there.
                 if fs::hard_link(&tmp, &dest).is_ok() {
-                    self.new_puts += 1;
+                    self.count_put(payload_bytes);
                 } else {
                     self.store.verify_and_sync_existing(id, &dest)?;
-                    self.new_dedup += 1;
+                    self.count_dedup(payload_bytes);
                 }
                 self.dirs.insert(shard_b);
                 self.oids.insert(id);
@@ -759,7 +813,9 @@ impl PublishBatch<'_> {
             proofs,
             oids,
             new_puts,
+            new_put_bytes,
             new_dedup,
+            new_dedup_bytes,
         } = self;
 
         // One filesystem-wide barrier is only the cheaper proof when it
@@ -825,8 +881,16 @@ impl PublishBatch<'_> {
         store.stats.puts.fetch_add(new_puts, Ordering::Relaxed);
         store
             .stats
+            .put_bytes
+            .fetch_add(new_put_bytes, Ordering::Relaxed);
+        store
+            .stats
             .dedup_hits
             .fetch_add(new_dedup, Ordering::Relaxed);
+        store
+            .stats
+            .dedup_bytes
+            .fetch_add(new_dedup_bytes, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1107,11 +1171,14 @@ mod tests {
         s.put(b"measured").unwrap();
         let after_dedup = s.stats();
         // A dedup hit republishes nothing and performs no new barrier, so the
-        // dedup counter is the only field allowed to move.
+        // dedup PAIR is all that may move: the outcome and the bytes it did not
+        // have to write. Every put field and every barrier field must be
+        // untouched, which is what the struct update below states.
         assert_eq!(
             after_dedup,
             BlobStoreStats {
                 dedup_hits: after.dedup_hits + 1,
+                dedup_bytes: after.dedup_bytes + b"measured".len() as u64,
                 ..after
             }
         );

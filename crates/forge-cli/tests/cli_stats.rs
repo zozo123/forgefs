@@ -16,6 +16,7 @@ fn forge() -> Command {
 
 const TOP_KEYS: &[&str] = &[
     "api",
+    "cache",
     "durability",
     "note",
     "schema_version",
@@ -29,12 +30,22 @@ const STORE_KEYS: &[&str] = &[
     "barrier_fs_batches",
     "barrier_fs_us",
     "barrier_us",
+    "dedup_bytes",
     "dedup_hits",
     "fsync_dir",
     "fsync_dir_us",
     "fsync_file",
     "fsync_file_us",
+    "get_bytes",
+    "hash_failures",
+    "put_bytes",
     "puts",
+];
+const CACHE_KEYS: &[&str] = &[
+    "object_cache_hits",
+    "object_cache_misses",
+    "tree_cache_hits",
+    "tree_cache_misses",
 ];
 const SQLITE_KEYS: &[&str] = &[
     "accounted_us",
@@ -54,8 +65,16 @@ const SQLITE_KEYS: &[&str] = &[
     "write_lock_wait_us",
 ];
 const API_KEYS: &[&str] = &[
+    "fsck_findings",
+    "fsck_runs",
+    "gc_bytes_deleted",
+    "gc_objects_deleted",
+    "gc_runs",
     "merge_applied",
+    "merge_base_searches",
+    "merge_base_us",
     "merge_conflict",
+    "renames",
     "sessions_opened",
     "stale_observation",
 ];
@@ -135,6 +154,7 @@ fn stats_json_emits_one_stable_document_for_every_counter() {
     assert!(durability["read_only"].is_boolean());
 
     assert_u64_section(&doc["store"], STORE_KEYS);
+    assert_u64_section(&doc["cache"], CACHE_KEYS);
     assert_u64_section(&doc["sqlite"], SQLITE_KEYS);
     assert_u64_section(&doc["api"], API_KEYS);
 }
@@ -148,6 +168,7 @@ fn stats_json_shape_does_not_depend_on_counter_values() {
     let second = stats_json(d.path(), &cap);
     assert_eq!(keys(&first), keys(&second));
     assert_eq!(keys(&first["store"]), keys(&second["store"]));
+    assert_eq!(keys(&first["cache"]), keys(&second["cache"]));
     assert_eq!(keys(&first["sqlite"]), keys(&second["sqlite"]));
     assert_eq!(keys(&first["api"]), keys(&second["api"]));
 }
@@ -169,6 +190,40 @@ fn stats_text_names_its_counter_scope() {
         text.contains("cas_noop=") || text.contains("noop="),
         "{text}"
     );
+}
+
+/// #324/#42: the human rendering is DERIVED from the document, so every key
+/// the JSON carries has to appear in the text. This is what stops the two
+/// surfaces drifting the way `forge bench` had drifted -- rendering only the
+/// summed lock wait, so writer contention could not be attributed at all.
+#[test]
+fn stats_text_carries_every_key_the_json_document_carries() {
+    let (d, cap) = repo();
+    let doc = stats_json(d.path(), &cap);
+    let out = forge()
+        .args(["--dir", d.path().to_str().unwrap()])
+        .args(["--cap", cap.to_str().unwrap()])
+        .arg("stats")
+        .output()
+        .expect("spawn forge stats");
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for section in ["store", "cache", "sqlite", "api"] {
+        for key in doc[section]
+            .as_object()
+            .unwrap_or_else(|| panic!("{section} is an object"))
+            .keys()
+        {
+            assert!(
+                text.contains(&format!("{key}=")),
+                "`forge stats` omits {section}.{key} that `--json` reports:\n{text}"
+            );
+        }
+    }
+    // The pair #324 is about, named explicitly so a future flattening of the
+    // split into the sum fails here and not only in a benchmark write-up.
+    assert!(text.contains("write_lock_wait_us="), "{text}");
+    assert!(text.contains("read_lock_wait_us="), "{text}");
 }
 
 /// I14: no ambient authority. A metrics read is still an authenticated command.

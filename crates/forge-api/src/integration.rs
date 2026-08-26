@@ -36,7 +36,12 @@ impl Forge {
         let ours_c = self.store.get_commit(into_row.oid)?;
         let (theirs_oid, theirs_c) = self.peel_commit(from)?;
         let tree = {
-            let bases = merge_bases(&self.store, into_row.oid, theirs_oid)?;
+            let started = std::time::Instant::now();
+            let bases = merge_bases(&self.store, into_row.oid, theirs_oid);
+            // Timed whatever the search returned: a search that FAILED still
+            // spent the time, and charging only successes hides the slow case.
+            self.count_merge_base(started.elapsed());
+            let bases = bases?;
             if bases.len() > 1 {
                 let base_trees = bases
                     .iter()

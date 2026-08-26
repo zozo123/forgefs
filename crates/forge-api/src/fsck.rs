@@ -482,6 +482,7 @@ impl Forge {
         // unauditable-schema refusal above.
         verify_graph(&self.store, roots, &mut report)?;
         report.finish();
+        self.count_fsck(&report);
         Ok(report)
     }
 }
