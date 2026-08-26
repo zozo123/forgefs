@@ -401,6 +401,10 @@ check abi/0-fsck-full blocking 0 "" -- --dir "$A" --cap "$A_ROOT" fsck --full
 check abi/0-fsck-json blocking 0 "" -- --dir "$A" --cap "$A_ROOT" fsck --full --json
 check abi/0-verify-sealed-tag blocking 0 "" -- --dir "$A" --cap "$A_ROOT" verify abi-seal
 check abi/0-show-sealed-tag blocking 0 "" -- --dir "$A" --cap "$A_ROOT" show tags/abi-seal
+# I25: a receipt reports only what it could verify from durable bytes.
+check abi/0-receipt-show blocking 0 \
+	"every object the receipt names is reread, rehashed and type-checked (I25)" -- \
+	--dir "$A" --cap "$A_ROOT" receipt show "heads/agents/anon/$A_NS"
 check abi/0-mv-blob blocking 0 \
 	"a move is staged atomically and publishes through the ordinary checkin (I24)" -- \
 	--dir "$A" --cap "$A_ROOT" mv --ns "$A_MVNS" /abi.txt /abi-moved.txt
@@ -557,6 +561,16 @@ check abi/1-unknown-flag blocking 1 \
 check abi/1-log-unknown-ref blocking 1 \
 	"not-found is exit 1; log used to exit 0 with no output, hiding the difference between no history and no such ref" -- \
 	--dir "$F" --cap "$F_ROOT" log no/such/ref
+# I10: a commit with no receipt is absence, not corruption -- exit 1, not 2.
+check abi/1-receipt-of-a-commit-without-one blocking 1 \
+	"a merge or canonical commit legitimately carries no Contribution (I10)" -- \
+	--dir "$A" --cap "$A_ROOT" receipt show main
+# An object the CALLER named that is not here is a not-found input error. An
+# object a RECEIPT names that is not here is corruption (exit 2). Collapsing
+# the two would report a typo as a damaged repository.
+check abi/1-receipt-of-an-absent-object blocking 1 \
+	"naming an object this repository does not hold is input, not corruption" -- \
+	--dir "$A" --cap "$A_ROOT" receipt show "oid:$ZERO_OID"
 check abi/1-landmark-absent-oid blocking 1 \
 	"not-found is exit 1; landmark verifies the object exists and records its real type instead of hardcoding 'commit'" -- \
 	--dir "$F" --cap "$F_ROOT" landmark "$ZERO_OID"
