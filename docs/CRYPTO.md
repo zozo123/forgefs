@@ -19,7 +19,7 @@ The authorization parser is separate from authentication: verification proves th
 Purpose: sign the immutable `Snapshot` identity used by `forge seal` / `forge verify` (`crates/forge-api/src/integration.rs`).
 
 - Primitive: workspace requirement `ed25519-dalek 2.1.1`; the committed release lockfile resolves the compatible `ed25519-dalek 2.2.0` release.
-- Requested feature surface: crate defaults plus the workspace's explicit `rand_core` feature. ForgeFS itself does **not** call `SigningKey::generate`; it fills a 32-byte seed with OS `getrandom 0.2.17` and calls `SigningKey::from_bytes`. Removing the unused `rand_core` request is tracked separately in #387 so this review does not claim a cleanup that has not landed.
+- Requested feature surface: crate defaults only. ForgeFS does **not** request Dalek's optional `rand_core` feature and does not call `SigningKey::generate`; it fills a 32-byte seed with OS `getrandom 0.2.17` and calls `SigningKey::from_bytes`. Keeping key generation on that one explicit OS-random path is intentional.
 - ForgeFS does not directly request Dalek's `batch`, `digest`, `asm`, `pkcs8`, `pem`, `serde`, `legacy_compatibility`, or `hazmat` features. A future dependency change must re-check the fully unified Cargo feature graph, not infer it from this direct-dependency list alone.
 - Secret seed: exactly 32 bytes filled directly by locked `getrandom 0.2.17`, then passed to `SigningKey::from_bytes`. This keeps OS randomness in one explicit repository-initialization path.
 - Public trust root: `seal.pub` is derived from the local secret seed. On every open ForgeFS derives the public key again and refuses a catalog `cap_root` that disagrees. A snapshot carrying another key is rejected during verification (I15).
@@ -39,7 +39,7 @@ Release CI installs no cryptographic implementation dynamically. `Cargo.lock` is
 Review rule for future changes:
 
 1. Prefer the primitive crate's high-level safe API; never add bespoke crypto or raw/hazmat APIs to save glue code.
-2. Enable only features exercised by production code. An unused crypto feature is trusted surface and should be removed through an ordinary Cargo-regenerated lockfile change.
+2. Enable only features exercised by production code. An unused crypto feature is trusted surface and should be removed through an ordinary Cargo feature-graph review.
 3. Use the primitive's constant-time verification API for secret-dependent authentication comparisons.
 4. Generate long-term key material from the OS CSPRNG through one auditable path; do not introduce a second RNG stack without a measured need.
 5. Treat changes to FMAC authentication, object hashes, seal signing, key sizes, or encoded key/signature fields as compatibility/security design changes, not routine dependency bumps.
@@ -50,5 +50,5 @@ Review rule for future changes:
 - `crates/forge-cap/src/lib.rs`: HMAC construction, chained attenuation, capability verification.
 - `crates/forge-api/src/repository.rs`: OS-random HMAC root and Ed25519 seed creation; secret/public key persistence; local public-key re-derivation.
 - `crates/forge-api/src/integration.rs`: snapshot construction, Ed25519 signing, trusted-key and signature verification.
-- `Cargo.toml` / `Cargo.lock`: direct crypto requirements and the committed resolved dependency graph; #387 owns the unused direct `rand_core` request.
+- `Cargo.toml` / `Cargo.lock`: direct crypto requirements and the committed resolved dependency graph; #387 removed the unused direct `rand_core` feature request.
 - `.github/workflows/security.yml` / `.github/workflows/release.yml`: RustSec, cargo-deny, locked builds, SBOM and release evidence.
