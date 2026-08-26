@@ -34,6 +34,46 @@ and retain the complete output with the machine/filesystem description when maki
 
 A new cache, index, connection pool, batching lane, or storage layout must point to a measured counter or profile showing that its cost is material. Average throughput alone is insufficient: p99 and invariant evidence must hold. In particular, a durability optimization may coalesce barriers but may never acknowledge a committed ref before every object reachable from it is durable.
 
+### Barriers: count the serialised critical path, not the barriers issued
+
+An earlier form of this rule held that the per-checkin flush count essentially
+*is* the serial cost, so removing a barrier buys its share of the average flush
+time. That rule is refuted; it must not be reintroduced here.
+
+- **Marginal is not average.** A barrier that follows other barriers finds the
+  journal already committed. Measured on one Linux/ext4 box: roughly 49 us
+  marginal against a roughly 402 us average. Multiplying an average flush cost
+  by a flush count overstated the value of removing one barrier by about 8x.
+- **The kernel already merges.** jbd2 coalesces concurrent fsyncs. At 16 workers
+  ForgeFS *issued* 16.01 barriers per checkin while the device *completed*
+  10.71. "Reduce the count" competes with a kernel that already does it, and
+  loses outright when the replacement introduces a global serialisation point.
+- **Both of this week's results, one model.** Collapsing 9 directory barriers to
+  2 with I4 intact *lost* 15-22% throughput at 2..16 workers (#341); moving
+  fsyncs out of the write mutex *won* (#338). A count-based rule predicts the
+  opposite for both. What costs is a barrier on the serialised critical path,
+  not a barrier issued.
+
+State where a proposed change moves barriers *relative to the serialising mutex
+or transaction*, then measure `flush_per_checkin` alongside issued-versus-
+completed device flushes. A change that only lowers the issued count is not yet
+evidence of a win.
+
+### Two hazards that turn durability numbers into fiction
+
+1. **Barrier reach is a precondition, not a detail.** A fresh sandbox may mount
+   ext4 `nobarrier`, and every durability number taken there is fiction. Confirm
+   the fsync-to-device-flush ratio (`/proc/diskstats` field 19) is about 1.00
+   before trusting any figure, and remount with barriers if it is not. This is
+   step zero of the bench command above, not an afterthought.
+2. **`kill -9` cannot evidence power-loss durability.** SIGKILL leaves the page
+   cache intact, so a clean kill test says nothing about whether barriers
+   reached the device. Demonstrated rather than argued: a mutated build with a
+   genuine I4 directory-edge hole passed a SIGKILL harness with 1,960
+   acknowledged checkins, zero losses, and `fsck --full` clean on every run.
+   SIGKILL evidences process-crash durability only; the power-loss half rests
+   entirely on device flush counts plus a verified barrier-reach ratio.
+
 ## Cache policy
 
 Caches are hints. The Store tree/blob LRU may avoid repeated decode/I/O on ordinary reads, but verification and fsck must remain able to re-read and validate durable bytes. Cache state is never content identity, authority, provenance, or evidence that a sealed object is sound.
