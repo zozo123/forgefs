@@ -121,6 +121,16 @@ objects separately rather than dropping them, so the number is auditable.
 filtered ref list, and a filtered root set is precisely how a collector deletes
 live objects.
 
+The plan and the sweep report reachability from one shared computation
+(`reachable_closure`), so `--dry-run` and `--collect` cannot describe the same
+unchanged repository differently. `--collect` used to report its own number and
+got it wrong: it widens its reachable set into a *protection* set — everything a
+withheld or batch-limited survivor can reach is spared — and then reported the
+widened size, so it printed `16 of 16 objects reachable` beside `withheld: 2`
+while `--dry-run` on the same repository printed `14 of 16`. Nothing was wrongly
+deleted; the operator was simply told, on the one path that deletes, that the
+repository had no unreachable objects (issue #356).
+
 ## `gc --collect`
 
 ```

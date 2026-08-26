@@ -134,6 +134,19 @@ refusal covers a catalog written by a *newer* ForgeFS, whose invariants this
 binary does not know; `verify` and `forge fsck` without `--full` have always
 answered both cases this way.
 
+`fsck --json` says the same thing in the format it was asked for. A refusal is
+not an audit, so it is not an `FsckReport` with `ok: false` and no findings --
+that would be the same untruth in JSON. It is a distinct document, on stdout,
+identified by `"schema": "forgefs.fsck-refusal/1"`, carrying `audited: false`, a
+machine-stable `reason` (`schema_needs_migration` or
+`schema_newer_than_supported`), the version found, the version supported, and
+the same sentence the prose path prints. It carries no `ok` and no counters, so
+no consumer can read it as an audit that found nothing. The exit code is
+unchanged at 1; only the silence is gone. Until issue #356 a `--json` caller got
+an empty stdout and had to parse English off stderr to tell "not audited" from
+"audited and clean" -- and issue #348 made that the routine answer for every
+repository written by an older release, not a rare one.
+
 Exit 2 keeps its reserved meaning here, in both directions. A damaged migration
 ledger -- a hole, a duplicate, an empty ledger, a missing or reshaped
 `schema_migrations` table -- is damage rather than age, and is still reported as
@@ -315,16 +328,33 @@ Neither verb introduces an exit code. Both map onto the table above:
 `forge gc --dry-run` **never deletes** and is the reporting half. `forge gc
 --collect` is the reclaiming half: it unlinks unreachable objects and removes
 the catalog rows that named them. Exactly one of the two flags is required, so
-a bare `forge gc` still exits 1 with the diagnostic pointing at `docs/GC.md`,
-and no invocation deletes anything by default. `--min-age-secs` is refused
-below its hard floor rather than quietly raised, because that floor is the only
-bound ForgeFS has on the window between a writer's put and the transaction that
-names it. `docs/GC.md` states the root set, the invariant collection preserves
-(I23) and the one precondition it cannot prove for itself.
+a bare `forge gc` still exits 1 with a diagnostic that names both modes and
+points at `docs/GC.md`, and no invocation deletes anything by default. That
+diagnostic said "collection is not implemented" from #12 until issue #356 --
+long after `--collect` shipped, was listed in `gc --help`, and was documented in
+the table above. The exit code was right the whole time, which is why the
+conformance suite in `scripts/cli-abi-conformance.sh` could not catch it: it
+checks status codes, not sentences.
+
+`--min-age-secs` is refused below its hard floor rather than quietly raised,
+because that floor is the only bound ForgeFS has on the window between a
+writer's put and the transaction that names it. `docs/GC.md` states the root
+set, the invariant collection preserves (I23) and the one precondition it
+cannot prove for itself.
 
 `forge gc --json` writes one JSON object to stdout. It is not part of the
 `forge stats --json` contract above and carries no `schema_version`; consumers
 must ignore keys they do not know and must not assert amounts.
+
+"Must not assert amounts" is not licence for the amounts to be untrue. Both
+halves report reachability from the same computation, so a `--dry-run` and a
+`--collect` of the same unchanged repository state the same
+`reachable_objects`. `--collect` used to add withheld and batch-limited garbage
+to that number -- it widens its reachable set into a protection set so nothing a
+survivor names is unlinked, and then reported the widened size -- producing
+lines like `16 of 16 objects reachable` beside `withheld: 2 objects` and hiding
+from the operator that the repository held unreachable objects at all (issue
+#356).
 
 ## Structured metrics: `forge stats --json`
 

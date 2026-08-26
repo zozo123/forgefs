@@ -1,0 +1,26 @@
+forgefs seal attestation
+tag:              v0.3.0
+snapshot oid:     92cb2ceab3296f3f2ab5687010c18eb813966c83fc76d8e91a1005474592c7f9
+verify result:    ok 92cb2ceab3296f3f2ab5687010c18eb813966c83fc76d8e91a1005474592c7f9
+tag ref flags:    PS (P=protected, S=sealed)
+forge version:    0.3.0
+seal command:     forge --cap <integrator> seal main --tag v0.3.0 --attest
+verify command:   forge --cap <root> verify v0.3.0
+
+-- seal output --
+sealed tags/v0.3.0 92cb2ceab3296f3f2ab5687010c18eb813966c83fc76d8e91a1005474592c7f9
+attested ok
+-- refs --
+-- conflict                         conflicts/main/01M0XNSJPF3HP6BEKJC0608ZA7 7ae033ea7df6263a2951d470307e3bf47cb30ae74354b8c303bbb2dec2e00aea
+-- commit                           heads/agents/alice/01M0XNSHAQXNS35J8X02WJCMFJ 328e1df31b1b80dcab57760ee1481782ca7f6421a4d2a32999eaf613ad52e82c
+-- commit                           heads/agents/alice/01M0XNSJ51CSPZ9MD7805BGH40 2b0b7a4f118cb561bb71d99f5af51d05314853f9ef7023417b2531dfa70a5ac3
+-- commit                           heads/agents/alice/01M0XNSK0CRM13QDY4DZ83F340 f9bfc0f8bb016f9ba428523147c6d3742b61170a5b4cc7ad1c98e81f77387fd1
+-- commit                           heads/agents/alice/01M0XNSKCSHFGQD3YW4WNJ0SM0 80f369ac42c69423ad16f36be6f43ca73b1f0990db33dbc6bf15d9d631226fcd
+-- commit                           heads/agents/anon/01M0XNSJ0BV3EWGYAZ7YN8WQVX f894547ee1d700c6a38d8e9e17bf75f8d693d5e394d76ff8c103895390310623
+-- commit                           heads/agents/bob/01M0XNSHC3FRJBCAKJE75YEQ99 7b9a5d2065d8822bf795fec336bf6b1b33a7c7fe7e6cf8e6e4c73cfcab158fc7
+-- commit                           heads/agents/bob/01M0XNSJ69AJDWC90S3AR8KZTP 16364317b2c03798f22dbea52e8dcc975af31881c0a786ffbd367667d8b90c48
+-- commit                           heads/agents/bob/01M0XNSKAB13NKV8S81060GES4 fbac9ebfd741b9b2469ac40d9f0fcc23ffe365ddd18c62dabf2b594d19710f95
+-- commit                           heads/agents/bob/01M0XNSKWACBA6VZ2AZ40Q93ED 1a9bed2c4401dc5e76d691ee33fadd62c14dc917d91af018df895a6c631837a3
+-- commit                           heads/agents/carol/01M0XNSKZ59YY6JNG8C54GS0N0 f57412921ea3861d442d37cc447c18b6649c1d546deab2c9d6068de460c543f0
+P- commit                           main 1a9bed2c4401dc5e76d691ee33fadd62c14dc917d91af018df895a6c631837a3
+PS snapshot                         tags/v0.3.0 92cb2ceab3296f3f2ab5687010c18eb813966c83fc76d8e91a1005474592c7f9

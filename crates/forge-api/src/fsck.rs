@@ -19,6 +19,53 @@ pub struct FsckFinding {
     pub detail: String,
 }
 
+/// Why `fsck` declined to audit at all, as a document rather than as prose on
+/// stderr.
+///
+/// `fsck --full --json` on a catalog from an older release used to write
+/// nothing to stdout: the refusal existed only as an English sentence on
+/// stderr, and a `--json` consumer got an empty stream and exit 1 with no way
+/// to tell "not audited" from "audit produced nothing" except by parsing prose
+/// (issue #356). Issue #348 made that outcome routine rather than rare -- it is
+/// what every un-migrated repository now gets -- so the refusal is part of the
+/// interface and needs a shape.
+///
+/// It is deliberately NOT an [`FsckReport`] with `ok: false`. A report says
+/// "I looked and here is what I found"; this says "I did not look". Giving the
+/// refusal `ok: false` and zero findings would be the same lie in JSON that
+/// the empty stdout was in prose, so the two documents share no field layout
+/// and this one leads with `schema`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct FsckRefusal {
+    /// Always `forgefs.fsck-refusal/1`, so no consumer can mistake this for a
+    /// report.
+    pub schema: &'static str,
+    /// Always false: nothing was audited.
+    pub audited: bool,
+    /// Machine-stable classification, never the prose.
+    pub reason: FsckRefusalReason,
+    /// The catalog's metadata schema version, as found.
+    pub schema_version: i64,
+    /// What this binary understands.
+    pub supported_schema_version: i64,
+    /// The same sentence the non-JSON path prints, so the two cannot drift.
+    pub detail: String,
+}
+
+/// The classifications a [`FsckRefusal`] can carry. Named, so a consumer can
+/// branch on "migrate the repository" versus "upgrade the binary" without
+/// matching on English.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FsckRefusalReason {
+    /// The catalog predates this binary: open it once for writing to migrate.
+    SchemaNeedsMigration,
+    /// The catalog postdates this binary: upgrade forge.
+    SchemaNewerThanSupported,
+}
+
+pub const FSCK_REFUSAL_SCHEMA: &str = "forgefs.fsck-refusal/1";
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct FsckReport {
     pub ok: bool,
@@ -330,7 +377,13 @@ impl Forge {
     /// metadata roots and reachable objects; `full=true` additionally proves
     /// one defensive catalog snapshot and scans every object file, including
     /// unreachable/orphan objects.
-    pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
+    /// The precondition `fsck` checks before auditing anything, as a value.
+    ///
+    /// `Ok(None)` means the audit may proceed. [`Forge::fsck`] calls this and
+    /// turns a `Some` into the `Error::Invalid` it has always returned, so the
+    /// prose path and the `--json` path are the same decision worded twice
+    /// rather than two decisions that can disagree.
+    pub fn fsck_refusal(&self, cap: &Cap, full: bool) -> Result<Option<FsckRefusal>> {
         if self.fsck_catalog && !full {
             return Err(Error::Invalid(
                 "a ledger-deferred fsck handle requires full=true".into(),
@@ -341,6 +394,65 @@ impl Forge {
             return Err(Error::Denied(
                 "fsck requires unrestricted read authority".into(),
             ));
+        }
+        if !full {
+            return Ok(None);
+        }
+        // A schema this binary cannot audit is not a verdict about the
+        // repository. `fsck --full` alone opens through the ledger-deferred
+        // path so it can REPORT a damaged ledger, and that deferral let an
+        // intact repository from an older release reach an auditor that
+        // knows only the current shape: it found a short ledger and a
+        // `mounts` table without the column v3 added, called both defects,
+        // and the CLI rendered them as exit 2 -- the code CLI_ABI.md
+        // reserves for corruption -- on bytes that were entirely healthy
+        // (issue #348).
+        //
+        // Refusing is deliberate, and it is the same answer the read-only
+        // path already gives: `verify` and reachable `fsck` exit 1 here,
+        // naming the version. Migrating first would be friendlier and is
+        // the wrong instinct -- `fsck` is what an operator reaches for when
+        // they are already worried, most often before deciding whether to
+        // trust an upgrade, and a diagnostic tool must not silently rewrite
+        // the catalog it was called to diagnose. So exit 2 keeps meaning
+        // corruption, and this keeps meaning "not yet migrated".
+        Ok(match self.store.meta.ledger_standing()? {
+            LedgerStanding::NeedsMigration(version) => Some(FsckRefusal {
+                schema: FSCK_REFUSAL_SCHEMA,
+                audited: false,
+                reason: FsckRefusalReason::SchemaNeedsMigration,
+                schema_version: version,
+                supported_schema_version: CURRENT_SCHEMA_VERSION,
+                detail: format!(
+                    "metadata schema version {version} needs migration to \
+                     {CURRENT_SCHEMA_VERSION}, which a read-only check cannot perform; \
+                     fsck will not migrate a repository it was asked to diagnose. \
+                     Open the repository once for writing to migrate it (for example \
+                     `forge --dir <repo> --cap <cap> refs`), then re-run `forge fsck --full`"
+                ),
+            }),
+            LedgerStanding::Newer(version) => Some(FsckRefusal {
+                schema: FSCK_REFUSAL_SCHEMA,
+                audited: false,
+                reason: FsckRefusalReason::SchemaNewerThanSupported,
+                schema_version: version,
+                supported_schema_version: CURRENT_SCHEMA_VERSION,
+                detail: format!(
+                    "metadata schema version {version} is newer than supported \
+                     {CURRENT_SCHEMA_VERSION}; this binary does not know that catalog's \
+                     invariants and cannot audit it. Upgrade forge, then re-run \
+                     `forge fsck --full`"
+                ),
+            }),
+            // Damaged is the case the deferral exists for: let the audit
+            // run and report SCHEMA_LEDGER as the corruption it is.
+            LedgerStanding::Current | LedgerStanding::Damaged => None,
+        })
+    }
+
+    pub fn fsck(&self, cap: &Cap, full: bool) -> Result<FsckReport> {
+        if let Some(refusal) = self.fsck_refusal(cap, full)? {
+            return Err(Error::Invalid(refusal.detail));
         }
 
         let mut report = FsckReport::new(full);
@@ -354,46 +466,8 @@ impl Forge {
         let mut roots = Vec::new();
 
         if full {
-            // A schema this binary cannot audit is not a verdict about the
-            // repository. `fsck --full` alone opens through the ledger-deferred
-            // path so it can REPORT a damaged ledger, and that deferral let an
-            // intact repository from an older release reach an auditor that
-            // knows only the current shape: it found a short ledger and a
-            // `mounts` table without the column v3 added, called both defects,
-            // and the CLI rendered them as exit 2 -- the code CLI_ABI.md
-            // reserves for corruption -- on bytes that were entirely healthy
-            // (issue #348).
-            //
-            // Refusing is deliberate, and it is the same answer the read-only
-            // path already gives: `verify` and reachable `fsck` exit 1 here,
-            // naming the version. Migrating first would be friendlier and is
-            // the wrong instinct -- `fsck` is what an operator reaches for when
-            // they are already worried, most often before deciding whether to
-            // trust an upgrade, and a diagnostic tool must not silently rewrite
-            // the catalog it was called to diagnose. So exit 2 keeps meaning
-            // corruption, and this keeps meaning "not yet migrated".
-            match self.store.meta.ledger_standing()? {
-                LedgerStanding::NeedsMigration(version) => {
-                    return Err(Error::Invalid(format!(
-                        "metadata schema version {version} needs migration to \
-                         {CURRENT_SCHEMA_VERSION}, which a read-only check cannot perform; \
-                         fsck will not migrate a repository it was asked to diagnose. \
-                         Open the repository once for writing to migrate it (for example \
-                         `forge --dir <repo> --cap <cap> refs`), then re-run `forge fsck --full`"
-                    )))
-                }
-                LedgerStanding::Newer(version) => {
-                    return Err(Error::Invalid(format!(
-                        "metadata schema version {version} is newer than supported \
-                         {CURRENT_SCHEMA_VERSION}; this binary does not know that catalog's \
-                         invariants and cannot audit it. Upgrade forge, then re-run \
-                         `forge fsck --full`"
-                    )))
-                }
-                // Damaged is the case the deferral exists for: let the audit
-                // run and report SCHEMA_LEDGER as the corruption it is.
-                LedgerStanding::Current | LedgerStanding::Damaged => {}
-            }
+            // The ledger standing was already decided by `fsck_refusal`
+            // above; a catalog this binary cannot audit never gets here.
             let catalog = self.store.meta.audit_catalog()?;
             self.collect_full_catalog(catalog, &mut report, &mut roots);
             scan_all_object_paths(&self.store.root(), &mut roots, &mut report)?;

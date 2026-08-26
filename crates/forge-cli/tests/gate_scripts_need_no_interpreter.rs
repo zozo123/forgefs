@@ -207,3 +207,302 @@ fn no_gate_script_invokes_an_interpreter() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #354: the declaration itself, RUN rather than read
+// ---------------------------------------------------------------------------
+//
+// The prose above was true about interpreters and false about `grep`, which is
+// its own Debian package and not part of coreutils. One `grep -Eq` sat in
+// release-gate.sh while three separate places declared the prerequisites to be
+// bash, coreutils, sed and awk. On a machine with exactly that PATH the gate
+// printed `grep: command not found`, reported `gate: FAIL gate/conflict-object`
+// and wrote `"ok": false` into gate-summary.json: a missing TOOL rendered as a
+// failing PRODUCT.
+//
+// `no_gate_script_invokes_an_interpreter` could never have caught it, because
+// it only knows the names it was told to look for -- and nobody thinks to add
+// `grep` to a deny-list. The tests below take the opposite shape. They build a
+// bin directory holding symlinks to exactly the commands
+// `scripts/prereq-lib.sh` declares, nothing else, and run the gates with that
+// directory as the entire PATH. Any tool the scripts use and do not declare
+// fails them, whatever its name, without anyone having had to anticipate it.
+
+/// Every command `scripts/prereq-lib.sh` declares, read out of the file so the
+/// test cannot drift from the list the scripts actually enforce.
+fn declared_commands(root: &Path) -> Vec<String> {
+    let lib = fs::read_to_string(root.join("scripts/prereq-lib.sh")).expect("read prereq-lib.sh");
+    let line = lib
+        .lines()
+        .find(|line| line.starts_with("GATE_REQUIRED_COMMANDS="))
+        .expect("prereq-lib.sh must declare GATE_REQUIRED_COMMANDS");
+    let list = line
+        .split_once('"')
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(inside, _)| inside)
+        .expect("GATE_REQUIRED_COMMANDS must be a double-quoted list");
+    let commands: Vec<String> = list.split_whitespace().map(str::to_string).collect();
+    assert!(
+        commands.iter().any(|c| c == "bash") && commands.iter().any(|c| c == "awk"),
+        "the declared list must at least name the shell and awk it is written in: {commands:?}"
+    );
+    commands
+}
+
+/// Resolve one command against the ambient PATH, the way a shell would.
+fn resolve_on_path(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(command))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A bin directory holding symlinks to exactly `commands`, and nothing else.
+/// `skip` is omitted, which is how the "declared but absent" case is built.
+fn declared_only_bin(dir: &Path, commands: &[String], skip: Option<&str>) -> PathBuf {
+    let bin = dir.join("declared-bin");
+    fs::create_dir_all(&bin).expect("declared bin");
+    for command in commands {
+        if Some(command.as_str()) == skip {
+            continue;
+        }
+        let Some(target) = resolve_on_path(command) else {
+            panic!(
+                "scripts/prereq-lib.sh declares `{command}`, which is not on this machine's PATH; \
+                 the declared list must name commands that exist"
+            );
+        };
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, bin.join(command)).expect("symlink declared command");
+    }
+    bin
+}
+
+/// The major version of the `bash` the gate will actually be run with.
+///
+/// `scripts/prereq-lib.sh` has two mechanisms and only one of them is portable:
+/// the up-front check over the declared list is POSIX and holds everywhere,
+/// while the undeclared-command backstop is built on `command_not_found_handle`,
+/// a bash 4.0 feature. macOS ships bash 3.2.57. Tests ask this rather than the
+/// host OS, because what decides the behaviour is the shell, not the platform.
+fn bash_major(bin: &Path) -> u32 {
+    let out = Command::new(bin.join("bash"))
+        .arg("-c")
+        .arg("printf %s \"${BASH_VERSINFO[0]}\"")
+        .output()
+        .expect("run bash to read its version");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("BASH_VERSINFO[0] must be a number")
+}
+
+fn run_gate(
+    script: &Path,
+    forge: &str,
+    outdir: &Path,
+    bin: &Path,
+    tmp: &Path,
+) -> std::process::Output {
+    Command::new(bin.join("bash"))
+        .arg(script)
+        .arg(forge)
+        .arg(outdir)
+        .env_clear()
+        .env("PATH", bin)
+        .env("HOME", tmp)
+        .env("TMPDIR", tmp)
+        .output()
+        .expect("run gate script")
+}
+
+/// The whole release gate, on a PATH that contains the declared prerequisites
+/// and nothing else. This is the run that found issue #354, and it fails for
+/// any undeclared command, not just the one that was there.
+#[test]
+fn the_release_gate_runs_on_a_path_holding_only_its_declared_prerequisites() {
+    let root = repo_root();
+    let dir = tempdir().unwrap();
+    let commands = declared_commands(&root);
+    let bin = declared_only_bin(dir.path(), &commands, None);
+    let outdir = dir.path().join("gate-out");
+
+    let out = run_gate(
+        &root.join("scripts/release-gate.sh"),
+        env!("CARGO_BIN_EXE_forge"),
+        &outdir,
+        &bin,
+        dir.path(),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !stderr.contains("command not found"),
+        "the gate reached for an undeclared command; declared: {commands:?}\n{stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "release-gate.sh failed on its own declared PATH: status {:?}\n{}\n{stderr}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(outdir.join("gate-summary.json")).unwrap())
+            .expect("gate-summary.json must be JSON");
+    assert_eq!(summary["ok"], true, "gate-summary.json: {summary}");
+    assert_eq!(
+        summary["failures"].as_array().map(Vec::len),
+        Some(0),
+        "gate-summary.json: {summary}"
+    );
+}
+
+/// A DECLARED prerequisite that this machine does not have is a harness error
+/// with an exit code of its own -- before any assertion runs, so there is
+/// nothing for it to be mistaken for.
+#[test]
+fn a_missing_declared_prerequisite_is_exit_3_and_names_itself() {
+    let root = repo_root();
+    let dir = tempdir().unwrap();
+    let commands = declared_commands(&root);
+    // `seq` is used only by the conformance fixtures, so its absence would
+    // otherwise surface deep inside a row rather than up front.
+    let bin = declared_only_bin(dir.path(), &commands, Some("seq"));
+    let outdir = dir.path().join("gate-out");
+
+    let out = run_gate(
+        &root.join("scripts/release-gate.sh"),
+        env!("CARGO_BIN_EXE_forge"),
+        &outdir,
+        &bin,
+        dir.path(),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a missing prerequisite must exit 3, not fail the product: {stderr}"
+    );
+    assert!(
+        stderr.contains("seq"),
+        "the message must name what is missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("gate: FAIL"),
+        "no gate assertion may be reported as failed: {stderr}"
+    );
+    assert!(
+        !outdir.join("gate-summary.json").exists(),
+        "a gate that could not run must not leave a verdict behind"
+    );
+}
+
+/// The other direction: a command the scripts use and do NOT declare -- the
+/// case the declared list cannot cover, because a list only knows what is on
+/// it. A copy of the gate is rewritten to reach for an absent tool exactly
+/// where the `grep -Eq` of issue #354 was.
+///
+/// This exercises the SECOND mechanism in `scripts/prereq-lib.sh`, and it is
+/// deliberately asserted at two different strengths, because the mechanism
+/// exists at two different strengths:
+///
+///   * on every shell, the missing tool must be NAMED -- bash itself says
+///     "command not found" -- so a reader is never left guessing;
+///   * on bash >= 4 only, `command_not_found_handle` additionally converts the
+///     verdict into exit 3 and withholds `gate-summary.json`.
+///
+/// The weaker arm is not this test being lowered to pass. Issue #354 is about a
+/// tool the scripts DECLARE, and that is fixed on every shell -- see
+/// `the_release_gate_runs_on_a_path_holding_only_its_declared_prerequisites`
+/// and `a_missing_declared_prerequisite_is_exit_3_and_names_itself`, both of
+/// which assert full strength unconditionally. What is version-dependent is
+/// only the bonus protection against a FUTURE undeclared dependency, and there
+/// is no POSIX way to have it: an ERR trap does not fire in a condition
+/// context, which is exactly the shape (`if ! ere_match ...`) the defect took.
+#[test]
+fn an_undeclared_command_is_a_harness_error_not_a_gate_failure() {
+    let root = repo_root();
+    let dir = tempdir().unwrap();
+    let commands = declared_commands(&root);
+    let bin = declared_only_bin(dir.path(), &commands, None);
+
+    // The scripts resolve their libraries relative to their own directory, so
+    // the whole set is copied and only the gate is rewritten.
+    let scripts = dir.path().join("scripts");
+    fs::create_dir_all(&scripts).expect("scripts dir");
+    for entry in fs::read_dir(root.join("scripts")).expect("read scripts") {
+        let entry = entry.expect("scripts entry");
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("sh") {
+            continue;
+        }
+        let dest = scripts.join(entry.file_name());
+        fs::copy(entry.path(), &dest).expect("copy script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        }
+    }
+    let gate = scripts.join("release-gate.sh");
+    let text = fs::read_to_string(&gate).expect("read gate copy");
+    let call = "if ! ere_match \"$want\" \"$CONFLICT_SHOW\"; then";
+    assert!(
+        text.contains(call),
+        "the conflict-object match moved; this test must be re-aimed at it"
+    );
+    let injected = text.replace(
+        call,
+        "if ! printf '%s\\n' \"$CONFLICT_SHOW\" | forgefs-undeclared-tool -Eq \"$want\"; then",
+    );
+    fs::write(&gate, injected).expect("write injected gate");
+
+    let outdir = dir.path().join("gate-out");
+    // A summary from an earlier, real run must not survive as the answer.
+    fs::create_dir_all(&outdir).expect("outdir");
+    fs::write(outdir.join("gate-summary.json"), "{\"ok\": true}").expect("stale summary");
+
+    let out = run_gate(
+        &gate,
+        env!("CARGO_BIN_EXE_forge"),
+        &outdir,
+        &bin,
+        dir.path(),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Holds on every shell: whatever the exit code, the tool that was not
+    // found is named, so the run is never silently attributed to forge alone.
+    assert!(
+        stderr.contains("forgefs-undeclared-tool"),
+        "the message must name the command that was not found: {stderr}"
+    );
+
+    if bash_major(&bin) < 4 {
+        // bash 3.2 (macOS) has no `command_not_found_handle`, so the backstop
+        // cannot exist here. Measured degraded behaviour: exit 1 with a
+        // `gate: FAIL` row -- which is why the declared list, asserted at full
+        // strength above, is the mechanism #354 is actually fixed by.
+        eprintln!(
+            "skipping the exit-3 arm: bash {} has no command_not_found_handle \
+             (added in bash 4.0); the undeclared-command backstop does not \
+             exist on this shell. The declared-list guard, which is what fixes \
+             issue #354, is asserted unconditionally by the other tests.",
+            bash_major(&bin)
+        );
+        return;
+    }
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a missing tool must be a harness error, not exit 1: {stderr}"
+    );
+    assert!(
+        !stderr.contains("gate: FAIL"),
+        "a missing tool must not be reported as a failing gate assertion: {stderr}"
+    );
+    assert!(
+        !outdir.join("gate-summary.json").exists(),
+        "a gate that could not run must not leave a verdict, stale or fresh"
+    );
+}
