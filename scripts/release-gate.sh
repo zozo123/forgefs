@@ -463,7 +463,7 @@ must gate/overlap-merge-a --dir "$DEMO" --cap "$INT" merge --into=main --from "h
 MAIN_PRE_CONFLICT="$(ref_oid main)"
 expect_exit gate/overlap-merge-conflict 4 \
 	--dir "$DEMO" --cap "$INT" merge --into=main --from "heads/agents/bob/$OV_B"
-CONFLICT_OID="$(printf '%s\n' "$LAST_OUT" | awk '/^conflict /{print $2; exit}')"
+CONFLICT_OID="$(printf '%s\n' "$LAST_OUT" | awk '/^conflict / && !s {print $2; s=1}')"
 if [ -z "$CONFLICT_OID" ] || [ "${#CONFLICT_OID}" -ne 64 ]; then
 	fail gate/overlap-merge-conflict "no machine-readable 'conflict <oid>' line: $LAST_OUT"
 	exit 1
@@ -487,8 +487,8 @@ for want in "^conflict $CONFLICT_OID" "^ours [0-9a-f]+$" "^theirs [0-9a-f]+$" "^
 		exit 1
 	fi
 done
-CONFLICT_OURS="$(printf '%s\n' "$CONFLICT_SHOW" | awk '/^ours /{print $2; exit}')"
-CONFLICT_THEIRS="$(printf '%s\n' "$CONFLICT_SHOW" | awk '/^theirs /{print $2; exit}')"
+CONFLICT_OURS="$(printf '%s\n' "$CONFLICT_SHOW" | awk '/^ours / && !s {print $2; s=1}')"
+CONFLICT_THEIRS="$(printf '%s\n' "$CONFLICT_SHOW" | awk '/^theirs / && !s {print $2; s=1}')"
 if [ "${#CONFLICT_OURS}" -ne 64 ] || [ "${#CONFLICT_THEIRS}" -ne 64 ]; then
 	fail gate/conflict-object \
 		"conflict sides are not full object ids: ours=$CONFLICT_OURS theirs=$CONFLICT_THEIRS"
@@ -592,7 +592,7 @@ phase gate/stale-observation "checkin exit 4, $STALE_DEST pinned at '${DEST_BEFO
 # ---------------------------------------------------------------------------
 must gate/seal --dir "$DEMO" --cap "$INT" seal main --tag "$TAG" --attest
 SEAL_OUT="$LAST_OUT"
-SNAP_OID="$(printf '%s\n' "$SEAL_OUT" | awk -v t="tags/$TAG" '$1 == "sealed" && $2 == t {print $3; exit}')"
+SNAP_OID="$(printf '%s\n' "$SEAL_OUT" | awk -v t="tags/$TAG" '$1 == "sealed" && $2 == t && !s {print $3; s=1}')"
 if [ -z "$SNAP_OID" ] || [ "${#SNAP_OID}" -ne 64 ]; then
 	fail gate/seal "no 'sealed tags/$TAG <oid>' line: $SEAL_OUT"
 	exit 1
@@ -604,7 +604,7 @@ case "$SEAL_OUT" in *"attested ok"*) ;; *)
 esac
 must gate/verify --dir "$DEMO" --cap "$ROOT" verify "$TAG"
 VERIFY_OUT="$LAST_OUT"
-VERIFY_OID="$(printf '%s\n' "$VERIFY_OUT" | awk '$1 == "ok" {print $2; exit}')"
+VERIFY_OID="$(printf '%s\n' "$VERIFY_OUT" | awk '$1 == "ok" && !s {print $2; s=1}')"
 if [ "$VERIFY_OID" != "$SNAP_OID" ]; then
 	fail gate/verify "verify names $VERIFY_OID but seal published $SNAP_OID"
 	exit 1
