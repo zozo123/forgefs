@@ -2,8 +2,8 @@
 
 Status: **design only, not recommended yet.** This document records the measured
 object-size ceiling, the format cost of removing it, and the trigger conditions
-that would justify paying that cost. One format-neutral part of the ceiling was
-removed while measuring it; that change is described in "What already changed".
+that would justify paying that cost. Two format-neutral parts of the ceiling
+have now been removed: copy-free publication and a byte-bound raw-object cache.
 
 `FORMAT.md` freezes the VERSION 1 encoding, and `v0.1.0` is now a real release
 tag, so FORMAT.md's pre-release exception has closed. Chunking needs a new
@@ -55,7 +55,9 @@ SQLite catalog are competing for the same pages.
 (`crates/forge-api/src/workspace.rs:180`). That threshold was not previously
 backed by a measurement. It is roughly 40% of the measured 512-MiB-budget
 ceiling, which is a defensible place for a warning; this document is the
-missing evidence for it.
+missing evidence for it. The raw-object cache now uses the same 64 MiB value as
+its total encoded-byte budget, so a single object above the warning threshold
+is never duplicated into that cache.
 
 ### Allocator-level accounting
 
@@ -68,7 +70,8 @@ pollute the reading). At N = 8 MiB, peak extra live bytes as a multiple of N:
 |---|---|---|---|
 | `put_blob_data`, first publication | 2.00x | **0.00x** | `data.to_vec()` into a temporary `Blob`, then the `encode()` buffer |
 | `put_blob_data`, identical bytes again | 1.00x | 1.00x | `verify_existing` re-reads the whole durable object to re-prove its hash (I3) |
-| `get_blob_data`, cold store | 3.00x | 3.00x | durable read buffer + the clone the object cache keeps + the decoded copy returned |
+| `get_blob_data`, one cold 8 MiB object | 3.00x | 3.00x | durable read buffer + the cached clone + the decoded copy returned |
+| walk ten distinct 8 MiB objects, retained raw cache | >80 MiB | **<64 MiB** | 64 MiB encoded-byte budget plus the pre-existing 256-entry cap |
 
 (The process-level multipliers in the first table are one higher than these,
 because they include the caller's own copy of the payload.)
@@ -81,8 +84,8 @@ largest blob in the tree even though it never needs blob *contents*. Traced:
 ```
 forge_api::Forge::checkin
   -> forge_store::Store::collect_intros
-    -> forge_store::Store::intro_walk          (crates/forge-store/src/lib.rs:429)
-      -> Store::get_raw                         full payload, and inserted into the object cache
+    -> forge_store::Store::intro_walk          (crates/forge-store/src/lib.rs)
+      -> Store::get_raw                         full payload
       -> Blob::decode(&bytes)                   a second full payload, discarded
 ```
 
@@ -90,13 +93,15 @@ The `Blob::decode` is a deliberate typed-graph check and must not simply be
 deleted; it wants a streaming validator (parse the frame, check `size` against
 the file length, rehash in a fixed buffer) rather than a buffering one.
 
-**The object cache is bounded by entry count, not by bytes.**
-`Store::blob_cache` is `LruCache<ObjectId, Arc<[u8]>>` with capacity 256
-(`crates/forge-store/src/lib.rs:254`). One entry can be a 164 MiB object. A
-`checkin` or `fsck` that walks 256 large blobs pins 256 payloads in memory. This
-is a memory hazard independent of object size policy, and chunking would *hide*
-it rather than fix it (256 chunk-sized entries is a small number). It should be
-given a byte budget on its own merits.
+**The object-cache memory hazard is resolved without chunking.** The raw object
+cache still has the original 256-entry LRU cap, but it now also tracks the
+encoded bytes held by those entries and evicts LRU entries above 64 MiB. An
+individual object larger than that budget bypasses the cache. The bound is on
+object bytes rather than allocator overhead; entry metadata remains separately
+bounded by 256. `large_blob_memory.rs` fills the cache past the byte ceiling,
+checks retained live memory, checks transient peak memory, and then proves the
+oldest object was really evicted by observing a cache miss. Chunking is no
+longer needed to prevent 256 large payloads being pinned in one `Store`.
 
 ## 2. What already changed
 
@@ -115,8 +120,15 @@ Nothing about the encoding, the ObjectId, the durability barriers or the CLI
 ABI moved. Measured effect on `forge write` at N = 256 MiB:
 815,955,968 B -> 279,150,592 B peak RSS, i.e. **3.00x -> 1.00x**.
 
-This does not close issue #11. It moves the *publish* half of the ceiling from
-RAM/3 to RAM/1 and leaves the read half at RAM/3.
+The raw-object cache is also byte-bound now: `OBJECT_CACHE_MAX_BYTES` is 64 MiB,
+in addition to the existing 256-entry cap. This changes only memory residency;
+cache misses still reread and re-hash through the same object-store path, and
+I15 trust-boundary reads still bypass the cache entirely.
+
+These changes do not make chunking necessary or change VERSION 1. Copy-free
+publication moves the publish half of the ceiling from RAM/3 to RAM/1; the cache
+bound removes unbounded accumulation across a walk. The remaining single-object
+read and verification copies are the format-neutral work below.
 
 ## 3. If chunking were built
 
@@ -279,7 +291,8 @@ instead, in this order:
    so it can take this safely; `forge read` writing to a pipe cannot, and should
    keep buffering or grow an explicit `--unverified-stream` opt-out. Do not
    quietly weaken I15 to win a benchmark.
-4. Give `Store::blob_cache` a byte budget. Independent of everything above.
+4. *(done)* Byte-bound `Store::blob_cache`: 64 MiB of encoded object bytes plus
+   the existing 256-entry cap; larger single objects bypass the cache.
 5. Stop `intro_walk` pulling whole blob payloads through the object cache.
 
 Together those take the ceiling from roughly RAM/3 to roughly RAM, i.e. a 3x,
@@ -313,5 +326,6 @@ Revisit chunking when any of these is true, and not before:
 |---|---|
 | publish allocates no copy of the payload; identity unchanged | `crates/forge-store/tests/large_blob_memory.rs` |
 | republish costs one payload (verifying re-read) | same |
-| cold read costs three payloads | same |
+| one cold 8 MiB read costs three payloads | same |
+| raw-object cache retains <64 MiB after walking ten distinct 8 MiB blobs | same |
 | process-level RSS multipliers and the 512 MiB bisection | this document, section 1 |
