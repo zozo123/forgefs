@@ -182,6 +182,113 @@ pub fn shared_stampede_bounded(
 /// informational, but outcome counts are correctness. CI already runs this
 /// path, so reject any silent noop/lost writer instead of merely printing a bad
 /// split that a human might miss in logs.
+/// Paths the read-heavy phase seeds and then re-reads.
+const READ_FANOUT_PATHS: usize = 8;
+
+/// N logical readers, each with its own session, re-reading a fixed set of
+/// paths through a bounded worker pool.
+///
+/// This phase exists so the bench has a workload whose catalog traffic lands on
+/// the READ pool rather than the write mutex (#324). Without one, every
+/// workload here is a checkin, `write_lock_wait_us` is essentially all of
+/// `lock_wait_us`, and the split the renderer now prints has nothing to
+/// distinguish -- so "writer contention is now visible" would be a claim with
+/// no counter-example behind it.
+///
+/// Re-reading is the point, not a shortcut. `Meta::observe` looks the path up
+/// on a read connection first and writes only when the row would change, so the
+/// first read of each path costs one write-mutex acquisition and every
+/// subsequent read of it costs read-pool acquisitions alone. `reads` well above
+/// `READ_FANOUT_PATHS` is therefore what makes the phase read-dominated; equal
+/// to it, this would be another write workload wearing a different name.
+pub fn read_fanout_bounded(
+    forge: Arc<Forge>,
+    root: &Cap,
+    readers: usize,
+    reads: usize,
+    workers: usize,
+) -> Result<(Percentiles, Duration, usize)> {
+    if readers == 0 || reads == 0 {
+        return Ok((Percentiles::from_us(Vec::new()), Duration::ZERO, 0));
+    }
+    // Seed a ref of its own so the phase does not depend on what the write
+    // workloads happened to leave behind, and so `main` stays untouched.
+    forge.branch(root, "main", "readbench")?;
+    let seed_ns = forge.session_open(root, "readbench")?;
+    forge.mount(root, &seed_ns, "/", "ref:readbench", true)?;
+    for k in 0..READ_FANOUT_PATHS {
+        forge.write(
+            root,
+            &seed_ns,
+            &format!("/rf{k}.txt"),
+            format!("payload {k}").as_bytes(),
+            false,
+        )?;
+    }
+    match forge.checkin(root, &seed_ns, "/", "read-fanout seed")? {
+        CasResult::Updated { .. } => {}
+        other => {
+            return Err(Error::Internal(format!(
+                "read-fanout seed did not publish: {other:?}"
+            )))
+        }
+    }
+
+    let workers = workers.max(1).min(readers);
+    let next = Arc::new(AtomicUsize::new(0));
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let forge = forge.clone();
+        let root = root.clone();
+        let next = next.clone();
+        handles.push(thread::spawn(move || -> Result<Vec<u128>> {
+            let mut out = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= readers {
+                    break;
+                }
+                let agent = forge.grant(
+                    &root,
+                    vec![
+                        "ops=read,branch".into(),
+                        format!("agent=reader{i}"),
+                        "ref=heads/agents/*,readbench".into(),
+                    ],
+                )?;
+                let ns = forge.session_open(&agent, "readbench")?;
+                for r in 0..reads {
+                    let path = format!("/rf{}.txt", r % READ_FANOUT_PATHS);
+                    let t0 = Instant::now();
+                    let bytes = forge.read(&agent, &ns, &path)?;
+                    out.push(us(t0.elapsed()));
+                    if bytes.is_empty() {
+                        return Err(Error::Internal(format!("read {path} returned nothing")));
+                    }
+                }
+            }
+            Ok(out)
+        }));
+    }
+
+    let mut samples = Vec::with_capacity(readers * reads);
+    for handle in handles {
+        samples.extend(
+            handle
+                .join()
+                .map_err(|_| Error::Internal("read-fanout worker panic".into()))??,
+        );
+    }
+    if samples.len() != readers * reads {
+        return Err(Error::Internal(format!(
+            "read fanout produced {} samples for {readers} readers x {reads} reads",
+            samples.len()
+        )));
+    }
+    Ok((Percentiles::from_us(samples), start.elapsed(), readers))
+}
+
 fn validate_bounded_outcomes(
     agents: usize,
     private_updated: usize,
@@ -210,6 +317,8 @@ pub fn run_bench_with_workers(
     dir: &std::path::Path,
     agents: usize,
     shared: usize,
+    readers: usize,
+    reads: usize,
     workers: usize,
 ) -> Result<BenchReport> {
     let forge = Arc::new(Forge::init(dir)?);
@@ -219,6 +328,7 @@ pub fn run_bench_with_workers(
     let private = private_checkins_bounded(forge.clone(), &root, agents, workers)?;
     let shared_result = shared_stampede_bounded(forge.clone(), &root, shared, workers)?;
     validate_bounded_outcomes(agents, private.2, shared, shared_result.2, shared_result.3)?;
+    let read_fanout = read_fanout_bounded(forge.clone(), &root, readers, reads, workers)?;
     let merge_seal = merge_all_and_seal(&forge, &root, &integ, "bench")?;
     let t0 = Instant::now();
     forge.verify_tag(&root, "bench")?;
@@ -235,6 +345,7 @@ pub fn run_bench_with_workers(
         serial: Some(serial),
         private: Some(private),
         shared: Some(shared_result),
+        read_fanout: (readers > 0 && reads > 0).then_some(read_fanout),
         merge_seal: Some(merge_seal),
         verify: Some(verify),
         durability: Some(forge.store.meta.durability_policy().clone()),

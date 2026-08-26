@@ -12,9 +12,10 @@ Performance claims must name a workload ID, hardware, durability policy, harness
 | W4 | Same-path overlap | two agents | merge returns `MergeConflict`; conflict object preserves both immutable inputs | CLI/API merge-conflict e2e tests |
 | W5 | Crash and reopen | one declared publish/checkpoint phase | after reopen, every committed ref resolves and `fsck --full` succeeds; otherwise the harness must exit non-zero with corruption | bootstrap/durability crash tests; real SIGKILL remains #147 |
 | W6 | Large tree walk/update | entries: 10k, 100k, 1M | output tree is byte-for-byte identical; report lookup/update scaling | dedicated tree benchmark; do not infer W6 from W1/W2 |
+| W8 | Read fanout: N readers re-reading a fixed path set through their own sessions | readers x reads | every read returns the seeded payload; catalog traffic lands mostly on the read pool | `forge bench --readers` / `read_fanout_bounded` |
 | W7 | Git worktree comparison | W1 only | identical logical edit/checkin count and demonstrated durability-equivalence; otherwise mark `non-comparable` | `scripts/w7-git-comparator.sh` (#24) |
 
-`forge bench` covers W1 and W2. W3-W5 are correctness/crash harnesses, not throughput substitutes. W6 is a scaling study. W7 is the external comparator; run it with
+`forge bench` covers W1, W2 and (with `--readers`) W8. W3-W5 are correctness/crash harnesses, not throughput substitutes. W6 is a scaling study. W7 is the external comparator; run it with
 `scripts/w7-git-comparator.sh` and read its verdict before quoting any
 ForgeFS/Git number.
 
@@ -31,8 +32,16 @@ Canonical command shape:
 
 ```bash
 cargo run --release --locked -p forge-cli -- bench \
-  --agents <N> --shared <M> --workers <W>
+  --agents <N> --shared <M> --readers <R> --reads <K> --workers <W>
 ```
+
+`--readers` defaults to 0, so a bench invocation written before W8 existed runs
+exactly the workloads it always ran. W8 seeds its own `readbench` ref with eight
+paths and never touches `main`. `--reads` must be well above those eight paths
+or the phase is another write workload wearing a different name: `Meta::observe`
+looks a path up on a read connection and writes only when the row would change,
+so the FIRST read of a path costs a write-mutex acquisition and every re-read of
+it costs read-pool acquisitions alone.
 
 By default the CLI creates and owns a fresh temporary workspace and removes it
 after a successful run. To retain a run for inspection or crash testing, pass
@@ -325,9 +334,32 @@ The individual counter semantics are deliberately mechanical:
   SQLite connection mutex, including reads and autocommit writes. That is the
   write connection plus the read-only connections that serve SELECT-only
   catalog queries, so the pair is a sum across connections and not a measure of
-  writer contention on its own. `forge stats --json` splits the sum into
+  writer contention on its own.
+- `write_acquires` / `write_wait_us` and `read_acquires` / `read_wait_us`
+  on the `sqlite locks` line decompose that sum: the write connection's mutex,
+  which every catalog write and every read that fell back to the writer queues
+  on, against the read pool's slot mutexes. `write_share_of_wait` is
+  `write_wait_us / lock_wait_us`, and it is `n/a` rather than a number when
+  nothing waited at all. **Writer contention is read here and nowhere else.**
+  Until issue #324 the renderer printed only the sum, so a writer convoy and a
+  busy read pool produced the same line; a barriered-storage sweep across four
+  storage classes had to report writer contention as `unavailable` for exactly
+  that reason, and `lock_wait_us` alone had by then produced three wrong
+  conclusions on #37. `forge stats --json` exposes the same split under
   `write_lock_acquires` / `write_lock_wait_us` and `read_lock_acquires` /
-  `read_lock_wait_us`; the write half is the writer-contention signal.
+  `read_lock_wait_us`.
+
+  The two halves separate workloads the sum cannot. One pair of runs on the same
+  machine, `--workers 16`:
+
+  | Run | `lock_wait_us` (the sum) | `write_wait_us` | `read_wait_us` | `write_share_of_wait` |
+  |---|---:|---:|---:|---:|
+  | `--agents 192 --shared 96` (W1+W2) | 1704942 | 1653635 | 51307 | 97.0% |
+  | `--readers 10 --reads 1000` (W8) | 1701393 | 339144 | 1362249 | 19.9% |
+
+  The summed column is the same number to any reader. The split says one run is
+  a writer convoy and the other is not. Amounts are environment-dependent and
+  are quoted here to show the SHAPE of the difference, not as a result.
 - `txn_count` counts every write transaction SQLite committed on the catalog:
   each explicit `BEGIN IMMEDIATE` that committed, and each autocommit statement
   that wrote, since SQLite wraps every such statement in an implicit

@@ -65,6 +65,11 @@ pub struct BenchReport {
     pub serial: Option<Percentiles>,
     pub private: Option<(Percentiles, Duration, usize)>,
     pub shared: Option<(Percentiles, Duration, usize, usize)>,
+    /// Per-READ latencies, wall time, and how many logical readers produced
+    /// them. The one phase in this harness whose catalog traffic lands mostly
+    /// on the read pool rather than the write mutex, so the two halves of the
+    /// lock split have something to disagree about (#324).
+    pub read_fanout: Option<(Percentiles, Duration, usize)>,
     pub merge_seal: Option<Duration>,
     pub verify: Option<Duration>,
     pub durability: Option<DurabilityPolicy>,
@@ -84,6 +89,7 @@ impl BenchReport {
              private = N threads, private refs (throughput; p50 includes convoy wait).\n\
              shared  = N threads, one ref; I8 pin ⇒ 1 Updated + N-1 Forked.\n\
              counter scope = cumulative whole-run process lifetime, never per-checkin.\n\
+             lock split = write connection mutex vs read-pool slot mutexes; lock_acquires/lock_wait_us are their SUM and attribute nothing.\n\
              counter start = storage at blob-store construction; sqlite/api post-open.\n\
              counter end   = after init + all workloads + merge/seal + verify (+ worker fsck).\n\
              per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals.\n",
@@ -117,6 +123,18 @@ impl BenchReport {
                 p.p50_us as f64 / 1000.0,
                 p.p95_us as f64 / 1000.0,
                 p.p99_us as f64 / 1000.0,
+            ));
+        }
+        if let Some((p, wall, readers)) = &self.read_fanout {
+            s.push_str(&format!(
+                "read fanout      readers={readers}  n={}  wall={:.3}s  {:>7.1} Hz\n  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms  max={:.2}ms\n",
+                p.n,
+                wall.as_secs_f64(),
+                p.throughput_hz(*wall),
+                p.p50_us as f64 / 1000.0,
+                p.p95_us as f64 / 1000.0,
+                p.p99_us as f64 / 1000.0,
+                p.max_us as f64 / 1000.0,
             ));
         }
         if let Some(d) = self.merge_seal {
@@ -164,6 +182,21 @@ impl BenchReport {
                 stats.cas_forked,
                 stats.cas_denied,
             ));
+            // #324: `lock_acquires` / `lock_wait_us` above have summed the
+            // write connection's mutex and the read pool since #315, so a
+            // writer convoy and a busy read pool render identically. Every
+            // performance conclusion in this project has come from these
+            // counters, and `lock_wait_us` alone has already produced three
+            // wrong ones on #37. The split is printed beside the sum, not
+            // instead of it, so the arithmetic stays checkable by eye.
+            s.push_str(&format!(
+                "sqlite locks     write_acquires={} write_wait_us={}  read_acquires={} read_wait_us={}  write_share_of_wait={}\n",
+                stats.write_lock_acquires,
+                stats.write_lock_wait_us,
+                stats.read_lock_acquires,
+                stats.read_lock_wait_us,
+                share(stats.write_lock_wait_us, stats.lock_wait_us),
+            ));
         }
         if let (Some(store), Some(meta)) = (self.store, self.meta) {
             let cumulative_phase_us = store
@@ -191,6 +224,18 @@ impl BenchReport {
 
 fn us(d: Duration) -> u128 {
     d.as_micros()
+}
+
+/// `part` as a percentage of `whole`, or the literal `n/a` when nothing waited.
+///
+/// A zero denominator is not 0% and not 100%: no lock wait was recorded at all,
+/// so the split has nothing to attribute and must say so rather than print a
+/// number a reader would take for a measurement.
+fn share(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "n/a".into();
+    }
+    format!("{:.1}%", part as f64 * 100.0 / whole as f64)
 }
 
 fn one_private(forge: &Forge, root: &Cap, i: usize) -> Result<CasResult> {
@@ -369,6 +414,10 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         serial: Some(serial),
         private: Some(private),
         shared: Some(shared_r),
+        // The in-process API entry point stays write-only: the read-heavy
+        // phase is driven by `run_bench_with_workers`, which is what `forge
+        // bench` calls and what carries the `--readers` knob (#324).
+        read_fanout: None,
         merge_seal: Some(merge_seal),
         verify: Some(verify),
         durability: Some(forge.store.meta.durability_policy().clone()),
@@ -388,6 +437,7 @@ mod tests {
             serial: None,
             private: None,
             shared: None,
+            read_fanout: None,
             merge_seal: None,
             verify: None,
             durability: None,
@@ -446,10 +496,128 @@ mod tests {
         assert!(rendered.contains(
             "per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals"
         ));
+        // #324: the split is rendered beside the sum, and the sum is still
+        // there -- a reader must be able to check 20+3=23 and 15+4=19 by eye.
+        assert!(rendered.contains(
+            "sqlite locks     write_acquires=20 write_wait_us=15  read_acquires=3 read_wait_us=4  write_share_of_wait=78.9%"
+        ));
+        assert!(rendered.contains(
+            "lock split = write connection mutex vs read-pool slot mutexes; lock_acquires/lock_wait_us are their SUM and attribute nothing"
+        ));
         assert!(rendered.contains("api lifetime     stale=2 conflict=3"));
         assert!(!rendered.contains("observed mix"));
         assert!(!rendered.contains("observed_us"));
         assert!(!rendered.contains("stale=2 ("));
         assert!(!rendered.contains("conflict=3 ("));
+    }
+
+    fn only_meta(meta: MetaStats) -> BenchReport {
+        BenchReport {
+            serial: None,
+            private: None,
+            shared: None,
+            read_fanout: None,
+            merge_seal: None,
+            verify: None,
+            durability: None,
+            store: None,
+            meta: Some(meta),
+            api: None,
+        }
+    }
+
+    fn line<'a>(rendered: &'a str, prefix: &str) -> &'a str {
+        rendered
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{rendered}"))
+    }
+
+    /// #324. Two runs whose SUMMED lock counters are identical, one a writer
+    /// convoy and one a busy read pool. The renderer printed only the sum, so
+    /// they produced byte-identical output and no reader could tell a queue on
+    /// the write connection from a queue on the read pool -- which is the
+    /// counter every performance conclusion in this project has come from, and
+    /// which `lock_wait_us` alone has already produced three wrong ones with.
+    #[test]
+    fn the_lock_split_distinguishes_a_writer_convoy_from_a_busy_read_pool() {
+        let convoy = MetaStats {
+            lock_acquires: 1000,
+            lock_wait_us: 1000,
+            write_lock_acquires: 90,
+            write_lock_wait_us: 970,
+            read_lock_acquires: 910,
+            read_lock_wait_us: 30,
+            ..MetaStats::default()
+        };
+        let pool = MetaStats {
+            write_lock_wait_us: 30,
+            read_lock_wait_us: 970,
+            ..convoy
+        };
+        // The premise: everything the old renderer printed is identical.
+        assert_eq!(convoy.lock_acquires, pool.lock_acquires);
+        assert_eq!(convoy.lock_wait_us, pool.lock_wait_us);
+        assert_eq!(convoy.sqlite_accounted_us(), pool.sqlite_accounted_us());
+
+        let a = only_meta(convoy).render();
+        let b = only_meta(pool).render();
+        assert_eq!(
+            line(&a, "sqlite lifetime"),
+            line(&b, "sqlite lifetime"),
+            "the summed line is the one that cannot tell these apart"
+        );
+        assert_ne!(
+            line(&a, "sqlite locks"),
+            line(&b, "sqlite locks"),
+            "the split must tell them apart"
+        );
+        assert!(
+            line(&a, "sqlite locks").contains("write_share_of_wait=97.0%"),
+            "{}",
+            line(&a, "sqlite locks")
+        );
+        assert!(
+            line(&b, "sqlite locks").contains("write_share_of_wait=3.0%"),
+            "{}",
+            line(&b, "sqlite locks")
+        );
+    }
+
+    /// A run that never waited has no split to report. Printing `0.0%` would
+    /// read as "no writer contention was measured", which is a claim; `n/a` is
+    /// the absence of one.
+    #[test]
+    fn a_run_that_never_waited_reports_no_share_rather_than_zero_percent() {
+        let rendered = only_meta(MetaStats {
+            lock_acquires: 4,
+            ..MetaStats::default()
+        })
+        .render();
+        assert!(
+            line(&rendered, "sqlite locks").ends_with("write_share_of_wait=n/a"),
+            "{}",
+            line(&rendered, "sqlite locks")
+        );
+    }
+
+    /// The read-heavy phase is rendered, and its label says how many logical
+    /// readers produced the samples -- `n` alone is readers x reads and cannot
+    /// be read as a concurrency point.
+    #[test]
+    fn the_read_phase_names_its_reader_count() {
+        let rendered = BenchReport {
+            read_fanout: Some((
+                Percentiles::from_us(vec![10, 20, 30, 40]),
+                Duration::from_millis(500),
+                7,
+            )),
+            ..only_meta(MetaStats::default())
+        }
+        .render();
+        assert!(
+            rendered.contains("read fanout      readers=7  n=4  wall=0.500s"),
+            "{rendered}"
+        );
     }
 }
