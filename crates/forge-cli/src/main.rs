@@ -138,6 +138,11 @@ enum Cmd {
     Landmark {
         oid: String,
     },
+    /// Contribution receipts: what a checkin contributed, verified (I25).
+    Receipt {
+        #[command(subcommand)]
+        cmd: ReceiptCmd,
+    },
     /// Explicitly retire a fork ref or a session so it stops being a GC root.
     ///
     /// This is the resolution half of I18: a refused checkin forks and keeps
@@ -257,6 +262,21 @@ enum AbandonCmd {
         /// Without it a session with staged work is refused, not emptied.
         #[arg(long)]
         discard_staged: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptCmd {
+    /// Show the receipt a commit, ref, sealed tag or receipt oid names.
+    ///
+    /// Every object the receipt names is reread from durable bytes, rehashed,
+    /// and checked against the type the receipt claims for it; a receipt whose
+    /// base, tree, parent or observation is absent, corrupt or wrongly typed
+    /// is refused (exit 2) rather than rendered. `forge show` prints the same
+    /// fields WITHOUT checking any of them, which is the difference.
+    Show {
+        /// A ref, `oid:<hex>`, a sealed tag, or the receipt object itself.
+        spec: String,
     },
 }
 
@@ -600,6 +620,11 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             } else {
                 print!("{}", report.render());
             }
+        }
+        Cmd::Receipt {
+            cmd: ReceiptCmd::Show { spec },
+        } => {
+            println!("{}", f.receipt(cap, &spec)?.render());
         }
         Cmd::Landmark { oid } => {
             f.landmark(cap, ObjectId::from_hex(&oid)?)?;

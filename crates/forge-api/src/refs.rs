@@ -2,10 +2,83 @@
 
 use crate::Forge;
 use forge_cap::{Cap, Op};
-use forge_core::{now_ms, Commit};
+use forge_core::object::decode_object_type;
+use forge_core::{now_ms, Commit, Contribution};
 use forge_ns::{parse_spec, Spec};
 use forge_store::sanitize_agent;
 use forge_types::{CasResult, Error, ObjectId, ObjectType, RefRow, Result};
+
+/// A verified ContributionReceipt: what one checkin contributed, and the
+/// evidence that everything it names is really there (#71, I25).
+///
+/// Constructed only by [`Forge::receipt`], which refuses rather than returning
+/// a receipt whose edges do not check out, so holding one of these IS the
+/// proof. Deterministic fields only; `ts` is advisory metadata and never
+/// causal order (I12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    /// The Contribution (`0x06`) object itself.
+    pub receipt: ObjectId,
+    /// The commit that names this receipt, when the receipt was reached
+    /// through one. `None` when the caller named the receipt object directly,
+    /// because a receipt does not record who published it.
+    pub result: Option<ObjectId>,
+    pub agent: String,
+    pub base: ObjectId,
+    pub tree: ObjectId,
+    pub parents: Vec<ObjectId>,
+    /// The observed frontier: `(path, blob oid)` for every blob the work read.
+    /// A directory read and a recorded absence are NOT here -- VERSION 1
+    /// `reads` cannot express either -- so this is a subset of what I9
+    /// recorded, never the whole observation set.
+    pub reads: Vec<(String, ObjectId)>,
+    /// Paths the contribution wrote, as a flat list. A frozen VERSION 1
+    /// `Contribution` has no add/delete/move tag, so a deletion and a creation
+    /// are reported identically here (see `rename_characterisation.rs`).
+    pub writes: Vec<String>,
+    /// Advisory wall clock. Never an ordering (I12).
+    pub ts: u64,
+}
+
+impl Receipt {
+    /// One line per fact, stable enough for a script to key on.
+    pub fn render(&self) -> String {
+        let mut out = format!("receipt {}\n", self.receipt);
+        if let Some(result) = self.result {
+            out.push_str(&format!("result {result}\n"));
+        }
+        out.push_str(&format!("agent {}\n", self.agent));
+        out.push_str(&format!("base {}\n", self.base));
+        out.push_str(&format!("tree {}\n", self.tree));
+        out.push_str(&format!(
+            "parents {}\n",
+            if self.parents.is_empty() {
+                "-".to_string()
+            } else {
+                self.parents
+                    .iter()
+                    .map(ObjectId::hex)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ));
+        for (path, id) in &self.reads {
+            out.push_str(&format!("read {id} {path}\n"));
+        }
+        for path in &self.writes {
+            out.push_str(&format!("write {path}\n"));
+        }
+        out.push_str(&format!("verified {} edges\n", self.verified_edges()));
+        out.trim_end().to_string()
+    }
+
+    /// How many objects `Forge::receipt` reread and type-checked to produce
+    /// this. Reported so "verified" is a count and not an adjective.
+    pub fn verified_edges(&self) -> usize {
+        // the receipt itself, base, tree, every parent, every read
+        3 + self.parents.len() + self.reads.len()
+    }
+}
 
 impl Forge {
     pub fn refs(&self, cap: &Cap) -> Result<Vec<RefRow>> {
@@ -74,6 +147,157 @@ impl Forge {
             }
         }
         Ok(out)
+    }
+
+    /// One verified ContributionReceipt (#71, I25).
+    ///
+    /// `spec` may name the receipt object itself, or a commit -- or a ref or
+    /// sealed tag peeling to one -- in which case the commit's `contrib` edge
+    /// is followed and the commit is required to AGREE with what it points at.
+    ///
+    /// Every object the receipt names is reread from durable bytes and
+    /// rehashed before it is reported, so a receipt that claims a result
+    /// commit, a base, a tree or an observation that is absent, corrupt, or of
+    /// the wrong type is refused -- exit 2 -- rather than rendered. That is the
+    /// difference between this and `show`, which renders a Contribution's
+    /// fields without checking that any of them are there.
+    pub fn receipt(&self, cap: &Cap, spec: &str) -> Result<Receipt> {
+        self.check_spec_read(cap, spec)?;
+        let named = self.resolve_spec_oid(spec)?;
+        // The object the CALLER named. Absence here is a not-found input error
+        // (exit 1): the caller asked about something that is not in this
+        // repository. Absence of an object a RECEIPT names is corruption (exit
+        // 2): the graph claims an edge it cannot produce. Collapsing the two
+        // would report a typo as a damaged repository.
+        let named_type = decode_object_type(&self.store.get_raw_verified(named)?)?;
+        let (result, receipt_oid) = match named_type {
+            ObjectType::Contribution => (None, named),
+            ObjectType::Commit | ObjectType::Snapshot => {
+                let (commit_oid, commit) = self.peel_commit(spec)?;
+                let contrib = commit.contrib.ok_or_else(|| {
+                    Error::NotFound(format!(
+                        "{spec} names commit {commit_oid}, which carries no contribution \
+                         receipt; a merge commit and a canonical historical commit both have \
+                         none, and I10 makes that absence legitimate rather than corrupt"
+                    ))
+                })?;
+                (Some((commit_oid, commit)), contrib)
+            }
+            other => {
+                return Err(Error::Invalid(format!(
+                    "{spec} is {}, which is neither a receipt nor a commit that names one",
+                    other.as_str()
+                )))
+            }
+        };
+        self.verified_receipt(result, receipt_oid)
+    }
+
+    /// I25: check every edge before reporting any of them.
+    fn verified_receipt(
+        &self,
+        result: Option<(ObjectId, Commit)>,
+        receipt_oid: ObjectId,
+    ) -> Result<Receipt> {
+        let bytes = self.durable_bytes(receipt_oid, "receipt", "receipt")?;
+        let contribution = Contribution::decode(&bytes).map_err(|error| {
+            Error::Corrupt(format!("receipt {receipt_oid} does not decode: {error}"))
+        })?;
+
+        self.require_durable_type(contribution.base, ObjectType::Commit, "base", receipt_oid)?;
+        self.require_durable_type(contribution.tree, ObjectType::Tree, "tree", receipt_oid)?;
+        for parent in &contribution.parents {
+            self.require_durable_type(*parent, ObjectType::Commit, "parent", receipt_oid)?;
+        }
+        for read in &contribution.reads {
+            // Only blob observations reach a receipt: a directory or an
+            // absence is not representable in VERSION 1 `reads`, so anything
+            // here that is not a blob is a corrupt receipt and not a shape
+            // this version can legitimately produce.
+            self.require_durable_type(read.id, ObjectType::Blob, "read", receipt_oid)?;
+        }
+
+        // A receipt reached through a commit is a claim ABOUT that commit. The
+        // three fields the publishing checkin copies into both objects must
+        // still agree, or the receipt describes work some other commit
+        // published.
+        if let Some((commit_oid, commit)) = &result {
+            let disagreement = if commit.tree != contribution.tree {
+                Some(format!(
+                    "tree {} != receipt tree {}",
+                    commit.tree, contribution.tree
+                ))
+            } else if commit.parents != contribution.parents {
+                Some("parents differ".to_string())
+            } else if commit.agent != contribution.agent {
+                Some(format!(
+                    "agent {:?} != receipt agent {:?}",
+                    commit.agent, contribution.agent
+                ))
+            } else {
+                None
+            };
+            if let Some(detail) = disagreement {
+                return Err(Error::Corrupt(format!(
+                    "commit {commit_oid} disagrees with the receipt {receipt_oid} it names: \
+                     {detail}"
+                )));
+            }
+        }
+
+        Ok(Receipt {
+            receipt: receipt_oid,
+            result: result.map(|(oid, _)| oid),
+            agent: contribution.agent,
+            base: contribution.base,
+            tree: contribution.tree,
+            parents: contribution.parents,
+            reads: contribution
+                .reads
+                .into_iter()
+                .map(|read| (read.path, read.id))
+                .collect(),
+            writes: contribution.writes,
+            ts: contribution.ts,
+        })
+    }
+
+    /// Durable bytes for one edge of a receipt, with absence reported as the
+    /// corrupt graph it is rather than as a missing file (I15, I25).
+    fn durable_bytes(&self, oid: ObjectId, edge: &str, of: &str) -> Result<Vec<u8>> {
+        self.store
+            .get_raw_verified(oid)
+            .map_err(|error| match error {
+                Error::NotFound(_) => Error::Corrupt(format!(
+                    "{of} names {edge} {oid}, which is not present in durable storage"
+                )),
+                other => other,
+            })
+    }
+
+    /// The type of an object a RECEIPT names. Absence is corruption here; see
+    /// `receipt` for why the object the caller named is treated differently.
+    fn durable_edge_type(&self, oid: ObjectId, edge: &str, of: &str) -> Result<ObjectType> {
+        let bytes = self.durable_bytes(oid, edge, of)?;
+        decode_object_type(&bytes)
+    }
+
+    fn require_durable_type(
+        &self,
+        oid: ObjectId,
+        want: ObjectType,
+        edge: &str,
+        receipt: ObjectId,
+    ) -> Result<()> {
+        let found = self.durable_edge_type(oid, edge, &format!("receipt {receipt}"))?;
+        if found != want {
+            return Err(Error::Corrupt(format!(
+                "receipt {receipt} names {edge} {oid} as {}, but it is {}",
+                want.as_str(),
+                found.as_str()
+            )));
+        }
+        Ok(())
     }
 
     pub fn peel_commit(&self, spec: &str) -> Result<(ObjectId, Commit)> {

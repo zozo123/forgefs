@@ -154,6 +154,51 @@ that is no longer there, which is the same thing a stale observation says.
 The daemon serves this verb as `ns.mv` with fields `ns`, `from`, `to`,
 `expect_oid`, and answers `{"from","to","kind","source","entries"}`.
 
+## Contribution receipts: `forge receipt show`
+
+`forge receipt show <spec>` prints one verified receipt and exits 0. `<spec>`
+may name a ref, a sealed tag, `oid:<commit>`, or the receipt object itself.
+
+```
+receipt <oid>
+result <commit-oid>        # only when reached through a commit
+agent <id>
+base <commit-oid>
+tree <tree-oid>
+parents <oid>[,<oid>...]|-
+read <blob-oid> <path>     # zero or more, bytewise sorted by path
+write <path>               # zero or more, bytewise sorted
+verified <n> edges
+```
+
+| Outcome | Exit |
+|---|---:|
+| the receipt verified | 0 |
+| `<spec>` resolves to nothing, or the capability may not read it | 1 |
+| `<spec>` names a commit that carries no receipt (a merge, or canonical history: I10 makes `Commit.contrib` legitimately absent) | 1 |
+| `<spec>` is an object that is neither a receipt nor a commit naming one | 1 |
+| the receipt names an object that is absent, does not rehash, or is not the type the receipt claims | 2 |
+| the commit and the receipt it names disagree on tree, parents, or agent | 2 |
+
+The difference from `forge show` is the whole point. `show` renders a
+Contribution's fields without touching a single object they name, so a receipt
+whose tree had been collected or replaced printed exactly like a good one.
+`receipt show` rereads every named object from durable bytes -- never the hot
+caches, the same trust-boundary rule I15 puts on `verify` and `fsck` -- rehashes
+it, and checks it against the type the receipt claims: base and parents are
+commits, tree is a tree, every read is a blob. `verified <n> edges` is that
+count, reported so "verified" is a number rather than an adjective.
+
+Exit 2 and not exit 1 for a missing edge: a ref pointing at an object that is
+not there is a corrupt graph, which is the row `fsck` uses for the same finding.
+
+`read` lines are the observed frontier I9 recorded, restricted to BLOB
+observations: a VERSION 1 `Contribution.reads` cannot express a directory read
+or a recorded absence, so this is a subset of what the session observed and
+never the whole observation set. `write` lines are a flat path list with no
+add/delete/move tag, so a deleted path and a created one are reported
+identically.
+
 ## Read-only checking: `forge fsck` and `forge verify`
 
 Neither verb introduces an exit code. Both take a structurally read-only open,
