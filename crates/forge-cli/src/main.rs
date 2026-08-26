@@ -217,6 +217,19 @@ enum Cmd {
         agents: usize,
         #[arg(long, default_value_t = 16)]
         shared: usize,
+        /// Logical readers in the read-heavy phase. Zero omits the phase.
+        ///
+        /// The write workloads above put nearly all their catalog traffic on
+        /// the write connection's mutex, so this is the phase that puts traffic
+        /// on the read pool instead and gives the rendered lock split something
+        /// to distinguish (#324).
+        #[arg(long, default_value_t = 0)]
+        readers: usize,
+        /// Reads per reader. Well above the eight distinct paths the phase
+        /// seeds, because a re-read of a path already observed costs no
+        /// write-mutex time and a first read of one does.
+        #[arg(long, default_value_t = 64)]
+        reads: usize,
         /// Maximum OS workers driving logical agents.
         #[arg(long, default_value_t = 64)]
         workers: usize,
@@ -304,6 +317,8 @@ fn run(cli: Cli) -> forge_types::Result<()> {
             scratch,
             agents,
             shared,
+            readers,
+            reads,
             workers,
         } => {
             if cli.dir.is_some() {
@@ -333,10 +348,11 @@ fn run(cli: Cli) -> forge_types::Result<()> {
                 }
             };
             eprintln!(
-                "forge bench dir={} agents={agents} shared={shared} workers={workers}",
+                "forge bench dir={} agents={agents} shared={shared} readers={readers} reads={reads} workers={workers}",
                 dir.display()
             );
-            let report = forge_api::run_bench_with_workers(&dir, agents, shared, workers)?;
+            let report =
+                forge_api::run_bench_with_workers(&dir, agents, shared, readers, reads, workers)?;
             print!("{}", report.render());
             Ok(())
         }
