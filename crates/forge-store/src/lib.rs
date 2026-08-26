@@ -27,6 +27,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Stable names for durability transitions exercised by the debug-only fault
@@ -213,6 +214,30 @@ pub struct Store<O: ObjectStore = LocalBlobStore> {
     root: PathBuf,
     trees: Mutex<LruCache<ObjectId, Arc<Tree>>>,
     blob_cache: Mutex<LruCache<ObjectId, Arc<[u8]>>>,
+    cache: CacheCounters,
+}
+
+/// Hit and miss counts for the two hot LRU caches a `Store` keeps.
+///
+/// Evidence, never policy: nothing here decides whether a read is served from
+/// memory. They exist because `BlobStoreStats::get_bytes` is PHYSICAL read
+/// volume, so without them a fall in physical reads is indistinguishable from
+/// a fall in work. A miss is counted where the lookup failed, so
+/// `hits + misses` is the number of lookups and never the number of objects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreCacheStats {
+    pub object_cache_hits: u64,
+    pub object_cache_misses: u64,
+    pub tree_cache_hits: u64,
+    pub tree_cache_misses: u64,
+}
+
+#[derive(Debug, Default)]
+struct CacheCounters {
+    object_hits: AtomicU64,
+    object_misses: AtomicU64,
+    tree_hits: AtomicU64,
+    tree_misses: AtomicU64,
 }
 
 pub struct StorePublishBatch<'a, O: ObjectStore = LocalBlobStore> {
@@ -261,6 +286,18 @@ impl<O: ObjectStore> Store<O> {
             root,
             trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
             blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+            cache: CacheCounters::default(),
+        }
+    }
+
+    /// Snapshot the cache counters. Relaxed loads, taken independently: a
+    /// diagnostic read, never consistent to a single instant.
+    pub fn cache_stats(&self) -> StoreCacheStats {
+        StoreCacheStats {
+            object_cache_hits: self.cache.object_hits.load(Ordering::Relaxed),
+            object_cache_misses: self.cache.object_misses.load(Ordering::Relaxed),
+            tree_cache_hits: self.cache.tree_hits.load(Ordering::Relaxed),
+            tree_cache_misses: self.cache.tree_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -327,9 +364,11 @@ impl<O: ObjectStore> Store<O> {
         {
             let mut c = self.blob_cache.lock();
             if let Some(b) = c.get(&id) {
+                self.cache.object_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(b.to_vec());
             }
         }
+        self.cache.object_misses.fetch_add(1, Ordering::Relaxed);
         let bytes = self.get_raw_verified(id)?;
         self.blob_cache
             .lock()
@@ -382,9 +421,11 @@ impl<O: ObjectStore> Store<O> {
         {
             let mut c = self.trees.lock();
             if let Some(t) = c.get(&id) {
+                self.cache.tree_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((**t).clone());
             }
         }
+        self.cache.tree_misses.fetch_add(1, Ordering::Relaxed);
         let bytes = self.get_raw(id)?;
         let t = Tree::decode(&bytes)?;
         self.trees.lock().put(id, Arc::new(t.clone()));

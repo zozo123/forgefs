@@ -518,6 +518,7 @@ impl Forge {
         self.store
             .meta
             .overlay_rename(ns, &m.path, &rel_from, &rel_to, &dest)?;
+        self.count_rename();
         Ok(Renamed {
             from: from_abs,
             to: to_abs,

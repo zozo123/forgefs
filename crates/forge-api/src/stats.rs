@@ -14,7 +14,7 @@
 
 use crate::{ApiStats, Forge};
 use forge_store::blob::BlobStoreStats;
-use forge_store::{DurabilityPolicy, MetaStats};
+use forge_store::{DurabilityPolicy, MetaStats, StoreCacheStats};
 use serde::Serialize;
 
 /// Version of the `forge stats --json` key set, not of the repository.
@@ -56,6 +56,32 @@ pub struct StoreCounterReport {
     /// Saturating `fsync_file_us + fsync_dir_us + barrier_fs_us`. Not wall
     /// time.
     pub barrier_us: u64,
+    /// Object bytes written, summed over `puts`.
+    pub put_bytes: u64,
+    /// Object bytes a publication did not have to write, summed over
+    /// `dedup_hits`. Paired with `put_bytes` this is the storage amplification
+    /// content addressing avoided.
+    pub dedup_bytes: u64,
+    /// Object bytes read back from durable storage. Reads served from a cache
+    /// never reach it, so this is physical read volume; the `cache` section
+    /// explains the difference.
+    pub get_bytes: u64,
+    /// Durable object bytes that did not rehash to the id naming them. Every
+    /// one is a refused read (I1, I3, I15).
+    pub hash_failures: u64,
+}
+
+/// Hit and miss counts for the two hot in-process caches.
+///
+/// A separate section because it describes MEMORY, not durable work: nothing
+/// here is a barrier, a transaction or a byte on disk, and mixing it into
+/// `store` would let a cache hit look like avoided storage work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CacheCounterReport {
+    pub object_cache_hits: u64,
+    pub object_cache_misses: u64,
+    pub tree_cache_hits: u64,
+    pub tree_cache_misses: u64,
 }
 
 /// Metadata catalog work: the SQLite transaction that is the visibility point,
@@ -92,6 +118,22 @@ pub struct ApiCounterReport {
     pub stale_observation: u64,
     pub merge_applied: u64,
     pub merge_conflict: u64,
+    /// Cumulative time inside merge-base search, over applied AND refused
+    /// merges. `merge_base_searches` is its sample count; nothing else is.
+    pub merge_base_us: u64,
+    pub merge_base_searches: u64,
+    /// Moves staged by `rename` (I24). One per accepted move, never per file.
+    pub renames: u64,
+    /// `gc` runs, dry runs included, and what collection actually unlinked.
+    /// A dry run moves `gc_runs` alone: it deletes nothing.
+    pub gc_runs: u64,
+    pub gc_objects_deleted: u64,
+    pub gc_bytes_deleted: u64,
+    /// `fsck` runs and the findings they produced. A clean repository moves
+    /// `fsck_runs` and not `fsck_findings`, so the pair separates "not
+    /// checked" from "checked and clean".
+    pub fsck_runs: u64,
+    pub fsck_findings: u64,
 }
 
 /// The catalog durability contract in force. Repository state, not a counter:
@@ -118,13 +160,96 @@ pub struct StatsReport {
     pub note: &'static str,
     pub durability: DurabilityReport,
     pub store: StoreCounterReport,
+    pub cache: CacheCounterReport,
     pub sqlite: MetaCounterReport,
     pub api: ApiCounterReport,
 }
 
+impl StoreCounterReport {
+    pub fn of(store: BlobStoreStats) -> Self {
+        Self {
+            puts: store.puts,
+            dedup_hits: store.dedup_hits,
+            fsync_file: store.fsync_file,
+            fsync_file_us: store.fsync_file_us,
+            fsync_dir: store.fsync_dir,
+            fsync_dir_us: store.fsync_dir_us,
+            barrier_fs: store.barrier_fs,
+            barrier_fs_us: store.barrier_fs_us,
+            barrier_fs_batches: store.barrier_fs_batches,
+            barrier_us: store.barrier_us(),
+            put_bytes: store.put_bytes,
+            dedup_bytes: store.dedup_bytes,
+            get_bytes: store.get_bytes,
+            hash_failures: store.hash_failures,
+        }
+    }
+}
+
+impl CacheCounterReport {
+    pub fn of(cache: StoreCacheStats) -> Self {
+        Self {
+            object_cache_hits: cache.object_cache_hits,
+            object_cache_misses: cache.object_cache_misses,
+            tree_cache_hits: cache.tree_cache_hits,
+            tree_cache_misses: cache.tree_cache_misses,
+        }
+    }
+}
+
+impl MetaCounterReport {
+    pub fn of(meta: MetaStats) -> Self {
+        Self {
+            txn_count: meta.txn_count,
+            txn_us: meta.txn_us,
+            explicit_txn_count: meta.explicit_txn_count,
+            lock_acquires: meta.lock_acquires,
+            lock_wait_us: meta.lock_wait_us,
+            write_lock_acquires: meta.write_lock_acquires,
+            write_lock_wait_us: meta.write_lock_wait_us,
+            read_lock_acquires: meta.read_lock_acquires,
+            read_lock_wait_us: meta.read_lock_wait_us,
+            busy: meta.busy,
+            cas_updated: meta.cas_updated,
+            cas_forked: meta.cas_forked,
+            cas_denied: meta.cas_denied,
+            cas_noop: meta.cas_noop,
+            accounted_us: meta.sqlite_accounted_us(),
+        }
+    }
+}
+
+impl ApiCounterReport {
+    pub fn of(api: ApiStats) -> Self {
+        Self {
+            sessions_opened: api.sessions_opened,
+            stale_observation: api.stale_observation,
+            merge_applied: api.merge_applied,
+            merge_conflict: api.merge_conflict,
+            merge_base_us: api.merge_base_us,
+            merge_base_searches: api.merge_base_searches,
+            renames: api.renames,
+            gc_runs: api.gc_runs,
+            gc_objects_deleted: api.gc_objects_deleted,
+            gc_bytes_deleted: api.gc_bytes_deleted,
+            fsck_runs: api.fsck_runs,
+            fsck_findings: api.fsck_findings,
+        }
+    }
+}
+
+/// The stable line label each counter section is rendered under. `forge bench`
+/// renders sections independently -- a partial report has only some of them --
+/// so the labels live here rather than in either renderer.
+pub const STORE_LABEL: &str = "storage lifetime";
+pub const CACHE_LABEL: &str = "cache lifetime  ";
+pub const SQLITE_LABEL: &str = "sqlite lifetime ";
+pub const API_LABEL: &str = "api lifetime    ";
+
 impl StatsReport {
-    fn build(
+    pub(crate) fn build(
         store: BlobStoreStats,
+        cache: StoreCacheStats,
         meta: MetaStats,
         api: ApiStats,
         durability: &DurabilityPolicy,
@@ -139,41 +264,10 @@ impl StatsReport {
                 fullfsync: durability.fullfsync,
                 read_only: durability.read_only,
             },
-            store: StoreCounterReport {
-                puts: store.puts,
-                dedup_hits: store.dedup_hits,
-                fsync_file: store.fsync_file,
-                fsync_file_us: store.fsync_file_us,
-                fsync_dir: store.fsync_dir,
-                fsync_dir_us: store.fsync_dir_us,
-                barrier_fs: store.barrier_fs,
-                barrier_fs_us: store.barrier_fs_us,
-                barrier_fs_batches: store.barrier_fs_batches,
-                barrier_us: store.barrier_us(),
-            },
-            sqlite: MetaCounterReport {
-                txn_count: meta.txn_count,
-                txn_us: meta.txn_us,
-                explicit_txn_count: meta.explicit_txn_count,
-                lock_acquires: meta.lock_acquires,
-                lock_wait_us: meta.lock_wait_us,
-                write_lock_acquires: meta.write_lock_acquires,
-                write_lock_wait_us: meta.write_lock_wait_us,
-                read_lock_acquires: meta.read_lock_acquires,
-                read_lock_wait_us: meta.read_lock_wait_us,
-                busy: meta.busy,
-                cas_updated: meta.cas_updated,
-                cas_forked: meta.cas_forked,
-                cas_denied: meta.cas_denied,
-                cas_noop: meta.cas_noop,
-                accounted_us: meta.sqlite_accounted_us(),
-            },
-            api: ApiCounterReport {
-                sessions_opened: api.sessions_opened,
-                stale_observation: api.stale_observation,
-                merge_applied: api.merge_applied,
-                merge_conflict: api.merge_conflict,
-            },
+            store: StoreCounterReport::of(store),
+            cache: CacheCounterReport::of(cache),
+            sqlite: MetaCounterReport::of(meta),
+            api: ApiCounterReport::of(api),
         }
     }
 
@@ -185,14 +279,9 @@ impl StatsReport {
             Some(false) => "off",
             None => "n/a",
         };
-        format!(
-            "forge stats schema={} scope={}\n\
-             {}\n\
-             durability       journal_mode={} synchronous={} fullfsync={} read_only={}\n\
-             storage lifetime puts={} dedup_hits={} fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_fs={} barrier_fs_us={} barrier_fs_batches={} barrier_us={}\n\
-             sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} txn_us={} explicit_txn_count={} accounted_us={} busy={} updated={} forked={} denied={} noop={}\n\
-             sqlite locks     write_acquires={} write_wait_us={} read_acquires={} read_wait_us={}\n\
-             api lifetime     sessions_opened={} stale={} merge_applied={} conflict={}\n",
+        let mut out = format!(
+            "forge stats schema={} scope={}\n{}\n\
+             durability       journal_mode={} synchronous={} fullfsync={} read_only={}\n",
             self.schema_version,
             self.scope,
             self.note,
@@ -200,37 +289,52 @@ impl StatsReport {
             self.durability.synchronous,
             fullfsync,
             self.durability.read_only,
-            self.store.puts,
-            self.store.dedup_hits,
-            self.store.fsync_file,
-            self.store.fsync_file_us,
-            self.store.fsync_dir,
-            self.store.fsync_dir_us,
-            self.store.barrier_fs,
-            self.store.barrier_fs_us,
-            self.store.barrier_fs_batches,
-            self.store.barrier_us,
-            self.sqlite.lock_acquires,
-            self.sqlite.lock_wait_us,
-            self.sqlite.txn_count,
-            self.sqlite.txn_us,
-            self.sqlite.explicit_txn_count,
-            self.sqlite.accounted_us,
-            self.sqlite.busy,
-            self.sqlite.cas_updated,
-            self.sqlite.cas_forked,
-            self.sqlite.cas_denied,
-            self.sqlite.cas_noop,
-            self.sqlite.write_lock_acquires,
-            self.sqlite.write_lock_wait_us,
-            self.sqlite.read_lock_acquires,
-            self.sqlite.read_lock_wait_us,
-            self.api.sessions_opened,
-            self.api.stale_observation,
-            self.api.merge_applied,
-            self.api.merge_conflict,
-        )
+        );
+        out.push_str(&self.counter_lines());
+        out
     }
+
+    /// The counter half of the human rendering, shared with `forge bench`.
+    ///
+    /// Derived from the same serialization the JSON document is, so every
+    /// counter that exists in `forge stats --json` appears here BY
+    /// CONSTRUCTION. That is the point, and it is the fix for the class of
+    /// defect #324 reported: the previous renderer was a hand-written format
+    /// string per section, `forge bench` had a second one, and the two
+    /// silently disagreed -- bench omitted `cas_noop`, `dedup_hits`,
+    /// `sessions_opened`, `merge_applied` and, the one that mattered, the
+    /// write/read lock split, so a bench run could not attribute contention to
+    /// the writer and reported it as `unavailable`. Adding a field to a
+    /// counter report now cannot leave either surface behind.
+    ///
+    /// Line LABELS are stable and parsed by `scripts/w7_git_worktree_bench.py`;
+    /// the key set inside a line is the JSON key set and grows with it.
+    pub fn counter_lines(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&counter_line(STORE_LABEL, &self.store));
+        out.push_str(&counter_line(CACHE_LABEL, &self.cache));
+        out.push_str(&counter_line(SQLITE_LABEL, &self.sqlite));
+        out.push_str(&counter_line(API_LABEL, &self.api));
+        out
+    }
+}
+
+/// One `label key=value ...` line, with the keys taken from the section's own
+/// serialization rather than written out again by hand.
+pub fn counter_line(label: &str, section: &impl Serialize) -> String {
+    let value = serde_json::to_value(section).expect("a counter section is plain integers");
+    let fields = value
+        .as_object()
+        .expect("a counter section serializes to a JSON object");
+    let mut line = String::from(label);
+    for (key, value) in fields {
+        line.push(' ');
+        line.push_str(key);
+        line.push('=');
+        line.push_str(&value.to_string());
+    }
+    line.push('\n');
+    line
 }
 
 impl Forge {
@@ -243,6 +347,7 @@ impl Forge {
     pub fn stats_report(&self) -> StatsReport {
         StatsReport::build(
             self.store.stats(),
+            self.store.cache_stats(),
             self.store.meta.stats(),
             self.api_stats(),
             self.store.meta.durability_policy(),
@@ -266,6 +371,16 @@ mod tests {
                 barrier_fs: 2,
                 barrier_fs_us: 31,
                 barrier_fs_batches: 5,
+                put_bytes: 64,
+                dedup_bytes: 32,
+                get_bytes: 128,
+                hash_failures: 0,
+            },
+            StoreCacheStats {
+                object_cache_hits: 6,
+                object_cache_misses: 2,
+                tree_cache_hits: 9,
+                tree_cache_misses: 4,
             },
             MetaStats {
                 txn_us: 17,
@@ -288,6 +403,14 @@ mod tests {
                 merge_conflict: 3,
                 sessions_opened: 6,
                 merge_applied: 5,
+                merge_base_us: 12,
+                merge_base_searches: 4,
+                renames: 1,
+                gc_runs: 1,
+                gc_objects_deleted: 3,
+                gc_bytes_deleted: 96,
+                fsck_runs: 2,
+                fsck_findings: 0,
             },
             &DurabilityPolicy {
                 journal_mode: "wal".into(),
@@ -314,5 +437,43 @@ mod tests {
         assert_eq!(report.scope, "process-lifetime");
         assert!(report.note.contains("Not per-operation"));
         assert!(report.render().contains("scope=process-lifetime"));
+    }
+
+    /// The rendering is DERIVED from the document, so this is a structural
+    /// statement and not a list to keep in sync: every counter key the JSON
+    /// carries appears in the text, and adding a field to a counter report
+    /// cannot leave the human surface behind (#324).
+    #[test]
+    fn every_counter_key_in_the_document_appears_in_the_rendering() {
+        let report = sample();
+        let rendered = report.render();
+        let doc = serde_json::to_value(&report).expect("the document serializes");
+        for section in ["store", "cache", "sqlite", "api"] {
+            let fields = doc[section]
+                .as_object()
+                .unwrap_or_else(|| panic!("{section} is an object"));
+            assert!(!fields.is_empty(), "{section} carries no counters");
+            for key in fields.keys() {
+                assert!(
+                    rendered.contains(&format!("{key}=")),
+                    "render omits {section}.{key}:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    /// #324 by name: writer contention must be attributable, so the split must
+    /// be present and must not be replaced by the sum.
+    #[test]
+    fn the_write_and_read_lock_halves_are_never_flattened_into_the_sum() {
+        let rendered = sample().render();
+        assert!(rendered.contains("write_lock_wait_us=15"), "{rendered}");
+        assert!(rendered.contains("write_lock_acquires=20"), "{rendered}");
+        assert!(rendered.contains("read_lock_wait_us=4"), "{rendered}");
+        assert!(rendered.contains("read_lock_acquires=3"), "{rendered}");
+        assert!(
+            rendered.contains("lock_wait_us=19"),
+            "the sum stays beside the split: {rendered}"
+        );
     }
 }

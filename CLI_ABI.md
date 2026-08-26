@@ -438,21 +438,29 @@ schema_version   integer, currently 2
 scope            "process-lifetime"
 note             prose restating scope
 durability       journal_mode, synchronous, fullfsync, read_only
-store            puts, dedup_hits, fsync_file, fsync_file_us,
+store            puts, put_bytes, dedup_hits, dedup_bytes, get_bytes,
+                 hash_failures, fsync_file, fsync_file_us,
                  fsync_dir, fsync_dir_us, barrier_fs, barrier_fs_us,
                  barrier_fs_batches, barrier_us
+cache            object_cache_hits, object_cache_misses,
+                 tree_cache_hits, tree_cache_misses
 sqlite           txn_count, txn_us, explicit_txn_count, lock_acquires,
                  lock_wait_us, write_lock_acquires, write_lock_wait_us,
                  read_lock_acquires, read_lock_wait_us, busy, cas_updated,
                  cas_forked, cas_denied, cas_noop, accounted_us
-api              sessions_opened, stale_observation, merge_applied, merge_conflict
+api              sessions_opened, stale_observation, merge_applied,
+                 merge_conflict, merge_base_us, merge_base_searches, renames,
+                 gc_runs, gc_objects_deleted, gc_bytes_deleted,
+                 fsck_runs, fsck_findings
 ```
 
 Stability rules for consumers:
 
 - Keys are added, never renamed or removed, while `schema_version` is 2. A
   consumer must ignore keys it does not know. `barrier_fs`, `barrier_fs_us`
-  and `barrier_fs_batches` were added this way.
+  and `barrier_fs_batches` were added this way, and so were the whole `cache`
+  section and the `store` byte and `api` gc/fsck/merge-base/rename counters
+  (issue #42). No existing key changed meaning, so `schema_version` stays 2.
 - `fsync_dir` counts per-directory barriers and `barrier_fs` counts
   filesystem-wide ones, which the object store may take instead when its
   directory-barrier policy is `collapsed`. Neither is the directory-barrier
@@ -469,7 +477,35 @@ Stability rules for consumers:
 - `lock_acquires` / `lock_wait_us` sum the write connection's mutex and the
   read pool's slot mutexes, so they measure neither family on its own. Use
   `write_lock_acquires` / `write_lock_wait_us` for writer contention and
-  `read_lock_acquires` / `read_lock_wait_us` for the pool.
+  `read_lock_acquires` / `read_lock_wait_us` for the pool. **This split may not
+  be flattened back into the sum by any surface.** `forge bench` rendered only
+  the sum until #324, which is how a storage sweep came to report writer
+  contention as `unavailable` while the number it needed was already collected.
+  Both human renderings are now derived from this document rather than written
+  out again, so a counter cannot exist here and be missing there.
+- `put_bytes` is object payload bytes written, summed over `puts`;
+  `dedup_bytes` is what a publication did NOT have to write, summed over
+  `dedup_hits`. Together they are the storage amplification content addressing
+  avoided. Neither is on-disk allocation.
+- `get_bytes` is object bytes read from durable storage. Reads served from a
+  process cache never reach it, so it is physical read volume and the `cache`
+  section is what explains a change in it. `hash_failures` counts durable
+  objects that did not rehash to the id naming them; every one is a refused
+  read (I1, I3, I15) and a non-zero value is a corrupt store, not a slow one.
+- `cache` describes MEMORY, not durable work. `hits + misses` is a lookup
+  count, never an object count, and both caches are cold on every process open.
+- `merge_base_us` covers merge-base search over applied AND refused merges: the
+  search runs before the outcome is known. `merge_base_searches` is its only
+  sample count -- a merge can refuse before searching, so
+  `merge_applied + merge_conflict` is not.
+- `gc_runs` counts every `gc` that produced a report, dry runs included, while
+  `gc_objects_deleted` / `gc_bytes_deleted` count only what a sweep actually
+  unlinked. A dry run therefore moves the first and neither of the others,
+  which is the distinction a single "gc" counter could not make (I23).
+- `fsck_runs` and `fsck_findings` move independently, so a clean check is
+  distinguishable from no check at all.
+- `renames` counts accepted moves (I24), once per move and never once per file
+  the move staged.
 - **Schema 1 -> 2 (issue #311).** No key was renamed or removed, but under
   schema 1 `txn_count` counted only explicit transactions, so a read-heavy
   phase reported `0` while the catalog committed one autocommit write per
@@ -489,5 +525,10 @@ Stability rules for consumers:
   not assert amounts.
 
 `forge stats` without `--json` renders the same numbers for humans and is not
-part of this contract.
+part of this contract. It is DERIVED from the document above rather than
+written out separately, so every key listed here appears in it; the line labels
+(`storage lifetime`, `cache lifetime`, `sqlite lifetime`, `api lifetime`) are
+stable because `scripts/w7_git_worktree_bench.py` selects lines by them, but
+the key set inside a line grows with the JSON. `forge bench` prints the same
+lines from the same renderer.
 

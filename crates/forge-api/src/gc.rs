@@ -304,6 +304,7 @@ impl Forge {
         report.sample_truncated = sample.len() > GC_SAMPLE_LIMIT;
         sample.truncate(GC_SAMPLE_LIMIT);
         report.collectable_sample = sample;
+        self.count_gc(&report);
         Ok(report)
     }
 
@@ -413,144 +414,147 @@ impl Forge {
         // over is also conservative in the safe direction -- an object that
         // pass one reached and pass two would not is kept, never swept.
         let min_age = Duration::from_secs(min_age_secs);
-        self.store.meta.gc_sweep(|sweep| {
-            let roots = reachable_closure(self, &sweep.roots()?, &mut reachable)?;
-            // The answer to "how much of this repository is reachable", fixed
-            // here, where it means the same thing it means in `gc`: what the
-            // root walk proved live. Below, `reachable` stops being that set
-            // and becomes the sweep's protection set -- it grows to cover
-            // withheld and batch-limited garbage so their children are not
-            // unlinked. Reporting its size after that growth is what made
-            // `--collect` say `16 of 16 objects reachable` beside `withheld: 2`
-            // for a repository whose `--dry-run` had just said 14 of 16: two
-            // unreachable objects, reported as reachable, on the one path that
-            // deletes (issue #356).
-            let reachable_objects = reachable.len();
+        self.store
+            .meta
+            .gc_sweep(|sweep| {
+                let roots = reachable_closure(self, &sweep.roots()?, &mut reachable)?;
+                // The answer to "how much of this repository is reachable", fixed
+                // here, where it means the same thing it means in `gc`: what the
+                // root walk proved live. Below, `reachable` stops being that set
+                // and becomes the sweep's protection set -- it grows to cover
+                // withheld and batch-limited garbage so their children are not
+                // unlinked. Reporting its size after that growth is what made
+                // `--collect` say `16 of 16 objects reachable` beside `withheld: 2`
+                // for a repository whose `--dry-run` had just said 14 of 16: two
+                // unreachable objects, reported as reachable, on the one path that
+                // deletes (issue #356).
+                let reachable_objects = reachable.len();
 
-            let mut report = GcReport {
-                dry_run: false,
-                min_age_secs,
-                roots,
-                reachable_objects,
-                scanned_objects: scanned.len(),
-                collectable_objects: 0,
-                collectable_bytes: 0,
-                withheld_young_objects: 0,
-                withheld_young_bytes: 0,
-                unnamed_files,
-                deleted_objects: 0,
-                collectable_sample: Vec::new(),
-                sample_truncated: false,
-                batch_limited: false,
-            };
-            // Choosing what to unlink is not per-object. `fsck --full` roots
-            // every object *file*, not just the catalog's roots, so it walks
-            // out of surviving garbage too: unlink a contribution and leave
-            // the garbage commit that names it, and fsck reports OBJECT_READ.
-            // "Reclaimed space converted into reported corruption" is the
-            // failure docs/GC.md named, and a per-object rule produces it
-            // whenever a subgraph splits across the age floor or the batch
-            // limit -- which under a concurrent load is constantly.
-            //
-            // So the doomed set is closed by construction: everything that
-            // survives this sweep is walked, and anything it can reach is
-            // spared. Age and the batch limit decide what is *offered* for
-            // collection; this decides what is safe to take.
-            let mut sample = Vec::new();
-            // The object plane's own exclusion, held across every age check
-            // and every unlink below. The catalog transaction stops roots from
-            // being *published* during the sweep; this stops a deduplicating
-            // put from refreshing an object's age in the microseconds between
-            // this sweep reading that age and acting on it. Both are needed:
-            // the first covers the graph, the second covers the clock.
-            //
-            // Held across the whole loop rather than taken per candidate.
-            // Per-candidate looked strictly better -- it shortens how long a
-            // publisher can block -- and a 120s soak found dangling references
-            // with it, so it is not an option: the exclusion has to cover the
-            // sweep, not each of its steps. `GC_COLLECT_BATCH_LIMIT` is what
-            // bounds the stall.
-            let _objects = self.store.gc_exclusive_objects()?;
-            let now = SystemTime::now();
-            let mut doomed = Vec::new();
-            let mut spared = Vec::new();
-            for object in &shortlist {
-                if reachable.contains(&object.id) {
-                    continue;
-                }
-                // The age that decides is read here, under that lock and
-                // inside the transaction: a deduplicating put that landed
-                // after the unlocked scan has refreshed it, and that is the
-                // whole content-addressing defence. A vanished or unreadable
-                // entry is simply skipped -- this sweep is not the only thing
-                // entitled to have run.
-                let Ok(metadata) = fs::metadata(&object.path) else {
-                    continue;
+                let mut report = GcReport {
+                    dry_run: false,
+                    min_age_secs,
+                    roots,
+                    reachable_objects,
+                    scanned_objects: scanned.len(),
+                    collectable_objects: 0,
+                    collectable_bytes: 0,
+                    withheld_young_objects: 0,
+                    withheld_young_bytes: 0,
+                    unnamed_files,
+                    deleted_objects: 0,
+                    collectable_sample: Vec::new(),
+                    sample_truncated: false,
+                    batch_limited: false,
                 };
-                let age = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .unwrap_or_default();
-                if age < min_age || doomed.len() >= GC_COLLECT_BATCH_LIMIT {
-                    if age < min_age {
-                        report.withheld_young_objects += 1;
-                        report.withheld_young_bytes =
-                            report.withheld_young_bytes.saturating_add(metadata.len());
-                    } else {
-                        report.batch_limited = true;
+                // Choosing what to unlink is not per-object. `fsck --full` roots
+                // every object *file*, not just the catalog's roots, so it walks
+                // out of surviving garbage too: unlink a contribution and leave
+                // the garbage commit that names it, and fsck reports OBJECT_READ.
+                // "Reclaimed space converted into reported corruption" is the
+                // failure docs/GC.md named, and a per-object rule produces it
+                // whenever a subgraph splits across the age floor or the batch
+                // limit -- which under a concurrent load is constantly.
+                //
+                // So the doomed set is closed by construction: everything that
+                // survives this sweep is walked, and anything it can reach is
+                // spared. Age and the batch limit decide what is *offered* for
+                // collection; this decides what is safe to take.
+                let mut sample = Vec::new();
+                // The object plane's own exclusion, held across every age check
+                // and every unlink below. The catalog transaction stops roots from
+                // being *published* during the sweep; this stops a deduplicating
+                // put from refreshing an object's age in the microseconds between
+                // this sweep reading that age and acting on it. Both are needed:
+                // the first covers the graph, the second covers the clock.
+                //
+                // Held across the whole loop rather than taken per candidate.
+                // Per-candidate looked strictly better -- it shortens how long a
+                // publisher can block -- and a 120s soak found dangling references
+                // with it, so it is not an option: the exclusion has to cover the
+                // sweep, not each of its steps. `GC_COLLECT_BATCH_LIMIT` is what
+                // bounds the stall.
+                let _objects = self.store.gc_exclusive_objects()?;
+                let now = SystemTime::now();
+                let mut doomed = Vec::new();
+                let mut spared = Vec::new();
+                for object in &shortlist {
+                    if reachable.contains(&object.id) {
+                        continue;
                     }
-                    spared.push(*object);
-                    continue;
-                }
-                doomed.push((*object, metadata.len()));
-            }
-
-            // Walk out of everything that survives. Leniently: a spared
-            // object may already have a missing child from an earlier sweep or
-            // a crash, and there is nothing left to protect down that edge.
-            // The root walk above is the one that must fail closed, and it
-            // already did.
-            // From here `reachable` is the PROTECTION set, not the reachable
-            // set: it is deliberately widened past the root closure so that
-            // nothing a survivor names is unlinked. `report.reachable_objects`
-            // is not touched again -- it already holds what the root walk
-            // proved, which is the same quantity `gc` reports for the same
-            // repository.
-            protect_from_survivors(self, &spared, &mut reachable);
-
-            for (object, size) in &doomed {
-                if reachable.contains(&object.id) {
-                    continue;
-                }
-                // Catalog rows first. They commit with the transaction, so if
-                // the unlink below fails the rows come back with it; the
-                // reverse order could leave a row naming bytes that are gone.
-                sweep.forget_object(object.id)?;
-                match fs::remove_file(&object.path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(Error::Io(format!(
-                            "gc could not unlink {}: {error}",
-                            object.id
-                        )))
+                    // The age that decides is read here, under that lock and
+                    // inside the transaction: a deduplicating put that landed
+                    // after the unlocked scan has refreshed it, and that is the
+                    // whole content-addressing defence. A vanished or unreadable
+                    // entry is simply skipped -- this sweep is not the only thing
+                    // entitled to have run.
+                    let Ok(metadata) = fs::metadata(&object.path) else {
+                        continue;
+                    };
+                    let age = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .unwrap_or_default();
+                    if age < min_age || doomed.len() >= GC_COLLECT_BATCH_LIMIT {
+                        if age < min_age {
+                            report.withheld_young_objects += 1;
+                            report.withheld_young_bytes =
+                                report.withheld_young_bytes.saturating_add(metadata.len());
+                        } else {
+                            report.batch_limited = true;
+                        }
+                        spared.push(*object);
+                        continue;
                     }
+                    doomed.push((*object, metadata.len()));
                 }
-                // The LRU caches assume immutability, which is true of an
-                // object's bytes and false of its existence.
-                self.store.forget_cached(object.id);
-                report.deleted_objects += 1;
-                report.collectable_objects += 1;
-                report.collectable_bytes = report.collectable_bytes.saturating_add(*size);
-                sample.push(object.id.hex());
-            }
-            sample.sort();
-            report.sample_truncated = sample.len() > GC_SAMPLE_LIMIT;
-            sample.truncate(GC_SAMPLE_LIMIT);
-            report.collectable_sample = sample;
-            Ok(report)
-        })
+
+                // Walk out of everything that survives. Leniently: a spared
+                // object may already have a missing child from an earlier sweep or
+                // a crash, and there is nothing left to protect down that edge.
+                // The root walk above is the one that must fail closed, and it
+                // already did.
+                // From here `reachable` is the PROTECTION set, not the reachable
+                // set: it is deliberately widened past the root closure so that
+                // nothing a survivor names is unlinked. `report.reachable_objects`
+                // is not touched again -- it already holds what the root walk
+                // proved, which is the same quantity `gc` reports for the same
+                // repository.
+                protect_from_survivors(self, &spared, &mut reachable);
+
+                for (object, size) in &doomed {
+                    if reachable.contains(&object.id) {
+                        continue;
+                    }
+                    // Catalog rows first. They commit with the transaction, so if
+                    // the unlink below fails the rows come back with it; the
+                    // reverse order could leave a row naming bytes that are gone.
+                    sweep.forget_object(object.id)?;
+                    match fs::remove_file(&object.path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(Error::Io(format!(
+                                "gc could not unlink {}: {error}",
+                                object.id
+                            )))
+                        }
+                    }
+                    // The LRU caches assume immutability, which is true of an
+                    // object's bytes and false of its existence.
+                    self.store.forget_cached(object.id);
+                    report.deleted_objects += 1;
+                    report.collectable_objects += 1;
+                    report.collectable_bytes = report.collectable_bytes.saturating_add(*size);
+                    sample.push(object.id.hex());
+                }
+                sample.sort();
+                report.sample_truncated = sample.len() > GC_SAMPLE_LIMIT;
+                sample.truncate(GC_SAMPLE_LIMIT);
+                report.collectable_sample = sample;
+                Ok(report)
+            })
+            .inspect(|report| self.count_gc(report))
     }
 }
 

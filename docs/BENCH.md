@@ -324,9 +324,21 @@ snapshot, not a workload delta and not a checkin profile. Its boundaries are:
 
 The individual counter semantics are deliberately mechanical:
 
-- `puts` counts newly published OIDs. Object-byte accumulation is not yet
-  instrumented, so the renderer emits the explicit literal
-  `bytes=unavailable`; do not derive bytes from puts.
+- `puts` counts newly published OIDs and `put_bytes` their payload bytes;
+  `dedup_hits` counts publications an existing object satisfied and
+  `dedup_bytes` the bytes they did not have to write. The renderer used to emit
+  the literal `bytes=unavailable` here because byte accumulation did not exist;
+  it does now (issue #42), and `put_bytes + dedup_bytes` is the volume a
+  workload asked to publish while `put_bytes` alone is what reached storage.
+  Neither is on-disk allocation.
+- `get_bytes` is object bytes read from durable storage; reads served from a
+  process cache never reach it. The `cache lifetime` line
+  (`object_cache_*`, `tree_cache_*`) is what separates "less work" from "more
+  cache", and both caches are cold on every process open, so a bench run's
+  hit counts are its own.
+- `hash_failures` counts durable objects that did not rehash to the id naming
+  them. It must be zero in any run used as evidence; a non-zero value means the
+  store is corrupt, not slow.
 - `fsync_file` / `fsync_file_us` count and time successful file durability
   barriers; `fsync_dir` / `fsync_dir_us` do the same for directories. Failed
   barriers fail the operation and are not reported as successful work.
@@ -360,6 +372,14 @@ The individual counter semantics are deliberately mechanical:
   The summed column is the same number to any reader. The split says one run is
   a writer convoy and the other is not. Amounts are environment-dependent and
   are quoted here to show the SHAPE of the difference, not as a result.
+
+  The `sqlite lifetime` line carries the same two pairs, because since #42 the
+  bench renderer derives its counter lines from the counter DOCUMENT that
+  `forge stats --json` emits rather than from a second format string of its own.
+  A counter therefore cannot exist in one surface and be missing from the other,
+  which is the class of omission #324 was an instance of. `sqlite locks` remains
+  a separate line because `write_share_of_wait` is a derived ratio and the
+  document holds counters only.
 - `txn_count` counts every write transaction SQLite committed on the catalog:
   each explicit `BEGIN IMMEDIATE` that committed, and each autocommit statement
   that wrote, since SQLite wraps every such statement in an implicit
@@ -440,8 +460,9 @@ A performance PR attaches or links the exact command and unedited machine-readab
 5. correctness result;
 6. all repetition outputs plus the median aggregation rule above;
 7. p50/p95/p99/max plus throughput;
-8. whole-run storage/SQLite lifetime totals, including `bytes=unavailable`,
-   plus explicit `unavailable` markers for per-checkin attribution;
+8. whole-run storage/cache/SQLite/api lifetime totals, including the
+   write/read lock split, plus explicit `unavailable` markers for per-checkin
+   attribution;
 9. the mechanism believed to explain the change;
 10. for W7, the comparator metadata and durability-equivalence verdict.
 

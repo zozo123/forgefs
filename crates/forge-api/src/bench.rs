@@ -11,7 +11,7 @@
 
 use crate::{ApiStats, Forge};
 use forge_cap::Cap;
-use forge_store::{blob::BlobStoreStats, DurabilityPolicy, MetaStats};
+use forge_store::{blob::BlobStoreStats, DurabilityPolicy, MetaStats, StoreCacheStats};
 use forge_types::{CasResult, Error, Result};
 use std::sync::Arc;
 use std::thread;
@@ -75,6 +75,8 @@ pub struct BenchReport {
     pub durability: Option<DurabilityPolicy>,
     /// Process-lifetime snapshot, not a delta for any one benchmark phase.
     pub store: Option<BlobStoreStats>,
+    /// Process-lifetime snapshot, not a delta for any one benchmark phase.
+    pub cache: Option<StoreCacheStats>,
     /// Process-lifetime snapshot, not a delta for any one benchmark phase.
     pub meta: Option<MetaStats>,
     /// Process-lifetime snapshot, not a delta for any one benchmark phase.
@@ -154,48 +156,54 @@ impl BenchReport {
                 policy.journal_mode, policy.synchronous, fullfsync
             ));
         }
-        if let Some(stats) = self.store {
-            s.push_str(&format!(
-                "storage lifetime puts={} bytes=unavailable fsync_file={} fsync_file_us={} fsync_dir={} fsync_dir_us={} barrier_fs={} barrier_fs_us={} barrier_fs_batches={} lifetime_barrier_us={}\n",
-                stats.puts,
-                stats.fsync_file,
-                stats.fsync_file_us,
-                stats.fsync_dir,
-                stats.fsync_dir_us,
-                stats.barrier_fs,
-                stats.barrier_fs_us,
-                stats.barrier_fs_batches,
-                stats.barrier_us(),
+        // Counter lines, DERIVED from the same documents `forge stats --json`
+        // emits rather than from a second format string of this renderer's own
+        // (#42). A counter therefore cannot exist there and be missing here,
+        // which is the class of omission #324 was one instance of.
+        //
+        // Rendered section by section, not as a whole `StatsReport`: a bench
+        // report may hold only some of the four snapshots, and requiring all
+        // four would have hidden the SQLite counters from exactly the partial
+        // reports that exist to isolate them.
+        if let Some(store) = self.store {
+            s.push_str(&crate::stats::counter_line(
+                crate::stats::STORE_LABEL,
+                &crate::StoreCounterReport::of(store),
             ));
         }
-        if let Some(stats) = self.meta {
-            s.push_str(&format!(
-                "sqlite lifetime  lock_acquires={} lock_wait_us={} txn_count={} explicit_txn_count={} txn_us={} lifetime_accounted_us={} busy={} updated={} forked={} denied={}\n",
-                stats.lock_acquires,
-                stats.lock_wait_us,
-                stats.txn_count,
-                stats.explicit_txn_count,
-                stats.txn_us,
-                stats.sqlite_accounted_us(),
-                stats.busy,
-                stats.cas_updated,
-                stats.cas_forked,
-                stats.cas_denied,
+        if let Some(cache) = self.cache {
+            s.push_str(&crate::stats::counter_line(
+                crate::stats::CACHE_LABEL,
+                &crate::CacheCounterReport::of(cache),
             ));
-            // #324: `lock_acquires` / `lock_wait_us` above have summed the
-            // write connection's mutex and the read pool since #315, so a
-            // writer convoy and a busy read pool render identically. Every
-            // performance conclusion in this project has come from these
-            // counters, and `lock_wait_us` alone has already produced three
-            // wrong ones on #37. The split is printed beside the sum, not
-            // instead of it, so the arithmetic stays checkable by eye.
+        }
+        if let Some(meta) = self.meta {
+            s.push_str(&crate::stats::counter_line(
+                crate::stats::SQLITE_LABEL,
+                &crate::MetaCounterReport::of(meta),
+            ));
+            // The ATTRIBUTION line (#324). `lock_acquires` / `lock_wait_us`
+            // have summed the write connection's mutex and the read pool since
+            // #315, so a writer convoy and a busy read pool render
+            // identically. Every performance conclusion in this project has
+            // come from these counters, and `lock_wait_us` alone has already
+            // produced three wrong ones on #37. The split is printed beside
+            // the sum, not instead of it, so the arithmetic stays checkable by
+            // eye -- and `write_share_of_wait` is a derived ratio, so the
+            // counter document has nowhere to carry it and this line stays.
             s.push_str(&format!(
                 "sqlite locks     write_acquires={} write_wait_us={}  read_acquires={} read_wait_us={}  write_share_of_wait={}\n",
-                stats.write_lock_acquires,
-                stats.write_lock_wait_us,
-                stats.read_lock_acquires,
-                stats.read_lock_wait_us,
-                share(stats.write_lock_wait_us, stats.lock_wait_us),
+                meta.write_lock_acquires,
+                meta.write_lock_wait_us,
+                meta.read_lock_acquires,
+                meta.read_lock_wait_us,
+                share(meta.write_lock_wait_us, meta.lock_wait_us),
+            ));
+        }
+        if let Some(api) = self.api {
+            s.push_str(&crate::stats::counter_line(
+                crate::stats::API_LABEL,
+                &crate::ApiCounterReport::of(api),
             ));
         }
         if let (Some(store), Some(meta)) = (self.store, self.meta) {
@@ -210,12 +218,6 @@ impl BenchReport {
                 meta.lock_wait_us,
                 meta.txn_us,
                 cumulative_phase_us,
-            ));
-        }
-        if let Some(stats) = self.api {
-            s.push_str(&format!(
-                "api lifetime     stale={} conflict={}\n",
-                stats.stale_observation, stats.merge_conflict,
             ));
         }
         s
@@ -422,6 +424,7 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
         verify: Some(verify),
         durability: Some(forge.store.meta.durability_policy().clone()),
         store: Some(store),
+        cache: Some(forge.store.cache_stats()),
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
     })
@@ -431,8 +434,73 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
 mod tests {
     use super::*;
 
+    /// The bench renderer must emit the SAME counter set `forge stats` does.
+    ///
+    /// #324: it did not. It rendered only the summed `lock_wait_us`, so a
+    /// bench run could not say whether the writer or the read pool waited, and
+    /// a storage sweep had to report writer contention as `unavailable`. It
+    /// also silently dropped `cas_noop`, `dedup_hits`, `sessions_opened` and
+    /// `merge_applied`. Both surfaces now derive their lines from the counter
+    /// documents, and this test is what keeps the two from drifting again.
     #[test]
-    fn render_labels_raw_counters_as_lifetime_totals() {
+    fn render_emits_every_counter_the_stats_document_carries() {
+        let store = BlobStoreStats {
+            puts: 2,
+            dedup_hits: 1,
+            fsync_file: 3,
+            fsync_file_us: 11,
+            fsync_dir: 4,
+            fsync_dir_us: 13,
+            barrier_fs: 2,
+            barrier_fs_us: 31,
+            barrier_fs_batches: 5,
+            put_bytes: 64,
+            dedup_bytes: 32,
+            get_bytes: 128,
+            hash_failures: 0,
+        };
+        let cache = StoreCacheStats {
+            object_cache_hits: 6,
+            object_cache_misses: 2,
+            tree_cache_hits: 9,
+            tree_cache_misses: 4,
+        };
+        let meta = MetaStats {
+            txn_us: 17,
+            txn_count: 9,
+            explicit_txn_count: 5,
+            lock_wait_us: 19,
+            lock_acquires: 23,
+            write_lock_acquires: 20,
+            write_lock_wait_us: 15,
+            read_lock_acquires: 3,
+            read_lock_wait_us: 4,
+            busy: 0,
+            cas_updated: 7,
+            cas_forked: 1,
+            cas_denied: 0,
+            cas_noop: 0,
+        };
+        let api = ApiStats {
+            stale_observation: 2,
+            merge_conflict: 3,
+            sessions_opened: 0,
+            merge_applied: 0,
+            merge_base_us: 12,
+            merge_base_searches: 4,
+            renames: 1,
+            gc_runs: 1,
+            gc_objects_deleted: 3,
+            gc_bytes_deleted: 96,
+            fsck_runs: 2,
+            fsck_findings: 0,
+        };
+        let durability = DurabilityPolicy {
+            journal_mode: "wal".into(),
+            synchronous: 2,
+            fullfsync: None,
+            read_only: false,
+        };
         let report = BenchReport {
             serial: None,
             private: None,
@@ -440,40 +508,11 @@ mod tests {
             read_fanout: None,
             merge_seal: None,
             verify: None,
-            durability: None,
-            store: Some(BlobStoreStats {
-                puts: 2,
-                dedup_hits: 1,
-                fsync_file: 3,
-                fsync_file_us: 11,
-                fsync_dir: 4,
-                fsync_dir_us: 13,
-                barrier_fs: 2,
-                barrier_fs_us: 31,
-                barrier_fs_batches: 5,
-            }),
-            meta: Some(MetaStats {
-                txn_us: 17,
-                txn_count: 9,
-                explicit_txn_count: 5,
-                lock_wait_us: 19,
-                lock_acquires: 23,
-                write_lock_acquires: 20,
-                write_lock_wait_us: 15,
-                read_lock_acquires: 3,
-                read_lock_wait_us: 4,
-                busy: 0,
-                cas_updated: 7,
-                cas_forked: 1,
-                cas_denied: 0,
-                cas_noop: 0,
-            }),
-            api: Some(ApiStats {
-                stale_observation: 2,
-                merge_conflict: 3,
-                sessions_opened: 0,
-                merge_applied: 0,
-            }),
+            durability: Some(durability.clone()),
+            store: Some(store),
+            cache: Some(cache),
+            meta: Some(meta),
+            api: Some(api),
         };
 
         let rendered = report.render();
@@ -485,10 +524,7 @@ mod tests {
             "counter end   = after init + all workloads + merge/seal + verify (+ worker fsck)"
         ));
         assert!(rendered.contains(
-            "storage lifetime puts=2 bytes=unavailable fsync_file=3 fsync_file_us=11 fsync_dir=4 fsync_dir_us=13 barrier_fs=2 barrier_fs_us=31 barrier_fs_batches=5 lifetime_barrier_us=55"
-        ));
-        assert!(rendered.contains(
-            "sqlite lifetime  lock_acquires=23 lock_wait_us=19 txn_count=9 explicit_txn_count=5 txn_us=17 lifetime_accounted_us=36 busy=0 updated=7 forked=1 denied=0"
+            "per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals"
         ));
         assert!(rendered.contains(
             "fsync_file_us=11 + fsync_dir_us=13 + barrier_fs_us=31 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=91"
@@ -504,11 +540,42 @@ mod tests {
         assert!(rendered.contains(
             "lock split = write connection mutex vs read-pool slot mutexes; lock_acquires/lock_wait_us are their SUM and attribute nothing"
         ));
-        assert!(rendered.contains("api lifetime     stale=2 conflict=3"));
+
+        // #42: the counter lines are DERIVED from the document, so this is a
+        // structural statement rather than a list to keep in sync. It replaces
+        // an assertion on the literal string `api lifetime     stale=2
+        // conflict=3`, which pinned an abbreviation the document does not use
+        // -- and pinning abbreviations per section is how the two surfaces
+        // drifted apart in the first place.
+        for (section, keys) in [
+            (
+                "store",
+                serde_json::to_value(crate::StoreCounterReport::of(store)).unwrap(),
+            ),
+            (
+                "cache",
+                serde_json::to_value(crate::CacheCounterReport::of(cache)).unwrap(),
+            ),
+            (
+                "sqlite",
+                serde_json::to_value(crate::MetaCounterReport::of(meta)).unwrap(),
+            ),
+            (
+                "api",
+                serde_json::to_value(crate::ApiCounterReport::of(api)).unwrap(),
+            ),
+        ] {
+            for key in keys.as_object().unwrap().keys() {
+                assert!(
+                    rendered.contains(&format!("{key}=")),
+                    "bench render omits {section}.{key}, which `forge stats --json` reports:\n{rendered}"
+                );
+            }
+        }
+
         assert!(!rendered.contains("observed mix"));
         assert!(!rendered.contains("observed_us"));
-        assert!(!rendered.contains("stale=2 ("));
-        assert!(!rendered.contains("conflict=3 ("));
+        assert!(!rendered.contains("bytes=unavailable"));
     }
 
     fn only_meta(meta: MetaStats) -> BenchReport {
@@ -521,6 +588,7 @@ mod tests {
             verify: None,
             durability: None,
             store: None,
+            cache: None,
             meta: Some(meta),
             api: None,
         }
@@ -562,11 +630,25 @@ mod tests {
 
         let a = only_meta(convoy).render();
         let b = only_meta(pool).render();
-        assert_eq!(
-            line(&a, "sqlite lifetime"),
-            line(&b, "sqlite lifetime"),
-            "the summed line is the one that cannot tell these apart"
-        );
+
+        // The SUMMED FIELDS are what cannot tell these apart, and that is the
+        // statement this test has always been making. It used to be checkable
+        // as "the whole `sqlite lifetime` line is byte-identical", because that
+        // line rendered only the sums. Since #42 the line is derived from the
+        // counter document, so it carries the split too and the two runs differ --
+        // the property is unchanged and the instrument is strictly better, but
+        // the assertion had to move from the LINE to the FIELDS it is about.
+        for field in [
+            "lock_acquires=1000",
+            "lock_wait_us=1000",
+            "accounted_us=1000",
+        ] {
+            assert!(
+                line(&a, "sqlite lifetime").contains(field)
+                    && line(&b, "sqlite lifetime").contains(field),
+                "the summed fields are identical for both runs: {field}"
+            );
+        }
         assert_ne!(
             line(&a, "sqlite locks"),
             line(&b, "sqlite locks"),

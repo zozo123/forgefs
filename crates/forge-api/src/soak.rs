@@ -350,6 +350,7 @@ pub fn run_bench_with_workers(
         verify: Some(verify),
         durability: Some(forge.store.meta.durability_policy().clone()),
         store: Some(store),
+        cache: Some(forge.store.cache_stats()),
         meta: Some(forge.store.meta.stats()),
         api: Some(forge.api_stats()),
     })

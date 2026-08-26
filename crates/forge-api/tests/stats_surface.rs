@@ -104,6 +104,120 @@ fn counters_move_for_sessions_dedup_noop_checkin_and_merge() {
     );
 }
 
+/// #42 coverage: the families the issue names -- object bytes, cache hits,
+/// merge-base search, GC and fsck -- must each move for the operation that
+/// causes them, and must NOT move for one that does not.
+#[test]
+fn counters_move_for_bytes_caches_merge_base_gc_and_fsck() {
+    let d = tempdir().unwrap();
+    let f = Forge::init(d.path()).unwrap();
+    let root = f.root_cap().unwrap();
+    f.branch(&root, "main", "shared").unwrap();
+
+    let before = f.stats_report();
+
+    let ns = f.session_open(&root, "shared").unwrap();
+    f.mount(&root, &ns, "/", "ref:shared", true).unwrap();
+    f.write(&root, &ns, "/a.txt", b"payload-bytes", false)
+        .unwrap();
+    f.checkin(&root, &ns, "/", "one").unwrap();
+
+    let published = f.stats_report();
+    assert!(
+        published.store.put_bytes > before.store.put_bytes,
+        "publishing objects must move the byte counter, not only `puts`"
+    );
+
+    // A second namespace republishing identical bytes: a dedup hit, and the
+    // bytes it did not have to write.
+    let twin = f.session_open(&root, "shared").unwrap();
+    f.mount(&root, &twin, "/", "ref:shared", true).unwrap();
+    f.write(&root, &twin, "/b.txt", b"payload-bytes", false)
+        .unwrap();
+    f.checkin(&root, &twin, "/", "two").unwrap();
+    let deduped = f.stats_report();
+    assert!(
+        deduped.store.dedup_bytes > published.store.dedup_bytes,
+        "a dedup hit must record the bytes content addressing avoided writing"
+    );
+
+    // Reads: the first resolves through the object plane, the rest are served
+    // from the hot caches, which is exactly why physical bytes and cache hits
+    // are separate numbers.
+    let reader = f.session_open(&root, "shared").unwrap();
+    for _ in 0..4 {
+        f.read(&root, &reader, "/a.txt").unwrap();
+    }
+    let read = f.stats_report();
+    assert!(
+        read.cache.object_cache_hits > deduped.cache.object_cache_hits
+            || read.cache.tree_cache_hits > deduped.cache.tree_cache_hits,
+        "repeated reads of one path must be observable as cache hits"
+    );
+    assert!(
+        read.store.get_bytes >= deduped.store.get_bytes,
+        "physical read volume is monotonic"
+    );
+    assert_eq!(
+        read.store.hash_failures, 0,
+        "an intact repository must report no hash failure"
+    );
+
+    // Merge-base search is timed whatever the merge decides.
+    f.branch(&root, "shared", "topic").unwrap();
+    let topic = f.session_open(&root, "topic").unwrap();
+    f.mount(&root, &topic, "/", "ref:topic", true).unwrap();
+    f.write(&root, &topic, "/c.txt", b"topic", false).unwrap();
+    f.checkin(&root, &topic, "/", "topic").unwrap();
+    f.merge(&root, "shared", "topic", None).unwrap();
+    let merged = f.stats_report();
+    assert!(
+        merged.api.merge_base_searches > read.api.merge_base_searches,
+        "a merge must record that it searched for a base"
+    );
+
+    // fsck: runs move, findings do not, which is what separates "not checked"
+    // from "checked and clean".
+    let clean = f.fsck(&root, true).unwrap();
+    assert!(clean.ok);
+    let checked = f.stats_report();
+    assert_eq!(
+        checked.api.fsck_runs - merged.api.fsck_runs,
+        1,
+        "every fsck that produced a report must be counted once"
+    );
+    assert_eq!(
+        checked.api.fsck_findings, merged.api.fsck_findings,
+        "a clean fsck must not invent findings"
+    );
+
+    // gc: a DRY RUN is a run that deletes nothing. A counter that could not
+    // say that would be worse than no counter (I23).
+    f.gc(&root, true, forge_api::DEFAULT_MIN_AGE_SECS).unwrap();
+    let planned = f.stats_report();
+    assert_eq!(planned.api.gc_runs - checked.api.gc_runs, 1);
+    assert_eq!(
+        planned.api.gc_bytes_deleted, checked.api.gc_bytes_deleted,
+        "a dry run deletes nothing and must add nothing to the deleted bytes"
+    );
+    assert_eq!(
+        planned.api.gc_objects_deleted, checked.api.gc_objects_deleted,
+        "a dry run deletes nothing and must add nothing to the deleted objects"
+    );
+
+    // rename: one move, one count, whatever it moved.
+    let mover = f.session_open(&root, "shared").unwrap();
+    f.mount(&root, &mover, "/", "ref:shared", true).unwrap();
+    f.rename(&root, &mover, "/a.txt", "/moved.txt", None)
+        .unwrap();
+    let moved = f.stats_report();
+    assert_eq!(
+        moved.api.renames - planned.api.renames,
+        1,
+        "a move is counted once, not once per file it staged"
+    );
+}
+
 /// The durability policy travels with the counters so nothing compares two
 /// runs that did not promise the same thing.
 #[test]
