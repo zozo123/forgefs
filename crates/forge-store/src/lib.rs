@@ -566,6 +566,12 @@ impl<O: ObjectStore> Store<O> {
             return Ok(());
         }
 
+        if expected == ObjectType::Blob {
+            self.blobs.verify_blob(new)?;
+            oids.push(new);
+            return Ok(());
+        }
+
         let bytes = self.get_raw(new)?;
         let actual = decode_object_type(&bytes)?;
         if actual != expected {

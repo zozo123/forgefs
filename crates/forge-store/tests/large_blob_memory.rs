@@ -12,8 +12,9 @@
 //! The counters are process-global, so every phase lives in one `#[test]`; a
 //! second test function would run concurrently and interleave its allocations.
 
-use forge_core::{hash_bytes, Blob};
+use forge_core::{hash_bytes, Blob, Tree, TreeEntry};
 use forge_store::{Store, OBJECT_CACHE_MAX_BYTES};
+use forge_types::EntryKind;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
@@ -76,7 +77,7 @@ fn payload() -> Vec<u8> {
 }
 
 #[test]
-fn large_blob_cost_and_raw_cache_residency_are_measured_and_bounded() {
+fn large_blob_cost_cache_residency_and_intro_walk_are_bounded() {
     let a = tempdir().unwrap();
     let store = Store::open(a.path()).unwrap();
     let data = payload();
@@ -113,12 +114,37 @@ fn large_blob_cost_and_raw_cache_residency_are_measured_and_bounded() {
          streaming verification must stay independent of object size"
     );
 
-    // Phase 3 - reading one object from a cold store. At 8 MiB the object is
+    // Phase 3 - a provenance intro walk needs the Blob's typed identity, not
+    // its payload. Build a one-blob tree, reopen cold so no cache can hide the
+    // cost, and prove the walk stays independent of payload size while still
+    // returning both exact OIDs.
+    let tree_id = store
+        .put_tree(
+            &Tree::new(vec![TreeEntry {
+                name: "large.bin".into(),
+                kind: EntryKind::Blob,
+                id,
+                exec: false,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+    drop(store);
+    let intro_cold = Store::open(a.path()).unwrap();
+    let (intros, intro_peak) = peak_payloads(|| intro_cold.collect_intros(None, tree_id).unwrap());
+    assert_eq!(intros, vec![tree_id, id]);
+    assert!(
+        intro_peak < 0.25,
+        "intro walk over a {N}-byte blob peaked at {intro_peak:.2}x the payload; \
+         typed Blob validation must stream instead of materializing the payload"
+    );
+    drop(intro_cold);
+
+    // Phase 4 - reading one object from a cold store. At 8 MiB the object is
     // intentionally below the 64 MiB cache budget, so the single-object peak
     // remains three payloads: durable read buffer, cached clone, decoded copy.
-    // Phase 4 below is the important bound: walking many such blobs no longer
+    // Phase 5 below is the important bound: walking many such blobs no longer
     // retains one payload per object without limit.
-    drop(store);
     let cold = Store::open(a.path()).unwrap();
     let (got, read) = peak_payloads(|| cold.get_blob_data(id).unwrap());
     assert_eq!(got.len(), N);
@@ -130,7 +156,7 @@ fn large_blob_cost_and_raw_cache_residency_are_measured_and_bounded() {
     drop(got);
     drop(cold);
 
-    // Phase 4 - the raw-object LRU is bounded by bytes as well as entries.
+    // Phase 5 - the raw-object LRU is bounded by bytes as well as entries.
     // Use enough distinct 8 MiB blobs to exceed 64 MiB. The former 256-entry
     // policy retained every one (80+ MiB here, and tens of GiB at the measured
     // 164 MiB object ceiling). The byte-bound cache must evict old entries and

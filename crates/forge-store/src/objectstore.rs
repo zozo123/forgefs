@@ -145,6 +145,16 @@ pub trait ObjectStore: Send + Sync {
     /// content-addressed read that trusts its own index is not a read.
     fn get(&self, id: ObjectId) -> Result<Vec<u8>>;
 
+    /// Verify that `id` names a well-formed Blob, including the backend's
+    /// ordinary durable-byte identity check. Implementations may stream this
+    /// validation; callers must not infer that the payload was materialized or
+    /// cached. The default is deliberately boring and correct for simple
+    /// backends.
+    fn verify_blob(&self, id: ObjectId) -> Result<()> {
+        forge_core::Blob::decode(&self.get(id)?)?;
+        Ok(())
+    }
+
     /// Visibility only -- never a durability proof. See the module docs.
     fn has(&self, id: ObjectId) -> bool;
 

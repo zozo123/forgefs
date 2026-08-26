@@ -4,7 +4,8 @@ Status: **design only, not recommended yet.** This document records the measured
 object-size ceiling, the format cost of removing it, and the trigger conditions
 that would justify paying that cost. Three format-neutral parts of the ceiling
 have now been removed: copy-free publication, streaming dedup verification,
-and a byte-bound raw-object cache.
+streaming typed Blob validation in provenance walks, and a byte-bound raw-object
+cache.
 
 `FORMAT.md` freezes the VERSION 1 encoding, and `v0.1.0` is now a real release
 tag, so FORMAT.md's pre-release exception has closed. Chunking needs a new
@@ -71,6 +72,7 @@ pollute the reading). At N = 8 MiB, peak extra live bytes as a multiple of N:
 |---|---|---|---|
 | `put_blob_data`, first publication | 2.00x | **0.00x** | `data.to_vec()` into a temporary `Blob`, then the `encode()` buffer |
 | `put_blob_data`, identical bytes again | 1.00x | **<0.25x** | full durable rehash remains (I3), now through a fixed 64 KiB buffer |
+| `collect_intros`, one cold 8 MiB Blob | >1.00x | **<0.25x** | full typed/hash validation remains (I1/I15), now through a fixed buffer and tiny canonical frame |
 | `get_blob_data`, one cold 8 MiB object | 3.00x | 3.00x | durable read buffer + the cached clone + the decoded copy returned |
 | walk ten distinct 8 MiB objects, retained raw cache | >80 MiB | **<64 MiB** | 64 MiB encoded-byte budget plus the pre-existing 256-entry cap |
 
@@ -79,20 +81,14 @@ because they include the caller's own copy of the payload.)
 
 ### Two findings that are not about chunking
 
-**`checkin` reads every blob payload it walks.** `checkin` costs 3.00x the
-largest blob in the tree even though it never needs blob *contents*. Traced:
-
-```
-forge_api::Forge::checkin
-  -> forge_store::Store::collect_intros
-    -> forge_store::Store::intro_walk          (crates/forge-store/src/lib.rs)
-      -> Store::get_raw                         full payload
-      -> Blob::decode(&bytes)                   a second full payload, discarded
-```
-
-The `Blob::decode` is a deliberate typed-graph check and must not simply be
-deleted; it wants a streaming validator (parse the frame, check `size` against
-the file length, rehash in a fixed buffer) rather than a buffering one.
+**The `checkin` typed-walk payload copy is resolved without weakening the
+check.** `Store::intro_walk` now asks the object backend to verify Blob edges
+without materializing their contents. The local backend re-hashes every durable
+byte through the same fixed 64 KiB identity path, then compares the small frame
+against `blob_frame_prefix(payload_len)`, proving type, canonical header,
+declared size and file length (I1/I15). Trees still decode normally. The
+allocator regression walks an 8 MiB Blob from a cold store and holds peak extra
+live memory below 0.25x the payload.
 
 **The object-cache memory hazard is resolved without chunking.** The raw object
 cache still has the original 256-entry LRU cap, but it now also tracks the
@@ -128,8 +124,8 @@ I15 trust-boundary reads still bypass the cache entirely.
 
 These changes do not make chunking necessary or change VERSION 1. Copy-free
 publication moves the publish half of the ceiling from RAM/3 to RAM/1; the cache
-bound removes unbounded accumulation across a walk. The remaining single-object read and typed-walk copies are the
-format-neutral work below.
+bound removes unbounded accumulation across a walk. The remaining single-object read/export copies are the format-neutral work
+below.
 
 ## 3. If chunking were built
 
@@ -294,7 +290,10 @@ instead, in this order:
    quietly weaken I15 to win a benchmark.
 4. *(done)* Byte-bound `Store::blob_cache`: 64 MiB of encoded object bytes plus
    the existing 256-entry cap; larger single objects bypass the cache.
-5. Stop `intro_walk` pulling whole blob payloads through the object cache.
+5. *(done)* Stop `intro_walk` pulling whole blob payloads through the
+   object cache. Blob edges retain full typed and hash validation through the
+   `ObjectStore::verify_blob` seam, but the local implementation uses fixed
+   memory and never inserts the payload into the raw-object cache.
 
 Together those take the ceiling from roughly RAM/3 to roughly RAM, i.e. a 3x,
 with zero format risk. A 3x that costs nothing beats a 10x that costs a
@@ -326,7 +325,7 @@ Revisit chunking when any of these is true, and not before:
 | Claim | Where |
 |---|---|
 | publish allocates no copy of the payload; identity unchanged | `crates/forge-store/tests/large_blob_memory.rs` |
-| republish costs one payload (verifying re-read) | same |
+| republish verification and typed intro walks stay below 0.25x one 8 MiB payload | same |
 | one cold 8 MiB read costs three payloads | same |
 | raw-object cache retains <64 MiB after walking ten distinct 8 MiB blobs | same |
 | process-level RSS multipliers and the 512 MiB bisection | this document, section 1 |
