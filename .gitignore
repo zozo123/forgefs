@@ -14,3 +14,5 @@ demo/
 /fuzz/artifacts
 /fuzz/coverage
 /fuzz/Cargo.lock
+/abi-conformance-out
+/release-gate-out
