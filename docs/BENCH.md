@@ -77,6 +77,14 @@ A Git comparison additionally records:
 - `git --version`;
 - relevant `git config --show-origin --list` output for durability/performance-affecting settings;
 - filesystem and storage settings for the Git worktree location;
+- filesystem and storage settings for the **ForgeFS** location, and a
+  statement that the two are the same filesystem. `forge bench` builds its
+  workspace under `$TMPDIR` unless `--scratch` is given, which on many boxes
+  is a different device from the repository; a ForgeFS row and a Git row taken
+  on two filesystems are not a comparison. The comparator now passes
+  `--scratch` under its own work directory so this cannot happen silently;
+- the barrier-reach probe for that filesystem, as a published number and not
+  as an assurance (see *Precondition: barriers must reach the device*);
 - every explicit sync/fsync step in the comparator script;
 - whether the compared operation includes object writes, ref update, index/worktree update, and any explicit durability barrier.
 
@@ -108,20 +116,27 @@ agent, which is what an orchestrator that shells out actually pays.
 Box: islo sandbox, AMD EPYC 9454, 4 logical cores, 7.8 GiB RAM, Debian 12,
 kernel 6.16.9, virtio block device `/dev/vdd` mounted at `/workspace` (`df`
 reports ext4; the environment-line probe renders the `stat -f` magic as
-ext2/ext3). ForgeFS commit `63fa098`, release profile, `forge 0.1.0`, rustc
+ext2/ext3). ForgeFS commit `5a7017a`, release profile, `forge 0.3.0`, rustc
 1.97.0. Git 2.39.5. SQLite `journal_mode=WAL`, `synchronous=FULL`, Linux
 `fsync` path. Cold run class, fresh repository per repetition on both sides.
 
-Workload W7 (W1 logical shape): 32 agents, 4 workers, 5 fresh-repository
+Precondition, published because the document demands it rather than because it
+was convenient: every configuration ran under `/workspace/w7-final/work` on
+`/dev/vdd` (ext4, `rw,relatime,discard`), and 200 `fsync`s on that filesystem
+moved the device flush count by 200 -- **ratio 1.000, barriers reaching**. The
+sandbox mounts `nobarrier` by default; `sudo mount -o remount,barrier
+/workspace` cleared it first.
+
+Workload W7 (W1 logical shape): 32 agents, 4 workers, 9 fresh-repository
 repetitions per configuration. Medians are run-level medians (`median_low`,
 so every published figure was observed in some repetition).
 
 | Configuration | Durability | ops/s | p50 ms | p95 ms | p99 ms | max ms |
 |---|---|---|---|---|---|---|
-| ForgeFS, `forge bench` (in-process threads) | synchronous=FULL, object file+dir fsync | 462.9 | 8.39 | 10.17 | 12.86 | 12.86 |
-| ForgeFS through the `forge` CLI (3 execs/agent) | synchronous=FULL, object file+dir fsync | 198.3 | 19.00 | 28.51 | 39.71 | 39.71 |
-| Git worktrees (2 execs/agent) | git as shipped: no fsync config set | 289.2 | 14.11 | 19.51 | 22.24 | 22.24 |
-| Git worktrees (2 execs/agent) | `core.fsync=all`, `core.fsyncMethod=fsync` | 283.3 | 12.65 | 20.44 | 25.14 | 25.14 |
+| ForgeFS, `forge bench` (in-process threads) | synchronous=FULL, object file+dir fsync | 245.8 | 15.08 | 19.12 | 20.61 | 20.61 |
+| ForgeFS through the `forge` CLI (3 execs/agent) | synchronous=FULL, object file+dir fsync | 131.4 | 27.12 | 40.09 | 57.97 | 57.97 |
+| Git worktrees (2 execs/agent) | git as shipped: no fsync config set | 344.9 | 10.65 | 15.79 | 18.10 | 18.10 |
+| Git worktrees (2 execs/agent) | `core.fsync=all`, `core.fsyncMethod=fsync` | 254.7 | 14.06 | 20.21 | 23.34 | 23.34 |
 
 Durability barriers observed for one agent operation, counted by
 `LD_PRELOAD`-interposing `fsync`/`fdatasync` and classifying each descriptor
@@ -137,6 +152,54 @@ The ForgeFS census spans two CLI processes, each of which performs its own
 open-time object/tmp directory durability setup, so 6/20 is an upper bound on
 one in-process checkin. The gate reads only presence or absence of a barrier
 class, which that overcount cannot flip.
+
+Raw per-repetition JSON for all nine repetitions of all four configurations is
+published under `docs/bench-results/w7-5a7017a/`, along with the barrier-reach
+record and the environment line.
+
+### Correction: the superseded `w7-63fa098` run
+
+The earlier results in `docs/bench-results/w7-63fa098/` are **withdrawn as a
+comparison**. Their per-repetition JSON is kept, because the raw output of a
+run is not deleted for being wrong, but the table they supported should not be
+quoted.
+
+Two defects, in order of size:
+
+1. **The ForgeFS and Git rows were on different filesystems.**
+   `scripts/w7-git-comparator.sh` invoked `forge bench` without `--scratch`,
+   so `forge bench` built its workspace under `$TMPDIR` -- on that box the
+   container's overlay root -- while the `forge` CLI row and both Git rows ran
+   under `--out .../work` on the ext4 volume. Only the in-process ForgeFS row
+   was affected, and it was affected by a lot.
+
+   Measured directly, one box, one binary, one commit, barriers reaching, 5
+   repetitions per run and 3 runs of each variant:
+
+   | row | `forge bench` on `$TMPDIR` (old) | all rows on one filesystem (fixed) |
+   |---|---|---|
+   | ForgeFS, `forge bench` | 405.7 / 342.5 / 364.8 | 179.8 / 195.6 / 211.1 |
+   | ForgeFS, `forge` CLI | 115.9 / 118.4 / 120.8 | 129.2 / 124.9 / 126.8 |
+   | Git worktrees, default | 251.4 / 262.7 / 272.1 | 270.8 / 306.3 / 303.0 |
+   | Git worktrees, durable | 210.2 / 197.9 / 212.6 | 204.1 / 262.4 / 215.2 |
+
+   The three rows that already shared a directory do not move. The one that
+   did not, halves. In isolation the same `forge bench` invocation measured
+   642 ops/s (median of 5) on the overlay against 197 ops/s on
+   `/workspace` -- a 3.3x difference that has nothing to do with ForgeFS.
+
+   The direction matters: the defect inflated the single row in which ForgeFS
+   appeared to beat Git, and it did not touch the rows in which ForgeFS loses.
+   A benchmark that can only err in its author's favour is the failure mode
+   this document exists to prevent.
+
+2. **Barrier reach was never recorded for that run.** The environment line has
+   no field for it, and the W7 section did not state it. The old text read the
+   near-free `core.fsync=all` (about 2%) as evidence that "this virtio device
+   is not paying for a real cache flush". On the same device class with
+   barriers proved reaching, `core.fsync=all` costs Git 26% (344.9 -> 254.7).
+   The comparator now probes the flush count itself and prints the result
+   above the table, and labels the table plainly when barriers do not reach.
 
 ### Equivalence verdict
 
@@ -156,27 +219,33 @@ honest state of the comparison, not a placeholder.
 ### What the numbers say, without decoration
 
 - Compared like for like -- one process invocation per agent step, which is
-  how an agent orchestrator drives either tool -- **ForgeFS loses**: 198.3
-  ops/s against 289.2 (git default) and 283.3 (git durable). ForgeFS is
+  how an agent orchestrator drives either tool -- **ForgeFS loses**: 131.4
+  ops/s against 344.9 (git default) and 254.7 (git durable). ForgeFS is
   doing strictly more durability work in that row, but a slower row is a
   slower row.
-- ForgeFS wins only in the in-process `forge bench` row, and that row is not
-  comparable to Git on process model. The no-op Git exec floor on this box
-  measured 1639.2 ops/s (p50 2.20 ms) under the same driver.
-- `core.fsync=all` cost Git about 2% here. A barrier that nearly free means
-  this virtio device is not paying for a real cache flush. Do not carry these
-  numbers to hardware where `fsync` is expensive: there ForgeFS issues far
-  more barriers per operation than Git and would be expected to lose by more,
-  not less. Re-run the comparator on the target device.
+- **ForgeFS also loses the in-process row**, once that row is measured on the
+  same filesystem as everything else: 245.8 against 344.9. It edges ahead of
+  git at `core.fsync=all` (245.8 against 254.7 -- inside the run-to-run spread,
+  so call it level), and even that comparison hands ForgeFS the process model:
+  `forge bench` uses in-process threads while Git execs twice per agent. There
+  is currently no configuration of this workload on this box in which ForgeFS
+  is faster than Git.
+- The no-op Git exec floor on this box measured 1176.1 ops/s (p50 2.99 ms)
+  under the same driver. Subtract it before attributing any part of the CLI
+  row's gap to storage design.
+- `core.fsync=all` costs Git 26% here. Do not carry these numbers to hardware
+  where `fsync` is expensive: there ForgeFS issues far more barriers per
+  operation than Git and would be expected to lose by more, not less. Re-run
+  the comparator on the target device.
 - Worktree and branch creation is excluded from the Git timed region (median
-  0.807 s for 32 worktrees, measured and reported separately), while ForgeFS
+  0.562 s for 32 worktrees, measured and reported separately), while ForgeFS
   capability grant and session open are inside the W1 timed region. That
   exclusion favours Git.
 
 Correctness gates passed in every repetition: `fsck --full` inside `forge
 bench`, `forge fsck --full` for the CLI configuration, and `git fsck --strict`
 plus a per-agent check that each branch carries exactly one new commit with
-the exact bytes. Raw per-repetition JSON for all five repetitions of all four
+the exact bytes. Raw per-repetition JSON for all nine repetitions of all four
 configurations is what the script writes to its `--out` directory; publish it
 with any claim made from this section.
 

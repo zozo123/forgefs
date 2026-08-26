@@ -1,0 +1,13 @@
+{
+  "available": true,
+  "device": "254:48",
+  "flush_delta": 200,
+  "fstype": "ext4",
+  "mountpoint": "/workspace",
+  "options": "rw,relatime,discard",
+  "path": "/workspace/w7-final/work",
+  "ratio": 1.0,
+  "samples": 200,
+  "source": "/dev/vdd",
+  "verdict": "reaching"
+}

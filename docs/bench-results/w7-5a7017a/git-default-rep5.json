@@ -1,0 +1,41 @@
+{
+  "agents": 32,
+  "barriers_per_agent_op": {
+    "available": true,
+    "dir": 0,
+    "file": 0,
+    "scope": "git add + git commit for one agent, mode=default",
+    "total": 0,
+    "unknown": 0
+  },
+  "durability_config_applied": [],
+  "durability_config_observed": [],
+  "durability_mode": "default",
+  "exec_floor": {
+    "latency": {
+      "max_us": 3776,
+      "n": 32,
+      "p50_us": 2670,
+      "p95_us": 3144,
+      "p99_us": 3776
+    },
+    "ops_s": 1619.5651568875787,
+    "wall_s": 0.019758389999879
+  },
+  "execs_per_agent_op": 2,
+  "fsck": "ok",
+  "git_version": "git version 2.39.5",
+  "latency": {
+    "max_us": 19468,
+    "n": 32,
+    "p50_us": 10610,
+    "p95_us": 15786,
+    "p99_us": 19468
+  },
+  "ops_s": 355.0409040399362,
+  "side": "git-worktree",
+  "wall_s": 0.09013046000018221,
+  "workers": 4,
+  "workload": "W7 (ForgeFS W1 logical shape)",
+  "worktree_setup_wall_s": 0.6755862190002517
+}

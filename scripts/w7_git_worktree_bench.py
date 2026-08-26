@@ -395,6 +395,12 @@ def cmd_selftest(_args):
         )[0],
         "non-comparable",
     )
+    check("barrier reaching", classify_barrier_reach(200, 200)[0], "reaching")
+    check("barrier near-reaching", classify_barrier_reach(101, 200)[0], "reaching")
+    check("barrier discarded", classify_barrier_reach(0, 200)[0], "not-reaching")
+    check("barrier partial", classify_barrier_reach(3, 200)[0], "not-reaching")
+    check("barrier unknown", classify_barrier_reach(None, 200)[0], "unknown")
+
     if failures:
         for f in failures:
             print("w7 selftest FAIL: {}".format(f), file=sys.stderr)
@@ -472,6 +478,111 @@ def cmd_parse_forge(args):
     return 0
 
 
+def classify_barrier_reach(delta, samples):
+    """Pure rule: did N fsyncs become about N device flushes?
+
+    docs/BENCH.md: a durability measurement taken on a filesystem that
+    discards write barriers is not a measurement. This is the rule that
+    decides, and it is deliberately not a judgement call.
+    """
+    if delta is None or samples <= 0:
+        return ("unknown", None)
+    ratio = float(delta) / float(samples)
+    if ratio >= 0.5:
+        return ("reaching", ratio)
+    return ("not-reaching", ratio)
+
+
+def _diskstats_flushes(major, minor):
+    """Field 19 of the matching /proc/diskstats row: flush requests completed."""
+    try:
+        with open("/proc/diskstats", "r", encoding="utf-8") as fh:
+            for raw in fh:
+                fields = raw.split()
+                if len(fields) < 19:
+                    continue
+                if int(fields[0]) == major and int(fields[1]) == minor:
+                    return int(fields[18])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _mount_line(path):
+    best = None
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as fh:
+            for raw in fh:
+                fields = raw.split()
+                if len(fields) < 4:
+                    continue
+                point = fields[1]
+                if path == point or path.startswith(point.rstrip("/") + "/"):
+                    if best is None or len(point) > len(best[1]):
+                        best = (fields[0], point, fields[2], fields[3])
+    except OSError:
+        return None
+    return best
+
+
+def measure_barrier_reach(path, samples=200):
+    """Establish whether fsync on this filesystem reaches the device."""
+    path = os.path.realpath(path)
+    record = {"path": path, "samples": samples}
+    mount = _mount_line(path)
+    if mount:
+        record["source"], record["mountpoint"] = mount[0], mount[1]
+        record["fstype"], record["options"] = mount[2], mount[3]
+    if not os.path.exists("/proc/diskstats"):
+        record["available"] = False
+        record["reason"] = "/proc/diskstats is unavailable on this platform"
+        record["verdict"], record["ratio"] = "unknown", None
+        return record
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        record["available"] = False
+        record["reason"] = str(exc)
+        record["verdict"], record["ratio"] = "unknown", None
+        return record
+    major, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    record["device"] = "{}:{}".format(major, minor)
+    before = _diskstats_flushes(major, minor)
+    probe = os.path.join(path, ".w7-barrier-probe")
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            for _ in range(samples):
+                os.write(fd, b"x")
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+            os.unlink(probe)
+    except OSError as exc:
+        record["available"] = False
+        record["reason"] = str(exc)
+        record["verdict"], record["ratio"] = "unknown", None
+        return record
+    after = _diskstats_flushes(major, minor)
+    delta = None if before is None or after is None else after - before
+    record["available"] = delta is not None
+    if delta is None:
+        record["reason"] = "no /proc/diskstats row for device {}".format(record["device"])
+    record["flush_delta"] = delta
+    verdict, ratio = classify_barrier_reach(delta, samples)
+    record["verdict"], record["ratio"] = verdict, ratio
+    return record
+
+
+def cmd_barrier_reach(args):
+    record = measure_barrier_reach(args.path, args.samples)
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    print(json.dumps(record, sort_keys=True))
+    return 0
+
+
 def median_low(values):
     """docs/BENCH.md summarises run-level medians. median_low reports a value
     that was actually observed in some repetition instead of averaging two
@@ -533,8 +644,39 @@ def cmd_report(args):
 
     L = []
     add = L.append
+    reach = None
+    reach_path = os.path.join(out_dir, "barrier-reach.json")
+    if os.path.exists(reach_path):
+        with open(reach_path, "r", encoding="utf-8") as fh:
+            reach = json.load(fh)
+
     add("### W7 -- ForgeFS vs Git worktrees")
     add("")
+    if reach is not None:
+        add("Precondition, storage and barrier reach (docs/BENCH.md). All four")
+        add("configurations run under one directory tree, so every row below is on")
+        add("the same filesystem:")
+        add("")
+        add("```text")
+        add("work directory:   {}".format(reach.get("path", "unknown")))
+        add("filesystem:       {} on {} ({})".format(
+            reach.get("fstype", "unknown"),
+            reach.get("source", "unknown"),
+            reach.get("options", "unknown")))
+        add("fsync probe:      {} fsyncs moved device flush count by {}".format(
+            reach.get("samples"), reach.get("flush_delta")))
+        add("barrier reach:    {}".format(reach.get("verdict", "unknown")))
+        add("```")
+        add("")
+        if reach.get("verdict") == "not-reaching":
+            add("**This filesystem discards write barriers.** docs/BENCH.md: do not")
+            add("publish durability numbers from it. The table below is not a")
+            add("durability measurement.")
+            add("")
+        elif reach.get("verdict") != "reaching":
+            add("**Barrier reach could not be established here.** Treat the table")
+            add("below as unverified for durability.")
+            add("")
     add("Workload W7 (W1 logical shape): {} agents, {} workers, one small edit and".format(
         forge_runs[0]["agents"], args.workers))
     add("one commit per agent onto its own ref, {} fresh-repository repetitions per".format(len(forge_runs)))
@@ -776,6 +918,14 @@ def main(argv):
     rep.add_argument("--out-dir", required=True)
     rep.add_argument("--workers", type=int, required=True)
     rep.set_defaults(func=cmd_report)
+
+    br = sub.add_parser(
+        "barrier-reach", help="probe whether fsync reaches the device (Linux)"
+    )
+    br.add_argument("--path", required=True)
+    br.add_argument("--samples", type=int, default=200)
+    br.add_argument("--json-out", required=True)
+    br.set_defaults(func=cmd_barrier_reach)
 
     st = sub.add_parser("selftest", help="test the pure percentile and gate rules")
     st.set_defaults(func=cmd_selftest)

@@ -1070,20 +1070,29 @@ throughput. If you care about tail latency, oversubscribing the CPU is the first
 doing.
 
 **ForgeFS versus Git, stated against itself.** The checked-in comparator
-(`scripts/w7-git-comparator.sh`, protocol in [`docs/BENCH.md`](docs/BENCH.md)) was re-run for this
-release on the same box, 32 agents, 4 workers, 5 fresh repositories per configuration:
+(`scripts/w7-git-comparator.sh`, protocol in [`docs/BENCH.md`](docs/BENCH.md)) was re-run on the
+same box, 32 agents, 4 workers, 9 fresh repositories per configuration. Every row is on one
+filesystem (`/dev/vdd`, ext4), and 200 `fsync`s on it moved the device flush count by 200 before
+any figure below was taken:
 
 | Configuration | ops/s | p50 | p99 |
 |---|---:|---:|---:|
-| ForgeFS, in-process threads (`forge bench`) | 524.8 | 7.17 ms | 10.96 ms |
-| **ForgeFS through the `forge` CLI, 3 execs/agent** | **117.5** | 30.69 ms | 54.85 ms |
-| **Git worktrees, as shipped** | **244.1** | 13.11 ms | 30.68 ms |
-| **Git worktrees, `core.fsync=all core.fsyncMethod=fsync`** | **178.2** | 19.60 ms | 37.26 ms |
+| ForgeFS, in-process threads (`forge bench`) | 245.8 | 15.08 ms | 20.61 ms |
+| **ForgeFS through the `forge` CLI, 3 execs/agent** | **131.4** | 27.12 ms | 57.97 ms |
+| **Git worktrees, as shipped** | **344.9** | 10.65 ms | 18.10 ms |
+| **Git worktrees, `core.fsync=all core.fsyncMethod=fsync`** | **254.7** | 14.06 ms | 23.34 ms |
 
 **ForgeFS is slower**, against both Git configurations, on the row that describes how an
-orchestrator actually drives either tool. Read that as lower raw throughput under this protocol
-rather than as a like-for-like defeat, because ForgeFS is doing strictly more durability work —
-measured, not asserted, by `scripts/w7_fsync_probe.c` for one agent operation:
+orchestrator actually drives either tool — and it is slower in the in-process row too, which
+earlier tables did not show. Those tables ran `forge bench` on `$TMPDIR` while the Git worktrees
+sat on the repository disk; on this box that alone was a 3.3x difference, and it flattered exactly
+the one row ForgeFS used to win. The comparator now places all four configurations on one
+filesystem and publishes the barrier-reach probe with the numbers;
+[`docs/BENCH.md`](docs/BENCH.md) carries the correction and the paired measurement.
+
+Read the deficit as lower raw throughput under this protocol rather than as a like-for-like defeat,
+because ForgeFS is doing strictly more durability work — measured, not asserted, by
+`scripts/w7_fsync_probe.c` for one agent operation:
 
 | Path | file fsync | dir fsync |
 |---|---:|---:|
@@ -1094,7 +1103,7 @@ measured, not asserted, by `scripts/w7_fsync_probe.c` for one agent operation:
 so the script's own durability gate marks both Git rows **`non-comparable: durability
 mismatch/unknown`**, and **neither quotient is quoted here as a speed ratio**. Some of the gap is
 not storage at all: the same driver measured a bare `git rev-parse --verify HEAD` per agent at
-1893.9 ops/s, and each Git agent operation costs two more execs than that, so any deficit smaller
+1176.1 ops/s, and each Git agent operation costs two more execs than that, so any deficit smaller
 than that floor is process-model cost. Correctness was gated on both sides — ForgeFS `fsck --full`,
 Git `fsck --strict` plus a per-agent check that every branch carries exactly one new commit with the
 exact bytes — and all runs passed. `git version 2.39.5`.
