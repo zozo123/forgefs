@@ -76,7 +76,7 @@ fn payload() -> Vec<u8> {
 }
 
 #[test]
-fn one_large_blob_costs_a_measured_multiple_of_itself() {
+fn large_blob_cost_and_raw_cache_residency_are_measured_and_bounded() {
     let a = tempdir().unwrap();
     let store = Store::open(a.path()).unwrap();
     let data = payload();
