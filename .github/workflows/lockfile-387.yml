@@ -1,0 +1,39 @@
+name: lockfile-387
+
+on:
+  push:
+    branches:
+      - security/387-trim-dalek-rng-v2
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Regenerate the resolved feature graph
+        run: cargo update -p ed25519-dalek --precise 2.2.0
+      - name: Prove the lockfile delta is only the unused Dalek RNG edge
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          diff = subprocess.check_output(["git", "diff", "--", "Cargo.lock"], text=True)
+          removed = [line for line in diff.splitlines() if line.startswith("-") and not line.startswith("---")]
+          added = [line for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
+          expected = ['- "rand_core 0.6.4",']
+          if removed != expected or added:
+              raise SystemExit(f"unexpected Cargo.lock delta\n{diff}")
+          print(diff)
+          PY
+      - name: Commit regenerated lockfile
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'build: regenerate lockfile without Dalek rand_core (#387)'
+          git push origin HEAD:security/387-trim-dalek-rng-v2
