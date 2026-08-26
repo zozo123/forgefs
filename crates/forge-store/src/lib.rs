@@ -200,6 +200,61 @@ pub fn durable_sync_dir_at(path: &Path, point: DurabilityBarrier) -> Result<()> 
     Ok(())
 }
 
+const OBJECT_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Maximum encoded object bytes retained by one `Store`'s hot raw-object cache.
+///
+/// The cache remains capped at 256 entries as well. The 64 MiB byte ceiling is
+/// the same measured threshold at which the CLI already warns about a large
+/// blob (docs/CHUNKING.md). An individual object larger than the budget is read
+/// normally and simply not cached. This is memory policy only: trust-boundary
+/// reads still bypass the cache and re-hash durable bytes (I15).
+pub const OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+struct ObjectCache {
+    entries: LruCache<ObjectId, Arc<[u8]>>,
+    bytes: usize,
+}
+
+impl ObjectCache {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(OBJECT_CACHE_MAX_ENTRIES).unwrap()),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, id: &ObjectId) -> Option<&Arc<[u8]>> {
+        self.entries.get(id)
+    }
+
+    fn put(&mut self, id: ObjectId, value: Arc<[u8]>) {
+        let incoming = value.len();
+        if incoming > OBJECT_CACHE_MAX_BYTES {
+            self.pop(&id);
+            return;
+        }
+
+        self.bytes += incoming;
+        if let Some((_id, old)) = self.entries.push(id, value) {
+            self.bytes -= old.len();
+        }
+        while self.bytes > OBJECT_CACHE_MAX_BYTES {
+            let Some((_id, old)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= old.len();
+        }
+        debug_assert!(self.bytes <= OBJECT_CACHE_MAX_BYTES);
+    }
+
+    fn pop(&mut self, id: &ObjectId) {
+        if let Some(old) = self.entries.pop(id) {
+            self.bytes -= old.len();
+        }
+    }
+}
+
 /// The object plane is a type parameter, not a file layout. `Store` is written
 /// against [`ObjectStore`] and defaults to the only production implementation,
 /// so the bare name `Store` still means `Store<LocalBlobStore>` everywhere it
@@ -213,7 +268,7 @@ pub struct Store<O: ObjectStore = LocalBlobStore> {
     /// holds the objects.
     root: PathBuf,
     trees: Mutex<LruCache<ObjectId, Arc<Tree>>>,
-    blob_cache: Mutex<LruCache<ObjectId, Arc<[u8]>>>,
+    blob_cache: Mutex<ObjectCache>,
     cache: CacheCounters,
 }
 
@@ -285,7 +340,7 @@ impl<O: ObjectStore> Store<O> {
             meta,
             root,
             trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
-            blob_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+            blob_cache: Mutex::new(ObjectCache::new()),
             cache: CacheCounters::default(),
         }
     }
