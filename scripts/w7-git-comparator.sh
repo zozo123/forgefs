@@ -40,6 +40,11 @@
 #                  the docs/BENCH.md minimum for a published claim)
 #   --out DIR      results directory; must not already exist
 #
+# All four configurations are placed under DIR/work so that every row is
+# measured on one filesystem, and the barrier reach of that filesystem is
+# probed and published with the numbers. A ForgeFS row taken on $TMPDIR and a
+# git row taken on the repository disk are not comparable to each other.
+#
 # Writes DIR/w7-report.md plus every unedited per-repetition JSON, because
 # docs/BENCH.md requires all repetitions and not just the best one.
 set -euo pipefail
@@ -94,6 +99,14 @@ mkdir -p "$work_dir"
 
 # The pure rules the report depends on are tested before anything is measured.
 python3 "$harness" selftest >"$out_dir/selftest.txt" || die "harness selftest failed"
+
+# --- precondition: barrier reach for the one filesystem every row runs on ---
+# docs/BENCH.md refuses durability numbers from a filesystem that discards
+# write barriers. Establish it here, for the directory all four configurations
+# use, and publish the result beside the numbers rather than beneath them.
+python3 "$harness" barrier-reach --path "$work_dir" \
+	--json-out "$out_dir/barrier-reach.json" >/dev/null ||
+	die "barrier reach probe failed"
 
 # --- durability barrier probe --------------------------------------------
 # Optional, Linux/glibc only. Without it the gate reports durability unknown
@@ -164,7 +177,12 @@ unset FORGE_DIR FORGE_CAP
 rep=1
 while [ "$rep" -le "$reps" ]; do
 	raw="$out_dir/forge-rep$rep.txt"
-	if ! "$forge_bin" bench --agents "$agents" --shared 0 --workers "$workers" >"$raw" 2>&1; then
+	# --scratch, not the default: without it `forge bench` builds its workspace
+	# under $TMPDIR, which is frequently a different filesystem from the git
+	# worktrees below. Measuring the two sides on two filesystems is not a
+	# comparison, and the difference is not small.
+	if ! "$forge_bin" bench --agents "$agents" --shared 0 --workers "$workers" \
+		--scratch "$work_dir/forgebench-rep$rep" >"$raw" 2>&1; then
 		cat "$raw" >&2
 		die "forge bench failed on repetition $rep"
 	fi

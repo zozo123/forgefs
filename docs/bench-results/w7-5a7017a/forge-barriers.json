@@ -1,0 +1,6 @@
+{
+  "available": true,
+  "file": 6,
+  "dir": 20,
+  "scope": "forge write + forge checkin for one agent (two CLI processes)"
+}
