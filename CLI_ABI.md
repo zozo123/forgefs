@@ -107,6 +107,53 @@ Automation that gets exit 1 from `checkin` re-runs it once per named mount. The
 refusal names the mount the CALLER named, never another one: the mount is
 resolved by exact name before any of this is decided.
 
+## Moving a path: `forge mv`
+
+`forge mv --ns <ns> <from> <to> [--expect-oid <oid>]` introduces no exit code.
+On success it prints one line and exits 0:
+
+```
+moved <from> <to> <blob|tree> <source-oid> entries=<n>
+```
+
+`<source-oid>` is what the source resolved to and `entries` is the number of
+destination overlay rows staged -- one per moved FILE, so a directory move
+reports its file count and a blob move reports `1`.
+
+| Outcome | Exit |
+|---|---:|
+| the move was staged | 0 |
+| `<from>` resolves to nothing through this session | 1 |
+| either endpoint is the mount root, the two are the same path, or one is inside the other | 1 |
+| `<from>` and `<to>` resolve through different mounts | 1 |
+| the mount is read-only, or the capability may not read the spec or write the ref | 1 |
+| `--expect-oid` names an object the source does not resolve to | 4 |
+
+`mv` stages; it does not publish. The move becomes durable at the next
+`checkin` of that mount, as one overlay fold, one Contribution and one ref CAS
+(I5, I10, I19) -- exactly as a `write` would.
+
+What `mv` adds over `write` plus a delete is that the two overlay mutations are
+ONE catalog transaction (I24). Between two separate mutations the session's own
+reads, and any other process reading the same namespace, see the content at both
+paths, and losing the process there leaves that duplicate staged with no record
+that a move was intended. `cli_mv_crash.rs` kills the process at exactly that
+point and shows the cold reopen is the state before the move, and shows the
+two-transaction spelling durably duplicating instead.
+
+A move never spans mounts. Each mount pins its own ref and publishes separately
+(I19), so a cross-mount move would be two publications with no atomicity between
+them; it is refused, naming both mounts, rather than half-applied. A caller that
+wants that writes the copy and the delete itself and owns what it means.
+
+`--expect-oid` is the caller's assumption about what it is moving, checked
+against the blob or tree oid the source resolves to. A mismatch is exit 4 --
+the stale-observation row -- because the caller is describing a repository state
+that is no longer there, which is the same thing a stale observation says.
+
+The daemon serves this verb as `ns.mv` with fields `ns`, `from`, `to`,
+`expect_oid`, and answers `{"from","to","kind","source","entries"}`.
+
 ## Read-only checking: `forge fsck` and `forge verify`
 
 Neither verb introduces an exit code. Both take a structurally read-only open,

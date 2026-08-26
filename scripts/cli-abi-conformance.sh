@@ -263,6 +263,10 @@ run --dir "$A" --cap "$A_INT" seal main --tag abi-seal --attest
 # Precondition for the duplicate-branch row below.
 run --dir "$A" --cap "$A_ROOT" branch main heads/abi-dup
 
+# Precondition for the `forge mv` rows below: a session of its own, so the move
+# rows never perturb the overlay the other fixture-A rows depend on.
+A_MVNS="$(capture --dir "$A" --cap "$A_ROOT" session open --from=main | tr -d '\n')"
+
 A_NONUTF8="$WORK/non-utf8.cap"
 printf '\377\376bad' >"$A_NONUTF8"
 
@@ -397,6 +401,9 @@ check abi/0-fsck-full blocking 0 "" -- --dir "$A" --cap "$A_ROOT" fsck --full
 check abi/0-fsck-json blocking 0 "" -- --dir "$A" --cap "$A_ROOT" fsck --full --json
 check abi/0-verify-sealed-tag blocking 0 "" -- --dir "$A" --cap "$A_ROOT" verify abi-seal
 check abi/0-show-sealed-tag blocking 0 "" -- --dir "$A" --cap "$A_ROOT" show tags/abi-seal
+check abi/0-mv-blob blocking 0 \
+	"a move is staged atomically and publishes through the ordinary checkin (I24)" -- \
+	--dir "$A" --cap "$A_ROOT" mv --ns "$A_MVNS" /abi.txt /abi-moved.txt
 
 # --- exit 1: denied / capability / input / not-found ----------------------
 # I14: no ambient root authority.
@@ -408,6 +415,13 @@ check abi/1-write-without-payload blocking 1 "" -- --dir "$A" --cap "$A_ROOT" wr
 check abi/1-malformed-oid-spec blocking 1 "" -- --dir "$A" --cap "$A_ROOT" show oid:not-a-hex-object-id
 check abi/1-bad-tag-charset blocking 1 "" -- --dir "$A" --cap "$A_INT" seal main --tag 'bad!tag'
 check abi/1-no-repository-here blocking 1 "" -- --dir "$E" --cap "$A_ROOT" refs
+# I24: a move that cannot be made atomically is refused, never half-applied.
+check abi/1-mv-absent-source blocking 1 "" -- \
+	--dir "$A" --cap "$A_ROOT" mv --ns "$A_MVNS" /absent.txt /moved.txt
+check abi/1-mv-mount-root blocking 1 "" -- \
+	--dir "$A" --cap "$A_ROOT" mv --ns "$A_MVNS" / /moved
+check abi/1-mv-same-path blocking 1 "" -- \
+	--dir "$A" --cap "$A_ROOT" mv --ns "$A_MVNS" /abi-moved.txt /abi-moved.txt
 # Raw tree resolution stays rejected at the API boundary, not silently applied.
 check abi/1-raw-merge-resolution blocking 1 "" -- \
 	--dir "$A" --cap "$A_INT" merge --into=main --from "heads/agents/anon/$A_NS" --resolved "$ZERO_OID"
@@ -488,6 +502,10 @@ check abi/4-merge-conflict blocking 4 "" -- \
 	--dir "$B" --cap "$B_INT" merge --into=main --from "heads/agents/anon/$B_B"
 check abi/4-stale-observation blocking 4 "" -- \
 	--dir "$C" --cap "$C_BOB" checkin --ns "$C_BOBNS" -m 'stale notes'
+# I24: --expect-oid is an assumption about the source, and a wrong one is the
+# same stale-observation row -- the caller described a state that is not there.
+check abi/4-mv-expect-oid-mismatch blocking 4 "" -- \
+	--dir "$A" --cap "$A_ROOT" mv --ns "$A_MVNS" /abi-moved.txt /moved.txt --expect-oid "$ZERO_OID"
 # A seal is a claim about a ref, so it CASes the ref it names and a head that
 # moved inside the seal window is the same stale observation (#331). The race
 # itself needs the debug-only FORGEFS_TEST_SEAL_CAS_BARRIER seam, which a

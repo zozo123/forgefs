@@ -1,6 +1,6 @@
 use crate::Forge;
 use forge_protocol::{read_frame_body, read_frame_len_after, write_frame, Request, Response};
-use forge_types::{CasResult, Error, Result};
+use forge_types::{CasResult, Error, ObjectId, Result};
 use serde_json::{json, Value};
 use std::io::{BufReader, BufWriter, Read};
 use std::net::{Shutdown, SocketAddr};
@@ -369,6 +369,8 @@ pub const DAEMON_OPS: &[(&str, &[&str])] = &[
     ("ns.read", &["ns", "path"]),
     // `forge ls --ns [path]`
     ("ns.ls", &["ns", "path"]),
+    // `forge mv --ns <from> <to> [--expect-oid]`
+    ("ns.mv", &["ns", "from", "to", "expect_oid"]),
     // `forge checkin --ns [--mount] [-m]`
     ("ns.checkin", &["ns", "mount", "msg"]),
     // `forge mount --ns <path> <spec> [--rw]`
@@ -513,6 +515,30 @@ fn dispatch_inner(forge: &Forge, req: &Request) -> Result<Value> {
                 .into_iter()
                 .map(|(n, k, id, x)| json!({"name": n, "kind": k, "id": id, "exec": x}))
                 .collect::<Vec<_>>()))
+        }
+        "ns.mv" => {
+            // Exactly `forge mv --ns <from> <to> [--expect-oid]`. The optional
+            // argument is optional here too, and a present-but-unparseable
+            // value is the same input error the CLI reports.
+            let expect = match req.body.get("expect_oid") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(v)) => Some(ObjectId::from_hex(v)?),
+                Some(_) => return Err(Error::Invalid("expect_oid must be a string".into())),
+            };
+            let r = forge.rename(
+                &cap,
+                s(&req.body, "ns")?,
+                s(&req.body, "from")?,
+                s(&req.body, "to")?,
+                expect,
+            )?;
+            Ok(json!({
+                "from": r.from,
+                "to": r.to,
+                "kind": r.kind,
+                "source": r.source.hex(),
+                "entries": r.entries,
+            }))
         }
         "ns.checkin" => {
             // Exactly `forge checkin --ns [--mount] [-m]`, defaults included.
