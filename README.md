@@ -19,7 +19,7 @@ Two or more of these should be true before ForgeFS is worth its cost:
 - You must be able to prove later exactly what shipped.
 
 If you have one agent and one checkout, use Git. It is smaller, you already know it, and on the box
-measured below a `forge` CLI checkin is slower than a `git commit` in a worktree (see
+measured below a `forge` CLI checkin has lower raw throughput than a `git commit` in a worktree (see
 [What it costs](#what-it-costs) — the comparison is not durability-equivalent in Git's favour).
 ForgeFS buys isolation, recorded reasoning, and provenance. It costs durability barriers per
 publication, and it is not a POSIX filesystem.
@@ -44,8 +44,11 @@ sudo install forge-$V-$T/forge /usr/local/bin/
 forge --version
 ```
 
-Only `$V` moves. Those exact commands, run on Debian 12 with `V=0.3.0` while this page was being
-written, printed:
+Only `$V` moves — and the transcripts below are `V=0.3.0` runs on Debian 12, deliberately. **This
+file ships inside the v0.4.0 tarball, so it cannot quote v0.4.0's own checksums or attestation: they
+do not exist until after the artifact containing this sentence has been built.** What is shown is
+therefore the previous release, executed rather than remembered, with only `$V` differing from what
+you will run. Those exact commands printed:
 
 ```text
 forge-0.3.0-x86_64-unknown-linux-gnu.tar.gz: OK
@@ -1006,14 +1009,17 @@ forge --cap ./demo/.forge/keys/root.cap bench --agents 32 --shared 16 --workers 
 
 `forge bench --agents 32 --shared 16 --workers W`, median of 5:
 
-| W | private checkin ops/s | p50 | p99 | shared stampede p50 | device flushes / run | SQLite commits / run |
+| W | private checkin ops/s | p50 | p99 | shared stampede p50 | device flushes / run | SQLite `txn_count` / run |
 |---:|---:|---:|---:|---:|---:|---:|
 | 4 | 255.6 | 14.96 ms | 18.41 ms | 6.98 ms | 1378 | 239 |
 | 16 | 339.3 | 42.49 ms | 57.68 ms | 30.21 ms | 1107 | 188 |
 | 64 | 286.8 | 102.21 ms | 109.02 ms | 35.45 ms | 1095 | 176 |
 
-Device flushes are the `/proc/diskstats` flush-request delta across each run; SQLite commits are the
-`txn_count` the run reports. Serial checkin — one agent at a time, true operation latency — had p50
+Device flushes are the `/proc/diskstats` flush-request delta across each run. `txn_count` is a
+**process-lifetime** counter spanning init, both workloads, merge/seal, verify and `fsck` — it is
+not a per-checkin number and must never be divided by one. It is in the table because every run does
+exactly the same work, so the whole-run totals are comparable across `W` and nothing else here is;
+treat it as a diagnostic that shows *direction*, never as a measurement of an operation. Serial checkin — one agent at a time, true operation latency — had p50
 between **6.45 ms and 19.35 ms** across the fifteen runs. The shared stampede returned
 `updated=1 forked=15` in all fifteen, and every run ended `busy=0 denied=0 stale=0 conflict=0`,
 with lifetime `fsync_file=351` and `fsync_dir` between 892 and 896 regardless of worker count.
@@ -1033,10 +1039,11 @@ publish → fsync(parent directory)`. Lifetime counters for the run are `fsync_f
 `fsync_dir≈893` — **directory** barriers outnumber file barriers 2.5 to 1, and that is where the
 cost sits.
 
-**Group-committing the SQLite catalog is a real win, and it is visible in the counters.** As
-concurrency rises the number of durable SQLite commits per run falls 239 → 188 → 176 and total
-device flushes fall 1378 → 1095, because N waiting writers now share one WAL fsync
-(`synchronous=FULL` untouched). The change that introduced it measured **+33% throughput at 16
+**Group-committing the SQLite catalog is a real win, and the counters move the way it predicts.**
+As concurrency rises the whole-run `txn_count` falls 239 → 188 → 176 and total device flushes fall
+1378 → 1095, because N waiting writers now share one WAL fsync (`synchronous=FULL` untouched). Those
+are lifetime totals for identical runs, so they establish the direction, not the size, of the
+effect. The change that introduced it measured **+33% throughput at 16
 concurrent writers**, 2.82x fewer durable commits, and mutex wait down from 31.6 ms to 9.5 ms, on
 the machine where it landed. It is absent at W=1 and W=2, exactly as the mechanism predicts;
 [`docs/BENCH.md`](docs/BENCH.md) explains why membership in a shared fsync is structural rather than
@@ -1072,9 +1079,10 @@ release on the same box, 32 agents, 4 workers, 5 fresh repositories per configur
 | **Git worktrees, as shipped** | **244.1** | 13.11 ms | 30.68 ms |
 | **Git worktrees, `core.fsync=all core.fsyncMethod=fsync`** | **178.2** | 19.60 ms | 37.26 ms |
 
-**ForgeFS loses**, against both Git configurations, on the row that describes how an orchestrator
-actually drives either tool. It is also doing strictly more durability work — measured, not
-asserted, by `scripts/w7_fsync_probe.c` for one agent operation:
+**ForgeFS is slower**, against both Git configurations, on the row that describes how an
+orchestrator actually drives either tool. Read that as lower raw throughput under this protocol
+rather than as a like-for-like defeat, because ForgeFS is doing strictly more durability work —
+measured, not asserted, by `scripts/w7_fsync_probe.c` for one agent operation:
 
 | Path | file fsync | dir fsync |
 |---|---:|---:|
