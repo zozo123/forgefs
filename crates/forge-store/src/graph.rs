@@ -5,7 +5,66 @@ use forge_core::{decode_object_type, Blob, Commit, Conflict, Contribution, Snaps
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub const MAX_GRAPH_OBJECTS: usize = 1_000_000;
+/// Most distinct objects one graph WALK will hold in memory at a time.
+///
+/// This is a bound on a TRAVERSAL, not on an object (#359). `MAX_TREE_ENTRIES`
+/// says "no VERSION 1 Tree may hold more than N entries", so bytes that exceed
+/// it cannot have come from any encoder this binary contains and reading them
+/// back IS damage. Nothing of the kind is true here: a repository grows past a
+/// million objects through ordinary `import` and `checkin`, every object file
+/// still rehashes to its own name and every typed edge still resolves. So
+/// exceeding this bound is `Error::Invalid` -- exit 1, this build will not walk
+/// that much in one pass -- and never `Error::Corrupt`, exit 2, which
+/// CLI_ABI.md reserves for damaged bytes. `fsck` and `gc` are exactly what an
+/// operator reaches for when a repository has grown large, and they were the
+/// two commands that answered "corrupt".
+///
+/// The bound is not decorative and is not removed. Every walk in the tree is a
+/// whole-set walk: `reachable_graph_verified` returns one `Vec` of everything
+/// reachable, `gc::walk` fills one `HashSet` of it, and `fsck::verify_graph`
+/// one `HashMap`. None is incremental, resumable or spillable, so removing the
+/// bound converts a refusal that names itself into an OOM kill that reports no
+/// exit code at all. Raising it is the operator's call, because only the
+/// operator knows the machine: see `MAX_GRAPH_OBJECTS_ENV`.
+pub const DEFAULT_MAX_GRAPH_OBJECTS: usize = 1_000_000;
+
+/// Overrides `DEFAULT_MAX_GRAPH_OBJECTS` for one process.
+///
+/// Read once per `GraphWorkQueue`, which is once per walk, and never on a hot
+/// path. A value that is absent, unparseable or zero takes the default rather
+/// than failing the command: this variable can only make a walk that already
+/// refuses succeed, so a typo must not be able to break a walk that was fine.
+///
+/// Walk state costs roughly a hundred bytes per distinct object, so the
+/// default ceiling is worth ~100 MB of resident memory and raising it is a
+/// statement about available RAM. Tests use it to exercise the classification
+/// without a million real objects.
+pub const MAX_GRAPH_OBJECTS_ENV: &str = "FORGEFS_MAX_GRAPH_OBJECTS";
+
+/// The walk ceiling in force for this process.
+pub fn max_graph_objects() -> usize {
+    std::env::var(MAX_GRAPH_OBJECTS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_GRAPH_OBJECTS)
+}
+
+/// The one wording for "this build will not walk a graph this large".
+///
+/// `Invalid`, so it is exit 1 and not exit 2: the request is refused, nothing
+/// is being reported about the repository's bytes. It names the ceiling, says
+/// the bytes are intact, and names the two things an operator can do.
+fn walk_limit_exceeded(limit: usize) -> Error {
+    Error::Invalid(format!(
+        "object graph walk reached this build's ceiling of {limit} objects. \
+         The repository is not corrupt; this is a memory bound on the WALK, not \
+         a bound on any object, and no object was found damaged. Re-run with \
+         {MAX_GRAPH_OBJECTS_ENV}=<n> above {limit} (the walk holds roughly 100 \
+         bytes per object, so budget that much RAM), or reduce what is reachable \
+         -- `forge gc --dry-run` reports it -- and re-run. See docs/GC.md."
+    ))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphExpectation {
@@ -91,23 +150,46 @@ fn expectation_key(expectation: GraphExpectation) -> u8 {
 ///
 /// Repeated edges do not consume work, while incompatible expectations for
 /// one ObjectId remain independent constraints and are all verified.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GraphWorkQueue {
     queue: VecDeque<GraphEdge>,
     scheduled: HashSet<(ObjectId, u8)>,
     scheduled_ids: HashSet<ObjectId>,
+    limit: usize,
+}
+
+impl Default for GraphWorkQueue {
+    fn default() -> Self {
+        Self::with_limit(max_graph_objects())
+    }
 }
 
 impl GraphWorkQueue {
+    /// A queue with an explicit ceiling. `Default` reads it from the
+    /// environment once per walk; this is how a test drives the refusal
+    /// without a million real objects.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            scheduled: HashSet::new(),
+            scheduled_ids: HashSet::new(),
+            limit,
+        }
+    }
+
+    /// This walk's ceiling, so a caller that owns its own accumulator can
+    /// enforce the same one.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
     pub fn schedule(&mut self, edge: GraphEdge) -> Result<bool> {
         let constraint = (edge.id, expectation_key(edge.expected));
         if self.scheduled.contains(&constraint) {
             return Ok(false);
         }
-        if !self.scheduled_ids.contains(&edge.id) && self.scheduled_ids.len() >= MAX_GRAPH_OBJECTS {
-            return Err(Error::Corrupt(format!(
-                "object graph exceeded {MAX_GRAPH_OBJECTS} objects"
-            )));
+        if !self.scheduled_ids.contains(&edge.id) && self.scheduled_ids.len() >= self.limit {
+            return Err(walk_limit_exceeded(self.limit));
         }
         self.scheduled.insert(constraint);
         self.scheduled_ids.insert(edge.id);
@@ -265,10 +347,8 @@ impl<O: crate::ObjectStore> Store<O> {
                 expected.verify(actual, id, &resource)?;
                 continue;
             }
-            if verified.len() >= MAX_GRAPH_OBJECTS {
-                return Err(Error::Corrupt(format!(
-                    "object graph exceeded {MAX_GRAPH_OBJECTS} objects"
-                )));
+            if verified.len() >= queue.limit() {
+                return Err(walk_limit_exceeded(queue.limit()));
             }
 
             let bytes = self.get_raw_verified(id)?;
@@ -309,5 +389,49 @@ mod schedule_tests {
         assert_eq!(queue.scheduled_ids.len(), 1);
         assert_eq!(queue.scheduled.len(), 2);
         assert_eq!(queue.queue.len(), 2);
+    }
+
+    /// #359: the ceiling is a resource bound on a WALK, so exceeding it is
+    /// `Invalid` (exit 1) and never `Corrupt` (exit 2). It used to be `Corrupt`,
+    /// which told an operator whose bytes were entirely intact that their
+    /// repository was damaged, from `fsck` and `gc` -- the two commands they
+    /// run when a repository has grown large.
+    #[test]
+    fn exceeding_the_walk_ceiling_is_a_refusal_not_a_corruption_report() {
+        let mut queue = GraphWorkQueue::with_limit(2);
+        queue
+            .schedule(any(ObjectId([1; 32]), "root".into()))
+            .unwrap();
+        queue
+            .schedule(any(ObjectId([2; 32]), "second".into()))
+            .unwrap();
+        // A THIRD expectation on an id already scheduled costs no new object.
+        queue
+            .schedule(exact(ObjectId([2; 32]), ObjectType::Tree, "again".into()))
+            .unwrap();
+
+        let error = queue
+            .schedule(any(ObjectId([3; 32]), "third".into()))
+            .unwrap_err();
+        let Error::Invalid(message) = &error else {
+            panic!("the walk ceiling must not be reported as corruption: {error:?}");
+        };
+        assert!(message.contains("not corrupt"), "{message}");
+        assert!(message.contains(MAX_GRAPH_OBJECTS_ENV), "{message}");
+    }
+
+    /// The env override may only ever raise a walk that already refuses, so an
+    /// unusable value takes the default rather than failing a walk that was
+    /// fine. Read here rather than in a `#[test]` that sets the variable,
+    /// because tests share one process and `set_var` is not thread-safe; the
+    /// CLI side is covered end to end in
+    /// `forge-cli/tests/cli_graph_walk_bound.rs`.
+    #[test]
+    fn the_default_ceiling_is_unchanged_when_nothing_overrides_it() {
+        assert_eq!(DEFAULT_MAX_GRAPH_OBJECTS, 1_000_000);
+        if std::env::var(MAX_GRAPH_OBJECTS_ENV).is_err() {
+            assert_eq!(max_graph_objects(), DEFAULT_MAX_GRAPH_OBJECTS);
+            assert_eq!(GraphWorkQueue::default().limit(), DEFAULT_MAX_GRAPH_OBJECTS);
+        }
     }
 }

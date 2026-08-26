@@ -166,6 +166,7 @@ onto the table above:
 | the capability may not read, or `fsck` was given anything less than unrestricted read authority | 1 |
 | `verify` names a tag that does not exist | 1 |
 | the catalog's metadata schema is not the one this binary audits: an un-migrated older repository, or one written by a newer ForgeFS | 1 |
+| the object graph is larger than this build will walk in one pass | 1 |
 | `fsck` reported at least one finding: durable bytes, catalog rows, or the relations between them do not hold | 2 |
 | `verify` rejected the tag: missing, forged, wrongly scoped, or out-of-band provenance | 2 |
 
@@ -200,6 +201,26 @@ ledger -- a hole, a duplicate, an empty ledger, a missing or reshaped
 a `SCHEMA_LEDGER` finding with exit 2. Admitting that one case is the reason
 `fsck --full` opens the catalog with its schema-compatibility check deferred at
 all.
+
+The graph-walk row is the same rule applied to SIZE rather than age (issue
+#359). ForgeFS bounds how many distinct objects one traversal holds in memory:
+`fsck`, `gc` and seal `verify` all walk the typed object graph, and each walk
+accumulates its whole result set, so an unbounded walk is an out-of-memory kill
+with no exit code at all rather than an answer. A repository that grew past the
+bound through ordinary `import` and `checkin` is **intact** -- every object file
+rehashes to its own name, every typed edge resolves -- so exceeding the bound is
+a refusal of the request, exit 1, naming the ceiling and the remedy. It used to
+be exit 2 with `corrupt: object graph exceeded 1000000 objects`, told to the
+operator by the very commands they reach for when a repository has grown large.
+
+The ceiling is `FORGEFS_MAX_GRAPH_OBJECTS`, defaulting to 1_000_000. It is read
+once per walk. A value that is absent, unparseable or zero takes the default:
+the variable can only ever let a walk that already refuses succeed, so a typo
+must not be able to break a walk that was working. Raising it is a statement
+about available memory -- walk state costs roughly a hundred bytes per distinct
+object -- and it is deliberately not a repository setting, because the right
+value depends on the machine doing the walking and not on the repository.
+
 
 ## Input that is too large: `forge import`, `forge write`, `forge checkin`
 
@@ -371,6 +392,7 @@ Neither verb introduces an exit code. Both map onto the table above:
 | `gc --collect --min-age-secs` below the hard floor | 1 |
 | `gc` under a ref-scoped capability | 1 |
 | `gc` could not prove reachability because an object is unreadable or does not decode | 2 |
+| `gc` stopped because the object graph is larger than this build will walk in one pass (`FORGEFS_MAX_GRAPH_OBJECTS`, see `fsck` above) | 1 |
 
 `forge gc --dry-run` **never deletes** and is the reporting half. `forge gc
 --collect` is the reclaiming half: it unlinks unreachable objects and removes

@@ -296,6 +296,46 @@ generation stamps, which is a bigger change than this one.
 enumerated and the sweep then unlinked. That is a race between two
 administrative operations, not corruption; run them one at a time.
 
+### How large a graph a walk will hold, and what to do at the ceiling
+
+`gc`, `fsck` and seal `verify` all traverse the typed object graph, and each
+traversal accumulates its whole result in memory: `reachable_graph_verified`
+returns one `Vec` of every object reachable from a root, `gc`'s reachability
+walk fills one `HashSet`, `fsck`'s auditor one `HashMap`. None is incremental,
+resumable or spillable to disk. So the walk carries a ceiling on how many
+distinct objects it will hold -- `FORGEFS_MAX_GRAPH_OBJECTS`, default
+1_000_000, roughly a hundred bytes of walk state each -- and refuses past it
+rather than being killed for memory partway through, which would report no exit
+code at all.
+
+**Reaching that ceiling is not corruption.** A repository grows past a million
+objects through ordinary `import` and `checkin`; every object file still
+rehashes to its own name and every typed edge still resolves. Until issue #359
+the refusal was `Error::Corrupt`, so `fsck` and `gc` -- the two commands an
+operator runs when a repository has grown large -- answered `corrupt: object
+graph exceeded 1000000 objects` and exited 2 on entirely intact bytes. It is now
+`Error::Invalid`, exit 1, and the message names the ceiling and the remedy.
+
+An operator who hits it has two moves:
+
+1. **Raise the ceiling** for a machine that can afford it:
+   `FORGEFS_MAX_GRAPH_OBJECTS=4000000 forge fsck --full`. This is a statement
+   about available RAM, which is why it is an environment variable rather than a
+   repository setting -- the right value belongs to the machine doing the
+   walking, not to the repository being walked. An absent, unparseable or zero
+   value takes the default, so a typo cannot break a walk that was working.
+2. **Reduce what is reachable**, then re-run: `forge abandon fork` retires forks
+   that are still roots, `forge abandon session` retires stranded sessions, and
+   `forge gc --collect` unlinks what nothing can reach. Note the ordering
+   problem this creates -- `gc` itself walks the graph -- so at the ceiling
+   raise it for the collecting run.
+
+Making the walk resumable is the real answer for a repository that keeps
+growing, and it is not what #359 did. It needs a durable, restartable frontier
+and a decision about what a partially walked `fsck` may claim, which is a
+larger change than a classification fix and belongs with the incremental
+collector the previous section describes.
+
 ## Evidence
 
 `gc_collect.rs` pins the mechanisms one at a time, deterministically, including
