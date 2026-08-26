@@ -19,6 +19,21 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
+/// What one `rename` staged. Not a commit: publication is still `checkin`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Renamed {
+    pub from: String,
+    pub to: String,
+    /// `"blob"` or `"tree"`: what the source resolved to.
+    pub kind: &'static str,
+    /// The oid the move observed at the source, and the value `--expect-oid`
+    /// is checked against.
+    pub source: ObjectId,
+    /// Destination overlay rows staged. A directory move stages one per file,
+    /// so this is a file count and never an entry count of the source tree.
+    pub entries: u64,
+}
+
 impl Forge {
     pub fn session_open(&self, cap: &Cap, from: &str) -> Result<String> {
         self.check_spec_read(cap, from)?;
@@ -363,6 +378,153 @@ impl Forge {
             .meta
             .overlay_upsert(ns, &m.path, &rel, None, false)?;
         Ok(())
+    }
+
+    /// Move `from` to `to` inside ONE mount, staged as one catalog transaction
+    /// (I24).
+    ///
+    /// This is not `write(to)` followed by `delete(from)`. Those are two
+    /// independent autocommit transactions, and between them the session's own
+    /// reads -- and any later reader of the same namespace, in this process or
+    /// another -- see the file at BOTH paths. Losing the process there leaves
+    /// that duplicate staged permanently, and the agent has no record that a
+    /// move was ever intended. `Meta::overlay_rename` supersedes both subtrees,
+    /// stages the destination and tombstones the source in a single
+    /// transaction, so the only two observable states are before and after.
+    ///
+    /// Atomicity at the PUBLICATION point is unchanged and was never the gap:
+    /// a checkin already folds one overlay into one tree, one Contribution and
+    /// one CAS (I5, I10, I19). `mv` adds no commit point; it makes the STAGING
+    /// atomic too.
+    ///
+    /// `expect` is the caller's assumption about what it is moving. It is
+    /// checked against the blob or tree oid the source resolves to and refused
+    /// as a stale observation -- exit 4 -- so an agent that read a path, decided
+    /// to move it, and lost the race to another writer of its own namespace is
+    /// told, rather than moving something it never looked at.
+    ///
+    /// A move never spans mounts. Two mounts pin two different refs (I19), so a
+    /// cross-mount move is two publications with no atomicity between them; it
+    /// is refused rather than half-applied, and a caller that wants it writes
+    /// the copy and the delete itself and accepts what that means.
+    pub fn rename(
+        &self,
+        cap: &Cap,
+        ns: &str,
+        from: &str,
+        to: &str,
+        expect: Option<ObjectId>,
+    ) -> Result<Renamed> {
+        self.require_ns(cap, ns)?;
+        let mounts = self.mounts(ns)?;
+        let from_abs = normalize_abs(from)?;
+        let to_abs = normalize_abs(to)?;
+        let source_mount = longest_mount(&mounts, &from_abs)?;
+        let dest_mount = longest_mount(&mounts, &to_abs)?;
+        if source_mount.path != dest_mount.path {
+            return Err(Error::Invalid(format!(
+                "rename crosses mounts: {from_abs} resolves through {} and {to_abs} through {}; \
+                 each mount pins its own ref and publishes separately (I19), so there is no \
+                 transaction that could carry both halves",
+                source_mount.path, dest_mount.path
+            )));
+        }
+        let m = source_mount;
+        if m.mode != Mode::Rw {
+            return Err(Error::Denied(format!("{} is read-only", m.path)));
+        }
+        self.check_spec_read(cap, &m.spec)?;
+        if let Spec::Ref(n) = parse_spec(&m.spec)? {
+            self.check(cap, Op::Write, Some(&n))?;
+        } else {
+            self.check(cap, Op::Write, None)?;
+        }
+
+        let rel_from = rel_of(&m.path, &from_abs)?;
+        let rel_to = rel_of(&m.path, &to_abs)?;
+        if rel_from.is_empty() || rel_to.is_empty() {
+            return Err(Error::Invalid(format!(
+                "cannot rename a mount root: {} is the mount itself",
+                m.path
+            )));
+        }
+        if rel_from == rel_to {
+            return Err(Error::Invalid(format!(
+                "rename source and destination are the same path: {from_abs}"
+            )));
+        }
+        if is_under(&rel_to, &rel_from) {
+            return Err(Error::Invalid(format!(
+                "cannot move {from_abs} into itself at {to_abs}"
+            )));
+        }
+        if is_under(&rel_from, &rel_to) {
+            return Err(Error::Invalid(format!(
+                "cannot move {from_abs} onto its own ancestor {to_abs}: the destination \
+                 tombstone would delete the source"
+            )));
+        }
+
+        let rows = self.store.meta.overlay_list(ns, &m.path)?;
+        let ov = overlay_map(&rows);
+        let tree = self.session_mount_tree(m)?;
+        // I9: a move READS its source, so record what it saw before acting on
+        // it. Without this a concurrent writer could replace the source between
+        // the resolve and the checkin and the move would publish silently.
+        let seen = observed_at(&self.store, &ov, tree, &rel_from)?;
+        self.store.meta.observe(ns, &m.path, &rel_from, seen)?;
+
+        let (kind, source, dest) = match resolve(&self.store, &mounts, &rows, tree, &from_abs)? {
+            Resolved::Blob { id, exec } => ("blob", id, vec![(rel_to.clone(), id, exec)]),
+            Resolved::Tree(id) => {
+                let mut files = BTreeMap::new();
+                collect_blobs(&self.store, id, "", &mut files)?;
+                let prefix = format!("{rel_from}/");
+                for (path, op) in &ov {
+                    let Some(rest) = path.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    match op {
+                        Some((oid, exec)) => {
+                            files.insert(rest.to_string(), (*oid, *exec));
+                        }
+                        // A tombstone at a path removes whatever is there,
+                        // directory included. The overlay prefix rule
+                        // guarantees no surviving row is both an ancestor and
+                        // a descendant of another, so this is the whole effect.
+                        None => {
+                            let sub = format!("{rest}/");
+                            files.remove(rest);
+                            files.retain(|p, _| !p.starts_with(&sub));
+                        }
+                    }
+                }
+                let dest = files
+                    .into_iter()
+                    .map(|(rest, (oid, exec))| (format!("{rel_to}/{rest}"), oid, exec))
+                    .collect();
+                ("tree", id, dest)
+            }
+        };
+        if let Some(want) = expect {
+            if want != source {
+                return Err(Error::StaleObservation {
+                    path: from_abs.clone(),
+                    expected: want.to_string(),
+                    found: source.to_string(),
+                });
+            }
+        }
+        self.store
+            .meta
+            .overlay_rename(ns, &m.path, &rel_from, &rel_to, &dest)?;
+        Ok(Renamed {
+            from: from_abs,
+            to: to_abs,
+            kind,
+            source,
+            entries: dest.len() as u64,
+        })
     }
 
     /// Fold one mount's overlay onto THAT MOUNT's pinned base and CAS the ref
@@ -739,6 +901,62 @@ fn overlay_shadows(ov: &forge_core::Overlay, rel: &str) -> bool {
     }
     false
 }
+
+/// True when `path` is `ancestor` itself or lies beneath it. Compared by whole
+/// path components, so `/ab` is not under `/a` (I16: names are exact bytes).
+fn is_under(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Every blob reachable from `tree`, keyed by its path relative to it.
+///
+/// Directories that hold no blob contribute nothing, which is the same thing
+/// the tree encoding says: a VERSION 1 tree has no representation for an empty
+/// directory, so moving one moves no rows.
+///
+/// Iterative on purpose. The depth here comes from stored bytes rather than
+/// from a caller's argument, and a recursive walk would answer a deep or cyclic
+/// catalog with a stack overflow -- which is a crash, not a refusal. The
+/// accumulated path length is bounded exactly as every other path this crate
+/// accepts is, and exceeding it is `Corrupt`, because the caller asked to move
+/// something the object model says cannot exist.
+fn collect_blobs(
+    store: &Store,
+    tree: ObjectId,
+    prefix: &str,
+    out: &mut BTreeMap<String, (ObjectId, bool)>,
+) -> Result<()> {
+    let mut pending = vec![(tree, prefix.to_string())];
+    while let Some((id, at)) = pending.pop() {
+        for e in store.get_tree(id)?.entries {
+            let path = if at.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{at}/{}", e.name)
+            };
+            if path.len() > MAX_MOVED_PATH_BYTES {
+                return Err(Error::Corrupt(format!(
+                    "tree path exceeds {MAX_MOVED_PATH_BYTES} bytes under the moved directory"
+                )));
+            }
+            split_path(&path)?;
+            match e.kind {
+                EntryKind::Blob => {
+                    out.insert(path, (e.id, e.exec));
+                }
+                EntryKind::Tree => pending.push((e.id, path)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `Contribution` path bound, which every moved path must also satisfy:
+/// a checkin of the move has to be able to name what it wrote.
+const MAX_MOVED_PATH_BYTES: usize = 4096;
 
 /// The entry `rel` names inside `tree`, or `None` when nothing is there.
 fn entry_at(store: &Store, tree: ObjectId, rel: &str) -> Result<Option<(EntryKind, ObjectId)>> {

@@ -12,6 +12,32 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Debug-build-only process crash hook for the rename atomicity matrix.
+///
+/// `_exit` skips Rust and SQLite destructors, so an uncommitted transaction is
+/// lost exactly as it would be if the process were killed. It is the same class
+/// of evidence as SIGKILL and carries the same limit: the page cache and the
+/// WAL file survive, so this proves TRANSACTION atomicity across abrupt process
+/// loss and proves nothing about power loss (that is I4's barrier machinery,
+/// `barrier_fault_injection.rs` and `docs/RECOVERY.md`).
+fn rename_crash_point(point: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("FORGEFS_TEST_RENAME_CRASH_AFTER")
+        .ok()
+        .as_deref()
+        == Some(point)
+    {
+        #[cfg(unix)]
+        unsafe {
+            libc::_exit(86)
+        }
+        #[cfg(not(unix))]
+        std::process::exit(86);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
+}
+
 /// The durable record `abandon_ref` leaves behind for a retired ref.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetiredRef {
@@ -4072,6 +4098,114 @@ impl Meta {
                 params![ns_id, mount, path, oid, exec as i64],
             )
             .map_err(map_sql)?;
+            Ok(())
+        })
+    }
+
+    /// Stage a move as ONE catalog transaction (I24).
+    ///
+    /// `dest` is the complete set of `(path, blob, exec)` rows the destination
+    /// must hold, already resolved by the caller against that mount's pin and
+    /// overlay; `from` is the source path to tombstone and `to` the destination
+    /// endpoint every `dest` path lies at or under. The transaction drops every
+    /// row the move supersedes -- the source subtree and the destination
+    /// subtree -- inserts `dest`, and writes the source tombstone, so no reader
+    /// and no crash can observe the source gone without the destination present
+    /// or both present at once.
+    ///
+    /// The prefix rule `overlay_upsert` enforces still holds afterwards: the
+    /// rows that would have collided with the move are the ones it deletes, and
+    /// an ancestor of either endpoint that survives is a real collision and is
+    /// refused with the same diagnostic. Only the two endpoints need checking,
+    /// because every other candidate ancestor lies inside a subtree this
+    /// transaction has already removed.
+    pub fn overlay_rename(
+        &self,
+        ns_id: &str,
+        mount: &str,
+        from: &str,
+        to: &str,
+        dest: &[(String, ObjectId, bool)],
+    ) -> Result<()> {
+        // Debug-build-only: stage the same move the way copy+delete has to --
+        // two independent autocommit transactions -- so `cli_mv_crash.rs` can
+        // show that the intermediate state IS observable without the single
+        // transaction above. Absent from release builds and from every path a
+        // caller can reach without setting this variable.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("FORGEFS_TEST_RENAME_UNSAFE_SPLIT").is_some() {
+            for (path, oid, exec) in dest {
+                self.overlay_upsert(ns_id, mount, path, Some(*oid), *exec)?;
+            }
+            rename_crash_point("staged-destination");
+            return self.overlay_upsert(ns_id, mount, from, None, false);
+        }
+
+        let ns_id = ns_id.to_string();
+        let mount = mount.to_string();
+        let from = from.to_string();
+        let to = to.to_string();
+        let dest = dest.to_vec();
+        self.run_grouped(move |tx| {
+            let mut supersede = tx
+                .prepare(
+                    "DELETE FROM overlay
+                     WHERE ns_id=?1 AND mount=?2 AND (
+                       path=?3
+                       OR (length(path) > length(?3)
+                           AND substr(path,1,length(?3))=?3
+                           AND substr(path,length(?3)+1,1)='/')
+                     )",
+                )
+                .map_err(map_sql)?;
+            supersede
+                .execute(params![&ns_id, &mount, &from])
+                .map_err(map_sql)?;
+            supersede
+                .execute(params![&ns_id, &mount, &to])
+                .map_err(map_sql)?;
+
+            let mut ancestor = tx
+                .prepare(
+                    "SELECT path FROM overlay
+                     WHERE ns_id=?1 AND mount=?2
+                       AND length(path) < length(?3)
+                       AND substr(?3,1,length(path))=path
+                       AND substr(?3,length(path)+1,1)='/'
+                     ORDER BY path LIMIT 1",
+                )
+                .map_err(map_sql)?;
+            for endpoint in [from.as_str(), to.as_str()] {
+                if let Some(existing) = ancestor
+                    .query_row(params![&ns_id, &mount, endpoint], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()
+                    .map_err(map_sql)?
+                {
+                    return Err(Error::Invalid(format!(
+                        "overlay path conflict: {endpoint} and {existing} cannot coexist"
+                    )));
+                }
+            }
+            drop(ancestor);
+            drop(supersede);
+
+            let mut insert = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO overlay (ns_id, mount, path, blob_oid, exec) \
+                     VALUES (?1,?2,?3,?4,?5)",
+                )
+                .map_err(map_sql)?;
+            for (path, oid, exec) in &dest {
+                insert
+                    .execute(params![&ns_id, &mount, path, oid.0.to_vec(), *exec as i64])
+                    .map_err(map_sql)?;
+            }
+            rename_crash_point("staged-destination");
+            insert
+                .execute(params![&ns_id, &mount, &from, None::<Vec<u8>>, 0i64])
+                .map_err(map_sql)?;
             Ok(())
         })
     }

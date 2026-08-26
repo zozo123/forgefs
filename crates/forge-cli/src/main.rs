@@ -65,6 +65,24 @@ enum Cmd {
         #[arg(long)]
         text: Option<String>,
     },
+    /// Move a file or directory inside one mount, staged atomically (I24).
+    ///
+    /// Not a copy and not two commands: the destination and the source
+    /// tombstone are staged in a single catalog transaction, so no reader and
+    /// no crash sees the content at both paths or at neither. Publication is
+    /// still `checkin`, which folds this mount into one Contribution and one
+    /// CAS exactly as before.
+    Mv {
+        #[arg(long)]
+        ns: String,
+        from: String,
+        to: String,
+        /// Refuse -- exit 4 -- unless the source resolves to this object id.
+        /// The move's assumption about what it is moving, stated so it can be
+        /// checked rather than assumed.
+        #[arg(long)]
+        expect_oid: Option<String>,
+    },
     Checkin {
         #[arg(long)]
         ns: String,
@@ -421,6 +439,19 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             };
             let id = f.write(cap, &ns, &path, &data, false)?;
             println!("{id}");
+        }
+        Cmd::Mv {
+            ns,
+            from,
+            to,
+            expect_oid,
+        } => {
+            let expect = expect_oid.as_deref().map(ObjectId::from_hex).transpose()?;
+            let r = f.rename(cap, &ns, &from, &to, expect)?;
+            println!(
+                "moved {} {} {} {} entries={}",
+                r.from, r.to, r.kind, r.source, r.entries
+            );
         }
         Cmd::Checkin { ns, mount, message } => match f.checkin(cap, &ns, &mount, &message)? {
             CasResult::Updated { name, oid } => println!("updated {name} {oid}"),

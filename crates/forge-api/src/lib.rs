@@ -34,6 +34,7 @@ pub use stats::{
     ApiCounterReport, DurabilityReport, MetaCounterReport, StatsReport, StoreCounterReport,
     STATS_SCHEMA_VERSION, STATS_SCOPE,
 };
+pub use workspace::Renamed;
 
 /// Stable fail-closed error for the legacy raw-tree merge resolution input.
 ///
