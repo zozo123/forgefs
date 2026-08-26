@@ -377,7 +377,7 @@ run --dir "$G" --cap "$G_ROOT" write --ns "$G_LOSE" /l.txt --text l
 run --dir "$G" --cap "$G_ROOT" checkin --ns "$G_WIN" -m w
 # "forked <requested> -> <fork> ours=<oid> theirs=<oid>"
 G_FORKLINE="$(capture --dir "$G" --cap "$G_ROOT" checkin --ns "$G_LOSE" -m l | tr -d '\r')"
-G_FORK="$(printf '%s\n' "$G_FORKLINE" | awk '/^forked /{print $4; exit}')"
+G_FORK="$(printf '%s\n' "$G_FORKLINE" | awk '/^forked / && !s {print $4; s=1}')"
 # #343: a SESSION fork lands inside the losing agent's own capability scope,
 # because I18 retargets that session's mount at it. A merge or import fork,
 # which retargets no session, still lands under the flat forks/ tree.
