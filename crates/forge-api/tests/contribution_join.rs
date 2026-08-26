@@ -78,6 +78,12 @@ fn opposite_merge_orders_have_the_same_monotonic_contribution_join() {
         shared_base,
         "private checkins must not advance their shared starting ref"
     );
+    assert_ne!(
+        alice_contribution, bob_contribution,
+        "two independent checkins must publish distinct Contribution facts; \
+         equal receipts would collapse every set below to one element and let \
+         the join assertions pass without witnessing a join"
+    );
     let expected = BTreeSet::from([alice_contribution, bob_contribution]);
 
     forge.branch(&root, "main", "joins/alice-bob").unwrap();
