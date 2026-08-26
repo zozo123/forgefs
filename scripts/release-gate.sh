@@ -501,7 +501,7 @@ fi
 # I7: the conflict is published under a typed conflicts/ ref, not a naming
 # convention on heads/.
 CONFLICT_REF="$("$FORGE" --dir "$DEMO" --cap "$ROOT" refs 2>/dev/null |
-	awk -v o="$CONFLICT_OID" '$2 == "conflict" && $4 == o {print $3; exit}')"
+	awk -v o="$CONFLICT_OID" '$2 == "conflict" && $4 == o && !s {print $3; s=1}')"
 if [ -z "$CONFLICT_REF" ]; then
 	fail gate/conflict-object "no typed conflict ref names $CONFLICT_OID"
 	exit 1
