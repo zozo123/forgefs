@@ -13,7 +13,7 @@
 //! second test function would run concurrently and interleave its allocations.
 
 use forge_core::{hash_bytes, Blob};
-use forge_store::Store;
+use forge_store::{Store, OBJECT_CACHE_MAX_BYTES};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
@@ -76,7 +76,7 @@ fn payload() -> Vec<u8> {
 }
 
 #[test]
-fn one_large_blob_costs_a_measured_multiple_of_itself() {
+fn large_blob_cost_and_raw_cache_residency_are_measured_and_bounded() {
     let a = tempdir().unwrap();
     let store = Store::open(a.path()).unwrap();
     let data = payload();
@@ -113,11 +113,11 @@ fn one_large_blob_costs_a_measured_multiple_of_itself() {
          the characterised cost is one payload for the verifying re-read"
     );
 
-    // Phase 3 - reading it back from a cold store. Three payloads are live at
-    // once: the durable read buffer, the clone the object cache keeps, and the
-    // decoded copy handed to the caller. That cache is bounded by entry count
-    // (256), never by bytes, so 256 large objects are 256 payloads resident.
-    // This is the half of issue #11 that a chunked read path would have to beat.
+    // Phase 3 - reading one object from a cold store. At 8 MiB the object is
+    // intentionally below the 64 MiB cache budget, so the single-object peak
+    // remains three payloads: durable read buffer, cached clone, decoded copy.
+    // Phase 4 below is the important bound: walking many such blobs no longer
+    // retains one payload per object without limit.
     drop(store);
     let cold = Store::open(a.path()).unwrap();
     let (got, read) = peak_payloads(|| cold.get_blob_data(id).unwrap());
@@ -125,7 +125,60 @@ fn one_large_blob_costs_a_measured_multiple_of_itself() {
     assert!(
         (2.5..3.5).contains(&read),
         "cold get_blob_data of a {N}-byte blob peaked at {read:.2}x the \
-         payload; the characterised cost is 3x. If this moved, issue #11's \
-         measured ceiling moved with it and docs/BENCH.md needs re-measuring"
+         payload; one cacheable object still costs the characterised 3x"
+    );
+    drop(got);
+    drop(cold);
+
+    // Phase 4 - the raw-object LRU is bounded by bytes as well as entries.
+    // Use enough distinct 8 MiB blobs to exceed 64 MiB. The former 256-entry
+    // policy retained every one (80+ MiB here, and tens of GiB at the measured
+    // 164 MiB object ceiling). The byte-bound cache must evict old entries and
+    // keep both resident and transient live memory bounded by the declared
+    // budget plus the two buffers needed by the current decode.
+    let writer = Store::open(a.path()).unwrap();
+    let mut many = payload();
+    let object_count = OBJECT_CACHE_MAX_BYTES / N + 2;
+    let mut ids = Vec::with_capacity(object_count);
+    for i in 0..object_count {
+        many[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        ids.push(writer.put_blob_data(&many).unwrap());
+    }
+    drop(many);
+    drop(writer);
+
+    let cold_many = Store::open(a.path()).unwrap();
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    for object in &ids {
+        let got = cold_many.get_blob_data(*object).unwrap();
+        assert_eq!(got.len(), N);
+        drop(got);
+    }
+    let retained = LIVE.load(Ordering::Relaxed).saturating_sub(before);
+    let peak = PEAK.load(Ordering::Relaxed).saturating_sub(before);
+    assert!(
+        retained < OBJECT_CACHE_MAX_BYTES,
+        "walking {object_count} large objects retained {retained} bytes after \
+         callers dropped their buffers; raw-object cache budget is \
+         {OBJECT_CACHE_MAX_BYTES} bytes"
+    );
+    assert!(
+        peak < OBJECT_CACHE_MAX_BYTES + 3 * N,
+        "walking {object_count} large objects peaked at {peak} additional live \
+         bytes; a byte-bound cache may add only the current read/decode buffers \
+         above its {OBJECT_CACHE_MAX_BYTES}-byte resident budget"
+    );
+
+    // LRU semantics remain real, not merely accounting: the oldest object was
+    // evicted, so asking for it again causes one physical-cache miss.
+    let misses_before = cold_many.cache_stats().object_cache_misses;
+    let reread = cold_many.get_blob_data(ids[0]).unwrap();
+    assert_eq!(reread.len(), N);
+    let misses_after = cold_many.cache_stats().object_cache_misses;
+    assert_eq!(
+        misses_after,
+        misses_before + 1,
+        "the oldest object should have been evicted when the byte budget filled"
     );
 }
