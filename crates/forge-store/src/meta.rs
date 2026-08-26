@@ -3599,8 +3599,20 @@ impl Meta {
                     return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
                 }
             }
-            tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
-                .map_err(|error| count_busy(&stats, error))?;
+            // I9: the observation epoch is the MOUNT that recorded the read,
+            // the same epoch the overlay above is cleared on. Deleting every
+            // observation in the namespace here made a checkin of ONE mount
+            // forget the reads taken through every OTHER mount, so a foreign
+            // read stopped constraining the session at the first checkin of
+            // anything else while the overlay that read justified stayed
+            // staged (#329). The per-session alternative is not available:
+            // clearing the whole namespace's OVERLAY to match would destroy
+            // another mount's staged work, which I18 forbids outright.
+            tx.execute(
+                "DELETE FROM observations WHERE ns_id=?1 AND mount=?2",
+                params![ns_id, mount_path],
+            )
+            .map_err(|error| count_busy(&stats, error))?;
             Self::insert_intros_tx(tx, intro_oids, new, agent_id, ts)?;
             // Counted here, inside the transaction that carries the outcome, so a
             // batch-mate that poisons the commit cannot leave a phantom `Updated`
@@ -3670,8 +3682,14 @@ impl Meta {
                 return Err(Error::Corrupt(format!("missing namespace {ns_id}")));
             }
         }
-        tx.execute("DELETE FROM observations WHERE ns_id=?1", [ns_id])
-            .map_err(map_sql)?;
+        // I9, the same epoch `cas_ref_session` clears on: this mount's overlay
+        // was just cleared, so this mount's observations go with it and no
+        // other mount's reads are forgotten (#329).
+        tx.execute(
+            "DELETE FROM observations WHERE ns_id=?1 AND mount=?2",
+            params![ns_id, mount_path],
+        )
+        .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
         txn_timer.finish();
         // The only path that completes a checkin without publishing a commit,
