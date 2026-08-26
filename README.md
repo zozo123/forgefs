@@ -56,16 +56,20 @@ forge 0.3.0
 ```
 
 On macOS the same commands work with `shasum -a 256 --ignore-missing -c SHA256SUMS`. The tarball
-holds the binary and four documents, and nothing else:
+holds the binary and four documents, and nothing else. This listing is v0.4.0's own, not v0.3.0's:
+unlike a checksum, `tar -tzf` output is knowable before the artifact exists.
 
 ```text
-forge-0.3.0-x86_64-unknown-linux-gnu/
-forge-0.3.0-x86_64-unknown-linux-gnu/README.md
-forge-0.3.0-x86_64-unknown-linux-gnu/LICENSE
-forge-0.3.0-x86_64-unknown-linux-gnu/INVARIANTS.md
-forge-0.3.0-x86_64-unknown-linux-gnu/CLI_ABI.md
-forge-0.3.0-x86_64-unknown-linux-gnu/forge
+forge-0.4.0-x86_64-unknown-linux-gnu/
+forge-0.4.0-x86_64-unknown-linux-gnu/CLI_ABI.md
+forge-0.4.0-x86_64-unknown-linux-gnu/INVARIANTS.md
+forge-0.4.0-x86_64-unknown-linux-gnu/LICENSE
+forge-0.4.0-x86_64-unknown-linux-gnu/README.md
+forge-0.4.0-x86_64-unknown-linux-gnu/forge
 ```
+
+v0.3.0 packaged the same five entries in a different order. The order is not part of any contract:
+compare the set, not the sequence.
 
 `SHA256SUMS` for v0.4.0 has 41 entries — the v0.3.0 file checked above has 36, because v0.4.0's
 payload catalog ([`.github/scripts/release-assets.sh`](.github/scripts/release-assets.sh)) adds a
@@ -74,7 +78,9 @@ beside them — per target: a build-info file, a CycloneDX SBOM, the ABI conform
 Conflict-object record, the environment line (as both `.txt` and `.json`), the `fsck --full`
 report, the gate summary and the seal attestation, plus the double-build reproducibility evidence
 for `x86_64-unknown-linux-gnu` (see [`docs/SUPPLY-CHAIN.md`](docs/SUPPLY-CHAIN.md)). Each release
-is also covered by a SLSA provenance attestation you can check without trusting this page:
+is also covered by a SLSA provenance attestation you can check without trusting this page. That
+check needs the GitHub CLI, which is not in the install list above and is not in a base image
+either: install `gh` first (<https://cli.github.com>).
 
 ```bash
 gh attestation verify forge-$V-$T.tar.gz -R zozo123/forgefs
@@ -499,7 +505,19 @@ quoted, it comes from the issue that recorded it.
 ### `mount --rw` refuses at mount time what checkin could never publish
 
 Three read-write mount specs can never be published, and all three are now refused when you ask for
-the mount, not after you have staged work behind it:
+the mount, not after you have staged work behind it. `$ROOT` and `$FORK` are from [the worked
+example](#a-worked-example); this section needs four more names, so that every block below can be
+pasted as it stands:
+
+```bash
+S=$(forge --cap $ROOT session open --from=work)   # a session to mount into
+Z=$S                                              # the same session, used in the checkin block
+OID=$(forge --cap $ROOT refs | awk '$3 == "work" {print $4}')                # bytes, not a ref
+CONF=$(forge --cap $ROOT refs | awk '$2 == "conflict" {print $3}' | head -1) # a Conflict ref
+```
+
+`$CONF` is empty until a same-path merge has produced one; the `conflicts/` transcript that closes
+[the worked example](#integrate-seal-verify) is what mints it.
 
 ```bash
 forge --cap $ROOT mount --ns "$S" / ref:main --rw          # main is protected
@@ -620,7 +638,26 @@ strict subset by design and now by documentation. What changed in v0.4.0 is that
 refused before the op runs.
 
 Started with `forge --cap $ROOT serve --http`, which adds a loopback listener on `127.0.0.1:4077`;
-the capability goes in an `Authorization: Bearer` header:
+the capability goes in an `Authorization: Bearer` header. Two things the blocks below assume, both
+measured:
+
+- **`$CAP` is the token, not a path.** Everywhere else on this page `$ROOT` is the *filename* of a
+  cap; the header wants its contents, so `CAP=$(cat $ROOT)` first. Handing it the path answers
+  `HTTP 400` / `{"code":"invalid","msg":"invalid: odd hex length"}`.
+- **The daemon holds the repository exclusively.** While `forge serve` is running, every `forge`
+  command against that repository exits **3** with `forge: busy: forge daemon owns this cell; use
+  the socket or stop forge serve`. The `ns` in the requests below therefore comes from the daemon's
+  own `session.open`, not from `forge session open`:
+
+  ```bash
+  curl -sS -X POST http://127.0.0.1:4077/v1/session.open \
+    -H "Authorization: Bearer $CAP" -H 'content-type: application/json' -d '{"from":"work"}'
+  ```
+
+  ```text
+  HTTP 200
+  {"v":1,"id":1,"ok":true,"body":{"ns":"01M0YYV0QCQ98FWY8NH05MQST0"}}
+  ```
 
 ```bash
 curl -sS -X POST http://127.0.0.1:4077/v1/ns.frobnicate \
@@ -837,8 +874,11 @@ bash scripts/cli-abi-conformance.sh target/release/forge
 bash scripts/release-gate.sh target/release/forge
 ```
 
-At the v0.4.0 tree, on the box described under [What it costs](#what-it-costs), those produce:
-`fmt` clean; `clippy` clean; **431 tests passed, 0 failed**, 2 ignored, across 114 test binaries;
+Those commands assume a checkout of the tree you mean to measure. A plain `git clone` gives you
+`main`, which has moved past this release; `git clone --branch v0.4.0` gives the tree these numbers
+were taken from. At the v0.4.0 tree (`f14eff9`), on the box described under
+[What it costs](#what-it-costs), they produce: `fmt` clean; `clippy` clean;
+**442 tests passed, 0 failed**, 2 ignored, across 116 test binaries;
 
 ```text
 abi rows=57 blocking=54 known_failing=0 unexercised=3 blocking_failures=0
@@ -1169,14 +1209,14 @@ because they are no longer true**, and the ones that changed shape say what is l
   refuses symlinks by default and names every one it found:
 
   ```text
-  forge: invalid: import refuses /tree/escape.txt (1 more symlink(s) in this tree: /tree/link.txt); pass --follow-symlinks to materialise link targets that stay inside the import root (a VERSION 1 tree cannot represent a symlink; see docs/POSIX.md)
+  forge: invalid: import refuses symlink /tree/escape.txt (1 more symlink(s) in this tree: /tree/link.txt); pass --follow-symlinks to materialise link targets that stay inside the import root (a VERSION 1 tree cannot represent a symlink; see docs/POSIX.md)
   ```
 
   With `--follow-symlinks` a link becomes a *copy* of its target: importing `link.txt -> real.txt`
   yields two entries with the **same blob id**
   (`c7325398…  link.txt` and `c7325398…  real.txt`), and exporting gives back two regular files, not
   a link. Containment still holds: a target resolving outside the import root is refused even with
-  the flag — `import refuses /tree/escape.txt: target /etc/passwd is outside the import root /tree`.
+  the flag — `import refuses symlink /tree/escape.txt: target /etc/passwd is outside the import root /tree`.
   Real symlinks need a VERSION 2 tree entry that does not exist. See [`docs/POSIX.md`](docs/POSIX.md).
 - **POSIX metadata is dropped or widened, silently.** `exec` is the only mode bit the format has.
   A directory holding `0600 a`, `0444 b` and `0755 x`, imported and exported, comes back:
@@ -1239,7 +1279,7 @@ because they are no longer true**, and the ones that changed shape say what is l
   roughly `FORGEFS_MODEL_SEQUENCES=20 FORGEFS_MODEL_STEPS=200`. The committed default run does not
   reach it. Recorded in [INVARIANTS.md](INVARIANTS.md) under "Shape gaps that remain".
 - **`serve` is a strict subset of the CLI, and no invariant covers it (#332, residual).** The
-  daemon serves 8 ops against the CLI's 25 verbs. As of v0.4.0 that surface is *specified* —
+  daemon serves 9 ops against the CLI's 26 verbs. As of v0.4.0 that surface is *specified* —
   `DAEMON_OPS` declares every op and field, unknown ones are refused, flags must be JSON booleans,
   error codes come from the same table as the CLI's exit codes, and `CLI_ABI.md` documents it — so
   it is no longer an undocumented wire format. What remains is the gap itself: 17 CLI verbs have no
