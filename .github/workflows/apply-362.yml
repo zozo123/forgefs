@@ -1,0 +1,41 @@
+name: apply 362 once
+
+on:
+  push:
+    branches:
+      - perf/362-streaming-dedup-cache-budget
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-362-once
+  cancel-in-progress: false
+
+jobs:
+  apply-and-prove:
+    if: ${{ !contains(github.event.head_commit.message, '[362-applied]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt,clippy
+      - name: Apply exact source transformation
+        run: python3 scripts/apply-362.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Memory regression gate
+        run: cargo test --locked -p forge-store --test large_blob_memory -- --nocapture
+      - name: Full test suite
+        run: cargo test --workspace --all-targets --locked
+      - name: Remove one-shot helper and commit proven tree
+        run: rm scripts/apply-362.py .github/workflows/apply-362.yml && git config user.name github-actions[bot] && git config user.email 41898282+github-actions[bot]@users.noreply.github.com && git add -A && git commit -m 'perf(store): stream dedup verification and byte-bound cache (#362) [362-applied]' && git push origin HEAD
