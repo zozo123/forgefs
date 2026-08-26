@@ -155,11 +155,11 @@ Darwin)
 	os_name="macOS"
 	os_version="$(sw_vers -productVersion 2>/dev/null || echo unavailable)"
 	# `df` names the device; `mount` names that device's filesystem type.
-	dev="$(df -P "$target_dir" 2>/dev/null | awk 'NR==2 {print $1}' || true)"
+	dev="$(df -P "$target_dir" 2>/dev/null | awk 'NR == 2 && !seen {print $1; seen = 1}' || true)"
 	if [ -n "${dev:-}" ]; then
-		filesystem="$(mount 2>/dev/null | awk -v d="$dev" '$1==d {
+		filesystem="$(mount 2>/dev/null | awk -v d="$dev" '$1 == d && !seen {
 			for (i = 1; i <= NF; i++) {
-				if ($i ~ /^\(/) { gsub(/[(),]/, "", $i); print $i; exit }
+				if ($i ~ /^\(/) { gsub(/[(),]/, "", $i); print $i; seen = 1; break }
 			}
 		}' || true)"
 		storage="$dev"
@@ -168,26 +168,26 @@ Darwin)
 	fullfsync="ON (declared; Meta::open fails closed without it, docs/RECOVERY.md)"
 	;;
 Linux)
-	cpu_model="$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+	cpu_model="$(awk -F': ' '/^model name/ && !seen {print $2; seen = 1}' /proc/cpuinfo 2>/dev/null || true)"
 	if [ -z "${cpu_model:-}" ]; then
-		cpu_model="$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}' || true)"
+		cpu_model="$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ && !seen {print $2; seen = 1}' || true)"
 	fi
 	[ -n "${cpu_model:-}" ] || cpu_model="unavailable"
 	cpu_cores="$(nproc 2>/dev/null || echo unavailable)"
-	mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+	mem_kb="$(awk '/^MemTotal:/ && !seen {print $2; seen = 1}' /proc/meminfo 2>/dev/null || true)"
 	if [ -n "${mem_kb:-}" ]; then
 		ram_bytes="$((mem_kb * 1024))"
 	fi
 	if [ -r /etc/os-release ]; then
-		os_name="$(awk -F= '/^NAME=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release)"
-		os_version="$(awk -F= '/^VERSION_ID=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release)"
+		os_name="$(awk -F= '/^NAME=/ && !seen {gsub(/"/, "", $2); print $2; seen = 1}' /etc/os-release)"
+		os_version="$(awk -F= '/^VERSION_ID=/ && !seen {gsub(/"/, "", $2); print $2; seen = 1}' /etc/os-release)"
 		[ -n "${os_name:-}" ] || os_name="Linux"
 		[ -n "${os_version:-}" ] || os_version="unavailable"
 	fi
 	filesystem="$(stat -f -c %T "$target_dir" 2>/dev/null || echo unavailable)"
 	src="$(findmnt -no SOURCE --target "$target_dir" 2>/dev/null || true)"
 	if [ -n "${src:-}" ]; then
-		model="$(lsblk -no MODEL "$src" 2>/dev/null | head -n1 | tr -s ' ' || true)"
+		model="$(lsblk -no MODEL "$src" 2>/dev/null | awk '!seen {first = $0; seen = 1} END {if (seen) print first}' | tr -s ' ' || true)"
 		storage="$src${model:+ ($model)}"
 	fi
 	;;
@@ -208,7 +208,7 @@ synchronous="FULL (declared; Meta::open fails closed without it, docs/RECOVERY.m
 
 forge_version="unavailable"
 if [ -n "$forge_bin" ] && [ -x "$forge_bin" ]; then
-	forge_version="$("$forge_bin" --version 2>/dev/null | head -n1 || echo unavailable)"
+	forge_version="$("$forge_bin" --version 2>/dev/null | awk 'NR == 1 {first = $0} END {if (NR) print first}' || echo unavailable)"
 fi
 
 rustc_version="unavailable"
