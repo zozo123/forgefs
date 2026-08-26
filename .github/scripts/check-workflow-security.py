@@ -84,7 +84,10 @@ ALLOWED_RUN_COMMANDS = frozenset(
         "cargo +nightly fuzz run tar_roundtrip -- -max_total_time=60 -rss_limit_mb=2048",
         "cargo +nightly fuzz run tree_name -- -max_total_time=60 -rss_limit_mb=2048",
         "cargo audit --deny warnings",
+        "sudo apt-get install -y -qq strace",
+        "sudo apt-get update -qq",
         "cargo build --locked -p forge-cli",
+        "cargo build --locked -p forge-api --example powerloss_multibatch",
         "cargo check --manifest-path fuzz/Cargo.toml --bins",
         "cargo check --workspace --all-targets --locked",
         "cargo clippy --workspace --all-targets --locked -- -D warnings",
@@ -103,6 +106,7 @@ ALLOWED_RUN_COMMANDS = frozenset(
         "python3 .github/scripts/test-release-tooling.py",
         "python3 .github/scripts/test-workflow-security.py",
         "scripts/cli-abi-conformance.sh target/debug/forge",
+        "scripts/powerloss/power-loss-gate.sh target/debug/forge",
         "scripts/release-gate.sh target/debug/forge",
     }
 )
