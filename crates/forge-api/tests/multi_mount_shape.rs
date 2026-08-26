@@ -354,14 +354,22 @@ fn remounting_a_path_over_staged_work_is_refused() {
     assert_eq!(f.read(&root, &ns, "/other/a.txt").unwrap(), b"BASE");
 }
 
-/// Characterisation, unchanged by I19. I9 says stale observations fail checkin
-/// but not for how long an observation constrains the session.
-/// `cas_ref_session` deletes observations for the whole namespace while
-/// deleting overlay for the published mount only, so a read through a foreign
-/// mount stops constraining the session at the first checkin of any other
-/// mount. That is audit gap 5 and is not what this change fixes.
+/// I9's epoch is the MOUNT that recorded the read, not the session (#329).
+///
+/// This is the test that used to assert the opposite. `cas_ref_session` cleared
+/// `observations` for the whole namespace while clearing `overlay` for the
+/// published mount alone, so a read through a foreign mount stopped
+/// constraining the session at the first checkin of any OTHER mount -- and the
+/// overlay that read justified outlived the observation that justified it.
+///
+/// Per-mount is the only epoch the rest of the system can carry. The
+/// per-session alternative has to clear the whole namespace's OVERLAY with the
+/// observations to be coherent, and that destroys another mount's staged work,
+/// which I18 forbids outright. Under I19 every read-write mount already owns
+/// its own pin, its own overlay and its own CAS, so the observation is the last
+/// piece of session state that was not scoped the way everything around it is.
 #[test]
-fn a_checkin_of_one_mount_forgets_every_other_mounts_observations() {
+fn i9_a_checkin_of_one_mount_keeps_every_other_mounts_observations() {
     let (_d, f, root) = diverged();
 
     let ns = f.session_open(&root, "base").unwrap();
@@ -376,11 +384,42 @@ fn a_checkin_of_one_mount_forgets_every_other_mounts_observations() {
     seed(&f, &root, "other", "/a.txt", b"MOVED");
 
     f.write(&root, &ns, "/y.txt", b"two", false).unwrap();
+    let second = f.checkin(&root, &ns, "/", "second").unwrap_err();
+    let Error::StaleObservation { path, .. } = &second else {
+        panic!("the /dep read must still constrain the session: {second:?}");
+    };
+    assert_eq!(path, "/dep:/a.txt", "{second:?}");
+
+    // I21: the refusal is one a re-read clears, and nothing was discarded.
+    assert_eq!(f.read(&root, &ns, "/dep/a.txt").unwrap(), b"MOVED");
+    let third = f.checkin(&root, &ns, "/", "third").unwrap();
+    assert!(matches!(third, CasResult::Updated { .. }), "{third:?}");
+    assert_eq!(read_ref(&f, &root, "base", "/y.txt"), b"two");
+}
+
+/// The other half of the same epoch (#329): a checkin DOES clear the
+/// observations of the mount it publishes, in the same transaction that clears
+/// that mount's overlay and re-pins it.
+///
+/// Without this half, "never forget an observation" would wedge the session
+/// that read a path and then wrote it: publication makes the mount's own tree
+/// disagree with the observation the overlay had been shadowing, and no re-read
+/// could have prevented a refusal it did not cause (I21).
+#[test]
+fn i9_a_checkin_clears_the_observations_of_the_mount_it_publishes() {
+    let (_d, f, root) = diverged();
+
+    let ns = f.session_open(&root, "base").unwrap();
+    f.mount(&root, &ns, "/", "ref:base", true).unwrap();
+    assert_eq!(f.read(&root, &ns, "/a.txt").unwrap(), b"BASE");
+    f.write(&root, &ns, "/a.txt", b"NEW", false).unwrap();
+    let first = f.checkin(&root, &ns, "/", "first").unwrap();
+    assert!(matches!(first, CasResult::Updated { .. }), "{first:?}");
+
+    f.write(&root, &ns, "/b.txt", b"two", false).unwrap();
     let second = f.checkin(&root, &ns, "/", "second").unwrap();
-    assert!(
-        matches!(second, CasResult::Updated { .. }),
-        "the /dep read was forgotten by the first checkin: {second:?}"
-    );
+    assert!(matches!(second, CasResult::Updated { .. }), "{second:?}");
+    assert_eq!(read_ref(&f, &root, "base", "/a.txt"), b"NEW");
 }
 
 /// I9 still holds for a read-only mount: it resolves live on purpose, so a read

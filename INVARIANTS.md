@@ -26,7 +26,7 @@ cap         (operation, resource); attenuation ⊆ parent
 | I6 | Ref + reflog (+ seal) commit together. |
 | I7 | tags/ conflicts/ heads/ are typed, not naming conventions. |
 | I8 | session.open pins a base OID. Reads through a session resolve against a pinned base -- per mount, see I19 -- and its overlay, never a live ref another agent can move. Checkin CASes that oid, never a moving head. |
-| I9 | Every read records what it saw at a path: a blob id, a directory's tree id, or its absence. Silence is not a recorded read. Stale observations fail checkin even on disjoint writes. |
+| I9 | Every read records what it saw at a path: a blob id, a directory's tree id, or its absence. Silence is not a recorded read. Stale observations fail checkin even on disjoint writes. The EPOCH of an observation is the MOUNT that recorded it, never the session: a checkin clears the observations of the one mount it publishes, in the transaction that clears that mount's overlay and re-pins it, and every other mount's reads keep constraining the session until that mount is itself checked in or the session is abandoned. So publishing one mount can never forget a read taken through another, and no overlay outlives the observations that justified it. The per-session epoch is not available: to be coherent it would have to clear the whole namespace's overlay along with the observations, destroying staged work I18 forbids destroying. An observation is dropped only by publishing its own mount, by re-reading the path, or by `abandon`. |
 | I10 | Checkin is a Contribution (`0x06`), not a loose message. A missing `Commit.contrib` is the canonical historical `None`; a present edge must verify as a Contribution. Reachable Contribution sets are monotonic facts: merge is set union, so parent order and wall clocks cannot select or retract a receipt. Every current-version seal manifest includes each Contribution reachable from its commit and binds the entry to the receipt's immutable agent. |
 | I11 | Overlap is a Conflict object. |
 | I12 | Merge order comes only from the commit parent DAG and real merge-bases. `Commit.ts` and `Contribution.ts` are advisory metadata, never causal order. |
@@ -114,17 +114,13 @@ or explicitly refuse everything staged. I19-I21 close the first blind spot;
 I22 closes the second, scoped to the `noop` outcome, because `updated` and
 `forked` are progress and may legitimately leave another mount staged. What the
 audit on `docs/invariant-shape-audit` found and these changes do **not** fix,
-stated so it is not mistaken for covered:
+stated so it is not mistaken for covered. The observation-epoch gap listed first
+here is now CLOSED: I9 states its epoch, `cas_ref_session` and
+`complete_noop_session` scope `DELETE FROM observations` the way they already
+scoped `DELETE FROM overlay`, and
+`multi_mount_shape.rs::i9_a_checkin_of_one_mount_keeps_every_other_mounts_observations`
+asserts the corrected behaviour (#329). What remains:
 
-* **The observation epoch is per-session while the overlay epoch is per-mount.**
-  `Meta::cas_ref_session` deletes observations for the whole namespace while
-  deleting overlay for the published mount alone, so a foreign-mount read stops
-  constraining the session at the first checkin of any *other* mount. Either the
-  epoch is per-session -- in which case say so, and clear the overlay with it --
-  or it is per-mount, in which case the `DELETE FROM observations` must be scoped
-  the way `DELETE FROM overlay` is.
-  `multi_mount_shape.rs::a_checkin_of_one_mount_forgets_every_other_mounts_observations`
-  pins it.
 * **A no-op checkin leaves other mounts' overlay ROWS staged, and `abandon`
   counts rows.** `#342` scoped I22 to WORK rather than rows, so a `Noop` is
   legitimate over an overlay that folds to its own mount's base -- but

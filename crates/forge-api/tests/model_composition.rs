@@ -1486,12 +1486,18 @@ impl World {
         }
     }
 
-    /// A successful checkin clears that mount's overlay and the whole session's
-    /// observation set, and repins the mount it published.
+    /// A completed checkin clears the published mount's overlay AND that same
+    /// mount's observations, and repins the mount it published.
+    ///
+    /// I9's epoch is the mount, not the session (#329). This used to clear the
+    /// whole session's observation set, matching a `cas_ref_session` that
+    /// deleted every observation in the namespace while deleting overlay for
+    /// one mount -- so a read through a foreign mount stopped constraining the
+    /// session at the first checkin of any other mount.
     fn apply_checkin_clear(&mut self, ns: &str, mount: &str, new_base: Option<Cid>) {
         let sm = self.model.sessions.get_mut(ns).expect("session");
         sm.overlay.remove(mount);
-        sm.obs.clear();
+        sm.obs.retain(|(obs_mount, _), _| obs_mount != mount);
         if let Some(cid) = new_base {
             sm.base.insert(mount.to_string(), cid);
         }
