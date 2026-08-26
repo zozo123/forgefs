@@ -475,7 +475,12 @@ impl Forge {
             self.collect_reachable_roots(cap, &mut report, &mut roots)?;
         }
 
-        verify_graph(&self.store, roots, &mut report);
+        // A walk this build will not finish is a refusal, not a verdict about
+        // the repository (#359): it propagates as `Error::Invalid`, exit 1,
+        // rather than becoming a finding that would make `report.ok` false and
+        // send the CLI to exit 2 over intact bytes. Same reasoning as the
+        // unauditable-schema refusal above.
+        verify_graph(&self.store, roots, &mut report)?;
         report.finish();
         Ok(report)
     }
@@ -512,21 +517,25 @@ fn check_object_expectation(
     }
 }
 
+/// Walk every root, recording what is wrong with the objects as findings.
+///
+/// The one thing it does NOT record as a finding is running out of walk
+/// budget. `GraphWorkQueue` refuses past its ceiling, and that refusal says
+/// nothing about the bytes -- every object walked so far verified -- so it
+/// leaves as `Error::Invalid` and never as a `report.ok = false` the CLI turns
+/// into exit 2 (#359).
 fn verify_graph(
     store: &forge_store::Store,
     roots: Vec<(ObjectId, GraphExpectation, String)>,
     report: &mut FsckReport,
-) {
+) -> Result<()> {
     let mut queue = GraphWorkQueue::default();
     for (id, expected, resource) in roots {
-        if let Err(error) = queue.schedule(GraphEdge {
+        queue.schedule(GraphEdge {
             id,
             expected,
             resource,
-        }) {
-            report.finding("GRAPH_LIMIT", "object-graph", error.to_string());
-            return;
-        }
+        })?;
     }
     let mut verified: HashMap<ObjectId, ObjectType> = HashMap::new();
 
@@ -569,12 +578,10 @@ fn verify_graph(
             }
         };
         for edge in decoded.edges {
-            if let Err(error) = queue.schedule(edge) {
-                report.finding("GRAPH_LIMIT", "object-graph", error.to_string());
-                return;
-            }
+            queue.schedule(edge)?;
         }
     }
+    Ok(())
 }
 
 fn scan_all_object_paths(

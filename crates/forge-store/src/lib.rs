@@ -9,7 +9,7 @@ pub mod objectstore;
 pub use blob::{BlobStoreStats, DirectoryBarrier, GcObjectGuard, LocalBlobStore, PublishBatch};
 pub use graph::{
     decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, GraphWorkQueue,
-    VerifiedGraphObject, MAX_GRAPH_OBJECTS,
+    VerifiedGraphObject, DEFAULT_MAX_GRAPH_OBJECTS, MAX_GRAPH_OBJECTS_ENV,
 };
 pub use meta::{
     sanitize_agent, validate_ref_kind, validate_ref_name, AbandonedSession, CatalogAudit,

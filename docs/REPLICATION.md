@@ -49,10 +49,13 @@ WAN. #143 is closed. The seam exists:
   the physical evidence a backend author must supply.
 
 So the precondition #25 named is met. The gate in the issue body -- "no
-distributed mode until local invariants and fsck are solid" -- is **not** met:
-`#359` reports fsck and gc calling corruption on repositories past 1,000,000
-objects, and `#21`'s V1 gate 1 is open. Truth at scale on one node comes first.
-This issue stays P2 research.
+distributed mode until local invariants and fsck are solid" -- is **not** met.
+`#359` is closed and only half of what it names is fixed: fsck and gc no longer
+call a repository past 1,000,000 objects CORRUPT -- they refuse the walk, exit
+1, and the ceiling is now settable -- but the walk itself is still not
+incremental or resumable, and that is the half a second node needs. `#21`'s V1
+gate 1 is also open. Truth at scale on one node comes first. This issue stays P2
+research.
 
 ## 3. The first PR: enumeration is not on the seam
 
@@ -129,4 +132,5 @@ is days and pays for itself on one node -- it makes the in-memory backend
 merits, not as the start of a replication project.
 
 Items 2 through 5 of section 4 are each a design document in their own right.
-None of them should begin before `#359` and `#21`'s gate 1.
+None of them should begin before a resumable graph walk -- the half of `#359`
+its classification fix deliberately left open -- and `#21`'s gate 1.
