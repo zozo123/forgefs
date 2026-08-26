@@ -38,7 +38,7 @@ fn awk_commands(text: &str) -> Vec<(usize, String)> {
             }
             command.push(ch);
         }
-        commands.push((text[..offset].lines().count(), command));
+        commands.push((text[..offset].matches('\n').count() + 1, command));
     }
     commands
 }
@@ -63,16 +63,15 @@ fn gate_pipeline_readers_never_stop_before_eof() {
             );
         }
 
-        for (line_no, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with('#') {
-                continue;
-            }
-            assert!(
-                !code.contains("| head "),
-                "{name}:{} pipes into head under pipefail: {line}",
-                line_no + 1
-            );
-        }
+        let executable = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let normalized = executable.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !normalized.contains("| head "),
+            "{name} pipes into head under pipefail"
+        );
     }
 }
