@@ -6,6 +6,7 @@ use crate::cbor::{
 };
 use crate::tree::{validate_name, Tree, TreeEntry};
 use forge_types::{EntryKind, Error, ObjectId, ObjectType, Result};
+use std::io::Read;
 
 /// Most entries one VERSION 1 Tree may hold.
 ///
@@ -37,6 +38,25 @@ pub fn hash_parts(parts: &[&[u8]]) -> ObjectId {
         h.update(p);
     }
     ObjectId(*h.finalize().as_bytes())
+}
+
+/// Identity of all bytes read from `reader`, without materializing them.
+///
+/// This is exactly the same BLAKE3-256 identity as [`hash_bytes`] and
+/// [`hash_parts`]. Storage uses it to re-prove durable object identity with a
+/// fixed memory footprint while keeping ObjectId semantics single-sourced.
+pub fn hash_reader(reader: &mut impl Read) -> std::io::Result<ObjectId> {
+    const BUFFER_BYTES: usize = 64 * 1024;
+    let mut h = blake3::Hasher::new();
+    let mut buffer = [0u8; BUFFER_BYTES];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buffer[..n]);
+    }
+    Ok(ObjectId(*h.finalize().as_bytes()))
 }
 
 /// The framed prefix that precedes a Blob payload: type byte, header length,

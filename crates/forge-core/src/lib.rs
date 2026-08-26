@@ -8,8 +8,8 @@ pub mod tree;
 
 pub use contribution::{Contribution, ContributionRead};
 pub use object::{
-    blob_frame_prefix, decode_object_type, hash_bytes, hash_parts, parse_file, Blob, Commit,
-    Conflict, ConflictPath, Snapshot, MAX_CONFLICT_ITEMS, MAX_TREE_ENTRIES,
+    blob_frame_prefix, decode_object_type, hash_bytes, hash_parts, hash_reader, parse_file, Blob,
+    Commit, Conflict, ConflictPath, Snapshot, MAX_CONFLICT_ITEMS, MAX_TREE_ENTRIES,
 };
 pub use provenance::ProvenanceManifest;
 pub use tree::{apply_overlay, split_path, validate_name, Overlay, Tree, TreeEntry, TreeStore};
@@ -78,6 +78,17 @@ mod tests {
         let b2 = Blob::decode(&bytes).unwrap();
         assert_eq!(b, b2);
         assert_eq!(hash_bytes(&bytes), hash_bytes(&b.encode()));
+    }
+
+    #[test]
+    fn streaming_hash_matches_buffered_hash() {
+        let data = b"forge streaming identity".repeat(8193);
+        let expected = hash_bytes(&data);
+        let mut reader = std::io::Cursor::new(&data);
+        assert_eq!(hash_reader(&mut reader).unwrap(), expected);
+
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(hash_reader(&mut empty).unwrap(), hash_bytes(&[]));
     }
 
     #[test]
