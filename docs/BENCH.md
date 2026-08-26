@@ -12,8 +12,8 @@ Performance claims must name a workload ID, hardware, durability policy, harness
 | W4 | Same-path overlap | two agents | merge returns `MergeConflict`; conflict object preserves both immutable inputs | CLI/API merge-conflict e2e tests |
 | W5 | Crash and reopen | one declared publish/checkpoint phase | after reopen, every committed ref resolves and `fsck --full` succeeds; otherwise the harness must exit non-zero with corruption | bootstrap/durability crash tests; real SIGKILL remains #147 |
 | W6 | Large tree walk/update | entries: 10k, 100k, 1M | output tree is byte-for-byte identical; report lookup/update scaling | dedicated tree benchmark; do not infer W6 from W1/W2 |
-| W8 | Read fanout: N readers re-reading a fixed path set through their own sessions | readers x reads | every read returns the seeded payload; catalog traffic lands mostly on the read pool | `forge bench --readers` / `read_fanout_bounded` |
 | W7 | Git worktree comparison | W1 only | identical logical edit/checkin count and demonstrated durability-equivalence; otherwise mark `non-comparable` | `scripts/w7-git-comparator.sh` (#24) |
+| W8 | Read fanout: N readers re-reading a fixed path set through their own sessions | readers x reads | every read returns the seeded payload; catalog traffic lands mostly on the read pool | `forge bench --readers` / `read_fanout_bounded` |
 
 `forge bench` covers W1, W2 and (with `--readers`) W8. W3-W5 are correctness/crash harnesses, not throughput substitutes. W6 is a scaling study. W7 is the external comparator; run it with
 `scripts/w7-git-comparator.sh` and read its verdict before quoting any
