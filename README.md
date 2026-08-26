@@ -67,11 +67,12 @@ forge-0.3.0-x86_64-unknown-linux-gnu/CLI_ABI.md
 forge-0.3.0-x86_64-unknown-linux-gnu/forge
 ```
 
-`SHA256SUMS` has 36 entries. It covers the four binaries *and* the release-gate evidence published
-beside them — per target: a build-info file, the ABI conformance table, the Conflict-object
-record, the environment line (as both `.txt` and `.json`), the `fsck --full` report, the gate
-summary and the seal attestation. Each release is also covered by a SLSA provenance attestation
-you can check without trusting this page:
+`SHA256SUMS` has 41 entries. It covers the four binaries *and* the release-gate evidence published
+beside them — per target: a build-info file, a CycloneDX SBOM, the ABI conformance table, the
+Conflict-object record, the environment line (as both `.txt` and `.json`), the `fsck --full`
+report, the gate summary and the seal attestation, plus the double-build reproducibility evidence
+for `x86_64-unknown-linux-gnu` (see [`docs/SUPPLY-CHAIN.md`](docs/SUPPLY-CHAIN.md)). Each release
+is also covered by a SLSA provenance attestation you can check without trusting this page:
 
 ```bash
 gh attestation verify forge-$V-$T.tar.gz -R zozo123/forgefs
