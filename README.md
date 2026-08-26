@@ -67,7 +67,9 @@ forge-0.3.0-x86_64-unknown-linux-gnu/CLI_ABI.md
 forge-0.3.0-x86_64-unknown-linux-gnu/forge
 ```
 
-`SHA256SUMS` has 41 entries. It covers the four binaries *and* the release-gate evidence published
+`SHA256SUMS` for v0.4.0 has 41 entries — the v0.3.0 file checked above has 36, because v0.4.0's
+payload catalog ([`.github/scripts/release-assets.sh`](.github/scripts/release-assets.sh)) adds a
+CycloneDX SBOM per target and a reproducibility report. It covers the four binaries *and* the release-gate evidence published
 beside them — per target: a build-info file, a CycloneDX SBOM, the ABI conformance table, the
 Conflict-object record, the environment line (as both `.txt` and `.json`), the `fsck --full`
 report, the gate summary and the seal attestation, plus the double-build reproducibility evidence
@@ -124,6 +126,9 @@ binaries — the released `forge 0.3.0` and the v0.4.0 build:
 | session forks at `heads/agents/<agent>/forks/<ref>/<ulid>` | no — `forks/<ref>/<agent>/<ulid>` | **yes, this is a rename** |
 | `mount --rw` refused at mount time for a protected ref, an `oid:` spec, or a ref not holding a commit | partly — only the `oid:` and non-commit cases | yes, protected refs too |
 | `checkin --mount <name>` refuses a name this session has no mount for | no — it published the default `/` mount and said `updated` | yes, exit 1 |
+| `forge mv` — an atomic move inside one mount (I24) | no — the verb does not exist | yes |
+| a read taken through one mount still constrains the session after another mount is checked in | no — the first checkin of any mount forgot it (#329) | yes |
+| a repository too large for the object-graph walk is `invalid`, not `corrupt` | no — exit 2, `object graph exceeded 1000000 objects` | yes, exit 1 |
 | `seal` CASes the ref it names and refuses a moved head | no — it silently sealed the pre-race commit | yes, exit 4 |
 | `serve` refuses unknown ops and fields, and answers structured JSON | no — unknown fields were silent defaults, `ns.checkin` returned a Rust `Debug` string | yes |
 | `fsck` on an un-migrated catalog refuses at exit 1 instead of reporting corruption at exit 2 | no — `FAILED (full)`, exit 2, `CATALOG_SCHEMA` + `SCHEMA_LEDGER` findings | yes |
@@ -254,9 +259,10 @@ In a clone rustup *does* honour `rust-toolchain.toml` and will fetch the pinned 
 
 **How this page was produced.** Every command on it was executed. Unless a block says otherwise, it
 ran against a `--release` build of `main` with the version-bump patch the release-preparation
-workflow applies, so `forge --version` reports `forge 0.4.0`. The transcripts were captured at
-commit `4593afc`; `e60310d` landed after them and adds one test file and two documents, so the
-release binary is unchanged and the gates were re-run there. The install and attestation transcripts above are runs against the **released
+workflow applies, so `forge --version` reports `forge 0.4.0`. Most transcripts were captured at commit
+`4593afc`; the atomic-move, observation-epoch and graph-ceiling sections and every count on this
+page were captured at `2581ae0` or later, after `mv` (#366), the I9 epoch fix (#363) and the graph
+reclassification (#367) landed. The install and attestation transcripts above are runs against the **released
 v0.3.0** artifacts, because v0.4.0's did not exist yet when they were captured; only `$V` differs.
 Object ids for *content* are reproducible and you should see the same ones — `b6b49a01…` for
 `pub fn a() {}` in both the worked example and the reclamation example below. Commit and tree ids
@@ -409,8 +415,9 @@ forge: stale observation of /vendor:/api.txt: expected 0aee50505cca4e134e62f9098
 **Exit 4.** Carol's write does not collide with anything. She is refused because the file she
 *reasoned from* is no longer the file she read. That is the property that makes an agent's output
 trustworthy, and it is the one thing a lock-free shared checkout cannot give you. Her staged work is
-not destroyed; the refusal names the mount and the path. (It holds *within* one checkin. Across
-checkins the epoch is per-session and it does not — see [Limits](#limits), issue #329.)
+not destroyed; the refusal names the mount and the path. And as of v0.4.0 it keeps holding across
+checkins: the epoch of an observation is the **mount** that recorded it, so publishing one mount no
+longer forgets a read taken through another (issue #329; I9 now states which epoch it means).
 
 ### Integrate, seal, verify
 
@@ -462,7 +469,7 @@ Eight nouns are enough to reason about everything above.
 One publication, exactly:
 
 ```text
-write            -> stage into the mount's overlay
+write, mv        -> stage into the mount's overlay
 checkin --mount  -> resolve that mount BY NAME, not by path prefix
                  -> fold that overlay onto that mount's pin
                  -> build a Contribution
@@ -482,7 +489,7 @@ Automation keys on those exit codes, never on stderr wording: `4` is a stale obs
 conflict or a moved head under `seal`; `2` is corruption or a sealed-state violation; `1` is denial
 or bad input; `3` is transient contention; `5` is I/O or internal failure.
 [`CLI_ABI.md`](CLI_ABI.md) is the contract; [`scripts/cli-abi-conformance.sh`](scripts/cli-abi-conformance.sh)
-executes it as **52 rows, 49 of them blocking** and three declared *unexercised* rather than faked.
+executes it as **57 rows, 54 of them blocking** and three declared *unexercised* rather than faked.
 
 ## What changed in v0.4.0, verb by verb
 
@@ -538,6 +545,40 @@ typo silently published the default mount and answered `updated`, exit 0 — inc
 (issue #353). A path *inside* a mount is not that mount; only the exact name resolves, modulo
 leading and trailing slashes.
 
+### `mv` — a move is one staged transaction, not copy plus delete
+
+New verb, and a new invariant (I24). `forge mv --ns <ns> <from> <to>` supersedes the source and
+destination subtrees, stages every destination row and writes the source tombstone in **one catalog
+transaction**, so the only observable states are before and after: nothing sees the content at both
+paths, and nothing sees it at neither.
+
+```bash
+forge --cap $ROOT mount --ns "$S" / ref:work --rw
+forge --cap $ROOT mv --ns "$S" /old /new
+forge --cap $ROOT ls --ns "$S" /
+forge --cap $ROOT checkin --ns "$S" -m 'move old to new'
+```
+
+```text
+mounted / -> ref:work
+moved /old /new tree 2447c9defee8626dd0400533fc6e24ab43300a0815273eb9496cf15185621357 entries=1
+blob  - 9c77e92db88530dda32ae0af5e0b228ffc6721eee1c9922e8fc5acf52c9e6415 main.rs
+tree  - 0000000000000000000000000000000000000000000000000000000000000000 new
+updated work 6c4d77b390377594efc6f4c248a2e4a2f3b68a34dee69cd3a25a688968d4c567
+```
+
+It adds no commit point: publication is still one overlay fold, one Contribution, one CAS. It also
+**never spans mounts**, because two mounts pin two refs (I19) and publish separately, so there is no
+transaction that could carry both halves:
+
+```text
+forge: invalid: rename crosses mounts: /new/a.rs resolves through / and /w2/a.rs through /w2; each mount pins its own ref and publishes separately (I19), so there is no transaction that could carry both halves
+```
+
+Exit **1**, refused rather than half-applied. The zero tree id on `new` in the listing above is the
+staged-directory display noted under [Limits](#limits); in a session opened after the checkin the
+same entry reads `2447c9de…`, the tree the move reported.
+
 ### `seal` compare-and-swaps the ref it names
 
 `seal` reads a ref, builds a snapshot from it, and publishes a tag. In v0.3.0 those were two
@@ -573,7 +614,7 @@ FORGEFS_TEST_SEAL_CAS_BARRIER, which exists only in a debug build
 
 ### `serve` is a specified projection of the CLI — a wire-format change
 
-The daemon serves **8 ops**, every one of them a CLI verb, against the CLI's 25 verbs. It is a
+The daemon serves **9 ops**, every one of them a CLI verb, against the CLI's 26 verbs. It is a
 strict subset by design and now by documentation. What changed in v0.4.0 is that it is also
 *specified*: `DAEMON_OPS` declares every op and every field each op accepts, and anything else is
 refused before the op runs.
@@ -678,11 +719,11 @@ corruption.
 
 ## Why you should believe any of this
 
-[INVARIANTS.md](INVARIANTS.md) is 23 numbered rules, I1 through I23. That file is not a manifesto,
+[INVARIANTS.md](INVARIANTS.md) is 24 numbered rules, I1 through I24. That file is not a manifesto,
 and this is the part that is genuinely unusual:
 
 **Every rule names its production owner and its test.** Under the "Executable evidence" heading is
-a table mapping every one of I1–I23 to the module that implements it and to the exact test files
+a table mapping every one of I1–I24 to the module that implements it and to the exact test files
 that prove it. I18 ("a refused checkin never destroys staged work") points at
 `forge-api/workspace.rs`, `forge-api/gc.rs`, `forge-store/meta.rs`, and at
 `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `gc_and_abandon.rs`, `model_composition.rs`
@@ -691,7 +732,7 @@ and `docs/GC.md`. You can check any claim on this page by opening the row.
 **A PR that cannot name an invariant does not merge.** That is a stated rule in INVARIANTS.md,
 enforced by review rather than by CI. When a fix needs a rule that does not exist yet, the rule gets
 added: I19–I21 arrived with the multi-mount pinning fix, I22 with the checkin refusal, I23 with
-garbage collection.
+garbage collection, and I24 with the atomic move documented above.
 
 **The evidence was itself audited by mutation.** A 45-mutation audit (#301) applied, one at a time,
 the smallest production edit that genuinely violates each invariant, and re-ran the full suite plus
@@ -797,10 +838,10 @@ bash scripts/release-gate.sh target/release/forge
 ```
 
 At the v0.4.0 tree, on the box described under [What it costs](#what-it-costs), those produce:
-`fmt` clean; `clippy` clean; **418 tests passed, 0 failed**, 2 ignored, across 112 test binaries;
+`fmt` clean; `clippy` clean; **431 tests passed, 0 failed**, 2 ignored, across 114 test binaries;
 
 ```text
-abi rows=52 blocking=49 known_failing=0 unexercised=3 blocking_failures=0
+abi rows=57 blocking=54 known_failing=0 unexercised=3 blocking_failures=0
 abi-conformance: CLI_ABI.md contract holds for every blocking row
 ```
 
@@ -1170,21 +1211,26 @@ because they are no longer true**, and the ones that changed shape say what is l
   default ratio for a 30 GB ext4). Size your filesystem by inodes, not by gigabytes: an object file
   averaged well under a kilobyte here. The repository was intact afterwards; `fsck --full` walked
   all 685,044 objects and returned `ok`.
-- **A repository past 1,000,000 objects reports corruption on intact bytes (#359).**
-  `crates/forge-store/src/graph.rs` holds `pub const MAX_GRAPH_OBJECTS: usize = 1_000_000;` and both
-  the work queue and the typed-graph walk raise `Error::Corrupt("object graph exceeded 1000000
-  objects")` on reaching it, so `fsck`, `gc` and publish-time typed-edge verification would report
-  **exit 2** for a repository that simply grew there through ordinary import and checkin. This is a
-  bound on a *traversal*, not on the data, and it is the same misclassification as #348 and #355.
-  **Stated from the source, not reproduced:** the attempt above ran out of inodes at 685k objects,
-  so this page cannot claim to have seen it fire. `fsck --full` at 685,044 objects was `ok`.
-- **The observation epoch is per-session for observations but per-mount for overlay (#329).** A
-  successful checkin on *any* mount clears the whole session's observation set. Re-verified on
-  v0.4.0: a session reads `/vendor/api.txt` through a read-only mount, checks in on `/` (exit 0),
-  another agent then moves `deps`, and the session's next checkin on `/` **succeeds** — the earlier
-  cross-mount read has been forgotten. Within one checkin, cross-mount staleness *is* detected (that
-  is the exit 4 in the worked example). I9 does not state its epoch; the two cleanup statements
-  disagree.
+- **The object-graph walk is bounded, and it is not resumable.** `fsck --full`, `gc` and seal
+  verification hold the entire reachable set in memory — one `Vec`, one `HashSet`, one `HashMap` —
+  so there is a ceiling, `DEFAULT_MAX_GRAPH_OBJECTS = 1_000_000`. Reaching it is **exit 1**, and the
+  refusal says why and what to do; measured with the ceiling forced down to three:
+
+  ```text
+  forge: invalid: object graph walk reached this build's ceiling of 3 objects. The repository is not corrupt; this is a memory bound on the WALK, not a bound on any object, and no object was found damaged. Re-run with FORGEFS_MAX_GRAPH_OBJECTS=<n> above 3 (the walk holds roughly 100 bytes per object, so budget that much RAM), or reduce what is reachable -- `forge gc --dry-run` reports it -- and re-run. See docs/GC.md.
+  ```
+
+  In v0.3.0 that was `corrupt: object graph exceeded 1000000 objects`, **exit 2**, on intact bytes
+  (#359). The classification is fixed; the bound is not gone. A repository past a million objects
+  needs `FORGEFS_MAX_GRAPH_OBJECTS` and the RAM to match, and a resumable walk — the real answer —
+  is not what v0.4.0 ships. The default ceiling was not reached on this box: the inode exhaustion
+  above stopped it at 685,044 objects, where `fsck --full` returned `ok`.
+- **A staged directory cannot be listed until it is published.** `write /d/x.txt` into a
+  read-write mount, and `ls /` shows the new directory with a **zero tree id** and `read /d/x.txt`
+  returns its contents — while `ls /d` answers `forge: not found: d`, exit 1. The destination of an
+  `mv` behaves the same way before its checkin. Nothing is lost and the checkin publishes correctly;
+  the listing of the parent and the listing of the child simply disagree about whether the directory
+  is there. Measured on v0.4.0.
 - **A no-op checkin and `abandon` disagree about what "staged" means (#342).** `Noop` clears only
   the published mount's overlay rows, while `abandon_session` counts rows across the whole
   namespace, so `checkin` can say "nothing to do" and `abandon` can still refuse the same session.
@@ -1224,17 +1270,21 @@ because they are no longer true**, and the ones that changed shape say what is l
   a 32 KiB free-space threshold rather than installing a handler, but automation must still
   distinguish `WIFSIGNALED` from every row of the exit-code table. `CLI_ABI.md` explains why.
 
-Two entries that were on this list for v0.3.0 and are **gone because they were fixed**, not because
-they were quietly dropped: `seal` not being CAS'd against the ref it names (#331), and a read-write
-mount of a protected ref wedging the session (#328, for new mounts). Both are documented above under
-[What changed in v0.4.0](#what-changed-in-v040-verb-by-verb).
+Four entries that were on this list for v0.3.0 and are **gone because they were fixed**, not
+because they were quietly dropped: `seal` not being CAS'd against the ref it names (#331); a
+read-write mount of a protected ref wedging the session (#328, for new mounts); the observation
+epoch, which is now the mount rather than the session, with I9 stating so (#329); and a large
+repository being called corrupt rather than too large to walk (#359). All four are documented above
+under [What changed in v0.4.0](#what-changed-in-v040-verb-by-verb) or in this list.
 
 One entry that was **checked and found no longer true**: issue #349 reported that the `release`
 GitHub Environment had no protection rules while `docs/RELEASING.md` said it did. As of this
 release the environment has a required reviewer and a deployment branch policy restricted to `v*`
-tags, so the documented control exists. The issue's second half still stands: `RELEASING.md` does
-not mention that the prepare-release PR's workflow runs land in `action_required` and need an
-explicit approval before they will start.
+tags, so the documented control exists. The issue's second half still stands, and cutting this
+release confirmed it: all three of the prepare-release PR's workflow runs (`ci`, `release`,
+`security`) landed in `action_required` and sat there until each was approved with
+`POST /repos/zozo123/forgefs/actions/runs/{id}/approve`. `docs/RELEASING.md` does not mention that
+step.
 
 ## Layout
 
