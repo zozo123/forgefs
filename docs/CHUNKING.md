@@ -2,8 +2,9 @@
 
 Status: **design only, not recommended yet.** This document records the measured
 object-size ceiling, the format cost of removing it, and the trigger conditions
-that would justify paying that cost. Two format-neutral parts of the ceiling
-have now been removed: copy-free publication and a byte-bound raw-object cache.
+that would justify paying that cost. Three format-neutral parts of the ceiling
+have now been removed: copy-free publication, streaming dedup verification,
+and a byte-bound raw-object cache.
 
 `FORMAT.md` freezes the VERSION 1 encoding, and `v0.1.0` is now a real release
 tag, so FORMAT.md's pre-release exception has closed. Chunking needs a new
@@ -69,7 +70,7 @@ pollute the reading). At N = 8 MiB, peak extra live bytes as a multiple of N:
 | Operation | Before | After | Where it goes |
 |---|---|---|---|
 | `put_blob_data`, first publication | 2.00x | **0.00x** | `data.to_vec()` into a temporary `Blob`, then the `encode()` buffer |
-| `put_blob_data`, identical bytes again | 1.00x | 1.00x | `verify_existing` re-reads the whole durable object to re-prove its hash (I3) |
+| `put_blob_data`, identical bytes again | 1.00x | **<0.25x** | full durable rehash remains (I3), now through a fixed 64 KiB buffer |
 | `get_blob_data`, one cold 8 MiB object | 3.00x | 3.00x | durable read buffer + the cached clone + the decoded copy returned |
 | walk ten distinct 8 MiB objects, retained raw cache | >80 MiB | **<64 MiB** | 64 MiB encoded-byte budget plus the pre-existing 256-entry cap |
 
@@ -127,8 +128,8 @@ I15 trust-boundary reads still bypass the cache entirely.
 
 These changes do not make chunking necessary or change VERSION 1. Copy-free
 publication moves the publish half of the ceiling from RAM/3 to RAM/1; the cache
-bound removes unbounded accumulation across a walk. The remaining single-object
-read and verification copies are the format-neutral work below.
+bound removes unbounded accumulation across a walk. The remaining single-object read and typed-walk copies are the
+format-neutral work below.
 
 ## 3. If chunking were built
 
@@ -278,10 +279,10 @@ decision, not a performance one, and it should be made deliberately.
 instead, in this order:
 
 1. *(done)* copy-free publish. Measured 3.00x -> 1.00x on `forge write`.
-2. Streaming dedup verify: rehash `verify_existing` /
-   `verify_and_sync_existing` in a fixed buffer. Removes the remaining 1.00x on
-   republishing identical bytes. No trust change: the same bytes are read and
-   the same hash is compared.
+2. *(done)* Streaming dedup verify: `verify_existing` /
+   `verify_and_sync_existing` rehash through a fixed 64 KiB buffer. The same
+   durable bytes are read and the same ObjectId is compared; the sync path uses
+   the same descriptor it hashes, so the I4 proof is unchanged.
 3. Streaming read and export: a `Store` entry point that copies object bytes to
    a sink in fixed-size reads while hashing. This is the 3.00x -> ~0x change for
    `read`, `export` and `import`, and it is where most of the remaining ceiling

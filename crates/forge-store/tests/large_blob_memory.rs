@@ -102,15 +102,15 @@ fn large_blob_cost_and_raw_cache_residency_are_measured_and_bounded() {
     // FORMAT.md VERSION 1).
     assert_eq!(id, hash_bytes(&Blob { data: data.clone() }.encode()));
 
-    // Phase 2 - republishing identical bytes. Dedup still re-reads the whole
-    // durable object to re-prove its hash at the trust boundary (I3), so it
-    // costs one payload. Characterised, not endorsed.
+    // Phase 2 - republishing identical bytes. I3 still re-reads and hashes
+    // every durable byte, but verification uses a fixed 64 KiB buffer. The
+    // verifier therefore must not allocate memory proportional to object size.
     let (again, dedup) = peak_payloads(|| store.put_blob_data(&data).unwrap());
     assert_eq!(again, id);
     assert!(
-        (0.75..1.5).contains(&dedup),
+        dedup < 0.25,
         "republishing a {N}-byte blob peaked at {dedup:.2}x the payload; \
-         the characterised cost is one payload for the verifying re-read"
+         streaming verification must stay independent of object size"
     );
 
     // Phase 3 - reading one object from a cold store. At 8 MiB the object is

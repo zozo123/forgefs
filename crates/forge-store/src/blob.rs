@@ -1,5 +1,5 @@
 use crate::metrics::TimingCounter;
-use forge_core::{hash_bytes, hash_parts};
+use forge_core::{hash_bytes, hash_parts, hash_reader};
 use forge_types::{Error, ObjectId, Result};
 use lru::LruCache;
 use parking_lot::{Condvar, Mutex};
@@ -556,28 +556,18 @@ impl LocalBlobStore {
 
     fn verify_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
         require_regular_file(path, id)?;
-        let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
-        if hash_bytes(&bytes) != id {
-            return Err(Error::Corrupt(format!(
-                "existing object does not match its id: {id}"
-            )));
-        }
-        Ok(())
+        let mut file = fs::File::open(path)?;
+        verify_object_stream(id, &mut file)
     }
 
     fn verify_and_sync_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
         require_regular_file(path, id)?;
-        // Operate on one descriptor so the bytes verified are the bytes forced.
+        // Verify and force the same descriptor. Streaming removes the
+        // object-sized allocation without weakening the I3/I4 proof boundary.
         // Opening writable is intentional: macOS F_FULLFSYNC is a fail-closed
         // durability contract, not a best-effort read hint.
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        if hash_bytes(&bytes) != id {
-            return Err(Error::Corrupt(format!(
-                "existing object does not match its id: {id}"
-            )));
-        }
+        verify_object_stream(id, &mut file)?;
         sync_file_counted(
             &file,
             &self.stats,
@@ -954,6 +944,20 @@ impl<O: crate::ObjectStore> crate::Store<O> {
     pub fn stats(&self) -> BlobStoreStats {
         crate::ObjectStore::stats(&self.blobs)
     }
+}
+
+/// Re-prove an existing object's identity with memory independent of its size.
+/// The caller owns descriptor choice: the durability path passes the exact
+/// descriptor it will subsequently force, so verified bytes and synced bytes
+/// cannot diverge through a pathname reopen.
+fn verify_object_stream(id: ObjectId, reader: &mut impl Read) -> Result<()> {
+    let actual = hash_reader(reader)?;
+    if actual != id {
+        return Err(Error::Corrupt(format!(
+            "existing object does not match its id: {id}"
+        )));
+    }
+    Ok(())
 }
 
 /// A durable object must be a regular file. Without this check a FIFO planted
