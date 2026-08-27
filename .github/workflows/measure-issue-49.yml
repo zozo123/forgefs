@@ -1,0 +1,299 @@
+name: issue-49-barriered-measurement
+
+on:
+  push:
+    branches:
+      - perf/49-group-observations
+    paths:
+      - .github/workflows/measure-issue-49.yml
+
+permissions:
+  contents: write
+
+jobs:
+  measure:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BASE_SHA: 0d838e360cd8440ddacabf0c35e4ab1976a9d490
+      HEAD_SHA: ${{ github.sha }}
+      READERS: "512"
+      READS: "64"
+      WORKERS: "32"
+      REPS: "5"
+    steps:
+      - name: Check out measured head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.0
+
+      - name: Prove fsync reaches the block device
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_raw="$(findmnt -n -o SOURCE -T "$RUNNER_TEMP")"
+          fstype="$(findmnt -n -o FSTYPE -T "$RUNNER_TEMP")"
+          options="$(findmnt -n -o OPTIONS -T "$RUNNER_TEMP")"
+          if [[ ",$options," == *,nobarrier,* ]]; then
+            echo "measurement refused: mount is nobarrier" >&2
+            exit 1
+          fi
+
+          major_minor="$(findmnt -n -o MAJ:MIN -T "$RUNNER_TEMP")"
+          device_path="$(readlink -f "/sys/dev/block/$major_minor")"
+          device="$(basename "$device_path")"
+          if [[ -f "/sys/class/block/$device/partition" ]]; then
+            device="$(basename "$(dirname "$device_path")")"
+          fi
+          stat_file="/sys/class/block/$device/stat"
+          if [[ ! -r "$stat_file" ]] || [[ "$(awk '{print NF}' "$stat_file")" -lt 16 ]]; then
+            echo "measurement refused: block flush counter unavailable for $device" >&2
+            exit 1
+          fi
+
+          before="$(awk '{print $16}' "$stat_file")"
+          PROBE_DIR="$RUNNER_TEMP/issue49-barrier-probe" PROBE_COUNT=64 python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+
+          root = pathlib.Path(os.environ["PROBE_DIR"])
+          shutil.rmtree(root, ignore_errors=True)
+          root.mkdir()
+          count = int(os.environ["PROBE_COUNT"])
+          payload = b"x" * 4096
+          for i in range(count):
+              path = root / f"probe-{i}"
+              fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+              try:
+                  os.write(fd, payload)
+                  os.fsync(fd)
+              finally:
+                  os.close(fd)
+          directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+          try:
+              os.fsync(directory)
+          finally:
+              os.close(directory)
+          PY
+          after="$(awk '{print $16}' "$stat_file")"
+          delta="$((after - before))"
+          echo "mount source=$source_raw fstype=$fstype options=$options block=$device"
+          echo "barrier probe: 64 sequential file fsync calls -> $delta completed device flushes"
+          if (( delta < 64 )); then
+            echo "measurement refused: barrier reach not proven (need at least 64 flush completions)" >&2
+            exit 1
+          fi
+          {
+            echo "MOUNT_SOURCE=$source_raw"
+            echo "MOUNT_FSTYPE=$fstype"
+            echo "MOUNT_OPTIONS=$options"
+            echo "BLOCK_DEVICE=$device"
+            echo "FLUSH_DELTA=$delta"
+          } >> "$GITHUB_ENV"
+
+      - name: Build baseline and candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_worktree="$RUNNER_TEMP/forgefs-base"
+          git worktree add --detach "$base_worktree" "$BASE_SHA"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" cargo build             --manifest-path "$base_worktree/Cargo.toml"             --release --locked -p forge-cli
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" cargo build             --release --locked -p forge-cli
+          cp "$RUNNER_TEMP/target-base/release/forge" "$RUNNER_TEMP/forge-base"
+          cp "$RUNNER_TEMP/target-head/release/forge" "$RUNNER_TEMP/forge-head"
+
+      - name: Run alternating read-heavy trials
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import statistics
+          import subprocess
+
+          runner_temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          binaries = {
+              "base": runner_temp / "forge-base",
+              "head": runner_temp / "forge-head",
+          }
+          readers = int(os.environ["READERS"])
+          reads = int(os.environ["READS"])
+          workers = int(os.environ["WORKERS"])
+          reps = int(os.environ["REPS"])
+          pattern = re.compile(
+              r"read fanout\s+readers=\d+\s+n=\d+\s+wall=([0-9.]+)s\s+([0-9.]+) Hz\s*"
+              r"p50=([0-9.]+)ms\s+p95=([0-9.]+)ms\s+p99=([0-9.]+)ms"
+          )
+
+          serial = 0
+          def trial(label, warmup=False):
+              global serial
+              serial += 1
+              scratch = runner_temp / f"issue49-{label}-{serial}"
+              shutil.rmtree(scratch, ignore_errors=True)
+              command = [
+                  str(binaries[label]), "bench",
+                  "--scratch", str(scratch),
+                  "--agents", "0",
+                  "--shared", "0",
+                  "--readers", str(readers),
+                  "--reads", str(reads),
+                  "--workers", str(workers),
+              ]
+              completed = subprocess.run(
+                  command, check=True, text=True,
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              print(f"===== {label} {'warmup' if warmup else 'measured'} =====")
+              print(completed.stdout)
+              match = pattern.search(completed.stdout)
+              if not match:
+                  raise RuntimeError("could not parse read-fanout result")
+              shutil.rmtree(scratch, ignore_errors=True)
+              return {
+                  "wall_s": float(match.group(1)),
+                  "hz": float(match.group(2)),
+                  "p50_ms": float(match.group(3)),
+                  "p95_ms": float(match.group(4)),
+                  "p99_ms": float(match.group(5)),
+              }
+
+          trial("base", warmup=True)
+          trial("head", warmup=True)
+          samples = {"base": [], "head": []}
+          for rep in range(reps):
+              order = ["base", "head"] if rep % 2 == 0 else ["head", "base"]
+              for label in order:
+                  samples[label].append(trial(label))
+
+          medians = {}
+          for label, rows in samples.items():
+              medians[label] = {
+                  key: statistics.median(row[key] for row in rows)
+                  for key in rows[0]
+              }
+          throughput_gain_pct = (
+              medians["head"]["hz"] / medians["base"]["hz"] - 1.0
+          ) * 100.0
+          p99_improvement_pct = (
+              1.0 - medians["head"]["p99_ms"] / medians["base"]["p99_ms"]
+          ) * 100.0
+          material = max(throughput_gain_pct, p99_improvement_pct) >= 10.0
+
+          result = {
+              "base_sha": os.environ["BASE_SHA"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "readers": readers,
+              "reads_per_reader": reads,
+              "workers": workers,
+              "repetitions": reps,
+              "mount": {
+                  "source": os.environ["MOUNT_SOURCE"],
+                  "fstype": os.environ["MOUNT_FSTYPE"],
+                  "options": os.environ["MOUNT_OPTIONS"],
+                  "block_device": os.environ["BLOCK_DEVICE"],
+                  "probe_file_fsyncs": 64,
+                  "completed_device_flushes": int(os.environ["FLUSH_DELTA"]),
+              },
+              "samples": samples,
+              "medians": medians,
+              "throughput_gain_pct": throughput_gain_pct,
+              "p99_improvement_pct": p99_improvement_pct,
+              "material_threshold_pct": 10.0,
+              "material": material,
+          }
+          pathlib.Path("issue49-results.json").write_text(
+              json.dumps(result, indent=2) + "\n"
+          )
+
+          verdict = "PASS" if material else "FAIL"
+          rows = []
+          for label in ("base", "head"):
+              median = medians[label]
+              rows.append(
+                  f"| {label} | {median['hz']:.1f} Hz | "
+                  f"{median['p99_ms']:.2f} ms | "
+                  f"{', '.join(f'{row['hz']:.1f}' for row in samples[label])} | "
+                  f"{', '.join(f'{row['p99_ms']:.2f}' for row in samples[label])} |"
+              )
+          markdown = "\n".join([
+              "# Issue #49: grouped observation-write measurement",
+              "",
+              f"Result: **{verdict}** against the predeclared 10% materiality gate.",
+              "",
+              f"Base: {os.environ['BASE_SHA']}",
+              f"Candidate: {os.environ['HEAD_SHA']}",
+              f"Workload: {readers} logical readers x {reads} reads, {workers} workers; "
+              f"{reps} alternating measured repetitions after one warmup per binary.",
+              "",
+              "## Barrier reach",
+              "",
+              f"Mount: {os.environ['MOUNT_SOURCE']} ({os.environ['MOUNT_FSTYPE']})",
+              f"Options: {os.environ['MOUNT_OPTIONS']}",
+              f"Block device: {os.environ['BLOCK_DEVICE']}",
+              f"Probe: 64 sequential file fsync calls produced "
+              f"{os.environ['FLUSH_DELTA']} completed device flushes.",
+              "",
+              "## Results",
+              "",
+              "| Variant | Median throughput | Median p99 | Throughput samples | p99 samples (ms) |",
+              "|---|---:|---:|---|---|",
+              *rows,
+              "",
+              f"Throughput change: {throughput_gain_pct:+.1f}%.",
+              f"p99 improvement: {p99_improvement_pct:+.1f}%.",
+              "",
+              "The patch is eligible to merge only when either controlled median "
+              "throughput or median p99 improves by at least 10%. Correctness and "
+              "durability gates remain separate requirements.",
+              "",
+          ])
+          pathlib.Path("issue49-results.md").write_text(markdown)
+          print(markdown)
+          PY
+
+      - name: Upload raw measurement
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: issue-49-observation-grouping
+          path: |
+            issue49-results.json
+            issue49-results.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce materiality gate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          result = json.load(open("issue49-results.json"))
+          if not result["material"]:
+              raise SystemExit(
+                  "candidate did not improve controlled median throughput or p99 by 10%"
+              )
+          PY
+
+      - name: Publish evidence and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/bench-results
+          mv issue49-results.md docs/bench-results/issue-49-observe-grouping.md
+          git rm .github/workflows/measure-issue-49.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/bench-results/issue-49-observe-grouping.md
+          git commit -m "docs(bench): record barriered observation grouping win"
+          git push origin "HEAD:perf/49-group-observations"
