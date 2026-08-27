@@ -27,7 +27,9 @@ jobs:
         run: cargo fmt --all
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Check
+      - name: Refresh lock for the direct workspace dependency
+        run: cargo check --workspace --all-targets
+      - name: Check locked
         run: cargo check --workspace --all-targets --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
