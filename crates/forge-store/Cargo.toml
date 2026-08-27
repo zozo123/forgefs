@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Local CAS blob store and SQLite metadata for ForgeFS"
 
 [dependencies]
+blake3.workspace = true
 forge-core.workspace = true
 forge-types.workspace = true
 libc.workspace = true

@@ -418,6 +418,72 @@ pub struct LocalBlobStore {
 /// immutable final name is linked. Final shard-directory barriers are deferred
 /// until `finish`; metadata CAS is allowed only after `finish` succeeds. A crash
 /// before CAS may leave durable orphan objects, which is safe.
+#[must_use = "staged blob bytes are not authenticated until finish() succeeds"]
+pub struct StagedBlobReader {
+    file: fs::File,
+    id: ObjectId,
+    hasher: blake3::Hasher,
+    remaining: u64,
+    payload_len: u64,
+    object_len: u64,
+    stats: Arc<BlobStoreCounters>,
+}
+
+impl StagedBlobReader {
+    pub fn payload_len(&self) -> u64 {
+        self.payload_len
+    }
+
+    /// Complete the I15 proof for bytes already copied to a staged sink.
+    ///
+    /// A caller must publish that sink only after this returns `Ok(())`. A
+    /// mismatch is deliberately detected after the final payload byte so one
+    /// pass over a large Blob is enough.
+    pub fn finish(mut self) -> Result<()> {
+        if self.remaining != 0 {
+            return Err(Error::Corrupt(format!(
+                "blob {} ended with {} payload bytes unread",
+                self.id, self.remaining
+            )));
+        }
+        let mut extra = [0u8; 1];
+        if self.file.read(&mut extra)? != 0 {
+            return Err(Error::Corrupt(format!(
+                "blob {} grew while staged output was being built",
+                self.id
+            )));
+        }
+        let actual = ObjectId(*self.hasher.finalize().as_bytes());
+        if actual != self.id {
+            self.stats.hash_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Corrupt(format!("hash mismatch {}", self.id)));
+        }
+        self.stats
+            .get_bytes
+            .fetch_add(self.object_len, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Read for StagedBlobReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let limit = usize::try_from(self.remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let n = self.file.read(&mut buf[..limit])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("blob {} payload truncated", self.id),
+            ));
+        }
+        self.hasher.update(&buf[..n]);
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 pub struct PublishBatch<'a> {
     store: &'a LocalBlobStore,
     dirs: BTreeSet<PathBuf>,
@@ -613,38 +679,34 @@ impl LocalBlobStore {
             return Err(Error::Corrupt(format!("hash mismatch {id}")));
         }
         self.stats.get_bytes.fetch_add(len, Ordering::Relaxed);
-
-        if len < 5 {
-            return Err(Error::Corrupt("object file too short".into()));
-        }
-        file.seek(SeekFrom::Start(0))?;
-        let mut frame = [0u8; 5];
-        file.read_exact(&mut frame)?;
-        let ty = forge_types::ObjectType::from_u8(frame[0])?;
-        if ty != forge_types::ObjectType::Blob {
-            return Err(Error::Corrupt("not a blob".into()));
-        }
-
-        let header_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as u64;
-        let header_end = 5u64
-            .checked_add(header_len)
-            .ok_or_else(|| Error::Corrupt("object header length overflow".into()))?;
-        if header_end > len {
-            return Err(Error::Corrupt("object header truncated".into()));
-        }
-        let payload_len = len - header_end;
-        let expected = blob_frame_prefix(payload_len);
-        if expected.len() as u64 != header_end {
-            return Err(Error::Corrupt("non-canonical blob header".into()));
-        }
-
-        file.seek(SeekFrom::Start(0))?;
-        let mut observed = vec![0u8; expected.len()];
-        file.read_exact(&mut observed)?;
-        if observed != expected {
-            return Err(Error::Corrupt("invalid blob header".into()));
-        }
+        verify_blob_frame(&mut file, len)?;
         Ok(())
+    }
+
+    /// Open a Blob payload for a sink that is itself staged and unpublished.
+    ///
+    /// The canonical frame and payload length are checked up front, but payload
+    /// authentication completes only in [`StagedBlobReader::finish`]. This is
+    /// intentionally *not* the API for stdout, sockets, or any irreversible
+    /// sink: callers must discard their staged output when `finish` fails.
+    pub fn open_blob_payload_for_staged_output(&self, id: ObjectId) -> Result<StagedBlobReader> {
+        let path = self.object_path(id);
+        require_regular_file(&path, id)?;
+        let mut file =
+            fs::File::open(&path).map_err(|_| Error::NotFound(format!("object {id}")))?;
+        let object_len = file.metadata()?.len();
+        let (prefix, payload_len) = verify_blob_frame(&mut file, object_len)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&prefix);
+        Ok(StagedBlobReader {
+            file,
+            id,
+            hasher,
+            remaining: payload_len,
+            payload_len,
+            object_len,
+            stats: Arc::clone(&self.stats),
+        })
     }
 
     pub fn has(&self, id: ObjectId) -> bool {
@@ -998,6 +1060,42 @@ impl<O: crate::ObjectStore> crate::Store<O> {
     pub fn stats(&self) -> BlobStoreStats {
         crate::ObjectStore::stats(&self.blobs)
     }
+}
+
+/// Validate the complete v1 Blob frame without reading or allocating the
+/// payload. On success the descriptor is positioned at the first payload byte.
+fn verify_blob_frame(file: &mut fs::File, object_len: u64) -> Result<(Vec<u8>, u64)> {
+    if object_len < 5 {
+        return Err(Error::Corrupt("object file too short".into()));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut frame = [0u8; 5];
+    file.read_exact(&mut frame)?;
+    let ty = forge_types::ObjectType::from_u8(frame[0])?;
+    if ty != forge_types::ObjectType::Blob {
+        return Err(Error::Corrupt("not a blob".into()));
+    }
+
+    let header_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as u64;
+    let header_end = 5u64
+        .checked_add(header_len)
+        .ok_or_else(|| Error::Corrupt("object header length overflow".into()))?;
+    if header_end > object_len {
+        return Err(Error::Corrupt("object header truncated".into()));
+    }
+    let payload_len = object_len - header_end;
+    let expected = blob_frame_prefix(payload_len);
+    if expected.len() as u64 != header_end {
+        return Err(Error::Corrupt("non-canonical blob header".into()));
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut observed = vec![0u8; expected.len()];
+    file.read_exact(&mut observed)?;
+    if observed != expected {
+        return Err(Error::Corrupt("invalid blob header".into()));
+    }
+    Ok((expected, payload_len))
 }
 
 /// Re-prove an existing object's identity with memory independent of its size.

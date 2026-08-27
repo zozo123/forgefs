@@ -175,7 +175,11 @@ fn write_tree(
         match e.kind {
             EntryKind::Tree => write_tree(store, b, &path, e.id, opts)?,
             EntryKind::Blob => {
-                let data = store.get_blob_data(e.id)?;
+                // The archive itself is still unpublished at this point. Read
+                // the payload once through a hashing reader, append those exact
+                // bytes to the sibling temporary tar, then complete I15 before
+                // the outer function can rename the archive into place.
+                let mut data = store.open_blob_payload_for_staged_output(e.id)?;
                 let mut h = Header::new_gnu();
                 h.set_entry_type(tar::EntryType::Regular);
                 h.set_mode(if e.exec { 0o755 } else { 0o644 });
@@ -184,9 +188,10 @@ fn write_tree(
                 h.set_gid(0);
                 h.set_username("").ok();
                 h.set_groupname("").ok();
-                h.set_size(data.len() as u64);
-                b.append_data(&mut h, &path, data.as_slice())
+                h.set_size(data.payload_len());
+                b.append_data(&mut h, &path, &mut data)
                     .map_err(|e| Error::Io(e.to_string()))?;
+                data.finish()?;
             }
         }
     }

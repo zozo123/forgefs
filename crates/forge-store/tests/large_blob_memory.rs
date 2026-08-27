@@ -77,7 +77,7 @@ fn payload() -> Vec<u8> {
 }
 
 #[test]
-fn large_blob_cost_cache_residency_and_intro_walk_are_bounded() {
+fn large_blob_cost_cache_intro_walk_and_staged_stream_are_bounded() {
     let a = tempdir().unwrap();
     let store = Store::open(a.path()).unwrap();
     let data = payload();
@@ -140,10 +140,27 @@ fn large_blob_cost_cache_residency_and_intro_walk_are_bounded() {
     );
     drop(intro_cold);
 
-    // Phase 4 - reading one object from a cold store. At 8 MiB the object is
+    // Phase 4 - staged output may stream before authentication completes only
+    // because the caller promises to publish its sink after finish(). The
+    // reader hashes exactly what it yields and needs no payload-sized buffer.
+    let stream_cold = Store::open(a.path()).unwrap();
+    let ((), stream_peak) = peak_payloads(|| {
+        let mut reader = stream_cold.open_blob_payload_for_staged_output(id).unwrap();
+        assert_eq!(reader.payload_len(), N as u64);
+        std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
+        reader.finish().unwrap();
+    });
+    assert!(
+        stream_peak < 0.25,
+        "staged stream of a {N}-byte blob peaked at {stream_peak:.2}x the payload; \
+         output streaming must stay independent of object size"
+    );
+    drop(stream_cold);
+
+    // Phase 5 - reading one object from a cold store. At 8 MiB the object is
     // intentionally below the 64 MiB cache budget, so the single-object peak
     // remains three payloads: durable read buffer, cached clone, decoded copy.
-    // Phase 5 below is the important bound: walking many such blobs no longer
+    // Phase 6 below is the important bound: walking many such blobs no longer
     // retains one payload per object without limit.
     let cold = Store::open(a.path()).unwrap();
     let (got, read) = peak_payloads(|| cold.get_blob_data(id).unwrap());
@@ -156,7 +173,7 @@ fn large_blob_cost_cache_residency_and_intro_walk_are_bounded() {
     drop(got);
     drop(cold);
 
-    // Phase 5 - the raw-object LRU is bounded by bytes as well as entries.
+    // Phase 6 - the raw-object LRU is bounded by bytes as well as entries.
     // Use enough distinct 8 MiB blobs to exceed 64 MiB. The former 256-entry
     // policy retained every one (80+ MiB here, and tens of GiB at the measured
     // 164 MiB object ceiling). The byte-bound cache must evict old entries and
