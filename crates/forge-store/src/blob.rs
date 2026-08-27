@@ -1,11 +1,11 @@
 use crate::metrics::TimingCounter;
-use forge_core::{hash_bytes, hash_parts, hash_reader};
+use forge_core::{blob_frame_prefix, hash_bytes, hash_parts, hash_reader};
 use forge_types::{Error, ObjectId, Result};
 use lru::LruCache;
 use parking_lot::{Condvar, Mutex};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -597,6 +597,56 @@ impl LocalBlobStore {
         Ok(bytes)
     }
 
+    /// Verify one Blob's durable identity and canonical v1 frame without
+    /// materializing its payload. This is the typed-graph trust check used by
+    /// `Store::intro_walk` (I1/I15).
+    pub fn verify_blob(&self, id: ObjectId) -> Result<()> {
+        let path = self.object_path(id);
+        require_regular_file(&path, id)?;
+        let mut file =
+            fs::File::open(&path).map_err(|_| Error::NotFound(format!("object {id}")))?;
+
+        let actual = hash_reader(&mut file)?;
+        let len = file.stream_position()?;
+        if actual != id {
+            self.stats.hash_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Corrupt(format!("hash mismatch {id}")));
+        }
+        self.stats.get_bytes.fetch_add(len, Ordering::Relaxed);
+
+        if len < 5 {
+            return Err(Error::Corrupt("object file too short".into()));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut frame = [0u8; 5];
+        file.read_exact(&mut frame)?;
+        let ty = forge_types::ObjectType::from_u8(frame[0])?;
+        if ty != forge_types::ObjectType::Blob {
+            return Err(Error::Corrupt("not a blob".into()));
+        }
+
+        let header_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as u64;
+        let header_end = 5u64
+            .checked_add(header_len)
+            .ok_or_else(|| Error::Corrupt("object header length overflow".into()))?;
+        if header_end > len {
+            return Err(Error::Corrupt("object header truncated".into()));
+        }
+        let payload_len = len - header_end;
+        let expected = blob_frame_prefix(payload_len);
+        if expected.len() as u64 != header_end {
+            return Err(Error::Corrupt("non-canonical blob header".into()));
+        }
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut observed = vec![0u8; expected.len()];
+        file.read_exact(&mut observed)?;
+        if observed != expected {
+            return Err(Error::Corrupt("invalid blob header".into()));
+        }
+        Ok(())
+    }
+
     pub fn has(&self, id: ObjectId) -> bool {
         self.object_path(id).exists()
     }
@@ -917,6 +967,10 @@ impl crate::ObjectStore for LocalBlobStore {
 
     fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
         LocalBlobStore::get(self, id)
+    }
+
+    fn verify_blob(&self, id: ObjectId) -> Result<()> {
+        LocalBlobStore::verify_blob(self, id)
     }
 
     fn has(&self, id: ObjectId) -> bool {
