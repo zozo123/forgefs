@@ -245,11 +245,23 @@ fn exact_rename_conflicts(
     let ours_changes = tree_changes(store, base, ours)?;
     let theirs_changes = tree_changes(store, base, theirs)?;
 
+    // Proving source uniqueness needs a base-tree walk, but only identities
+    // that have a same-side destination can possibly be rename candidates.
+    // Plain deletes therefore keep the normal path merge's changed-subtree cost.
+    let ours_added: HashSet<_> = ours_changes.added.values().map(entry_identity).collect();
+    let theirs_added: HashSet<_> = theirs_changes.added.values().map(entry_identity).collect();
     let wanted: HashSet<_> = ours_changes
         .deleted
         .values()
-        .chain(theirs_changes.deleted.values())
         .map(entry_identity)
+        .filter(|identity| ours_added.contains(identity))
+        .chain(
+            theirs_changes
+                .deleted
+                .values()
+                .map(entry_identity)
+                .filter(|identity| theirs_added.contains(identity)),
+        )
         .collect();
     let base_counts = count_base_identities(store, base, &wanted)?;
     let ours_renames = infer_exact_renames(&ours_changes, &base_counts);
