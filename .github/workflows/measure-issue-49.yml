@@ -221,11 +221,15 @@ jobs:
           rows = []
           for label in ("base", "head"):
               median = medians[label]
+              hz_samples = ", ".join(
+                  f"{sample['hz']:.1f}" for sample in samples[label]
+              )
+              p99_samples = ", ".join(
+                  f"{sample['p99_ms']:.2f}" for sample in samples[label]
+              )
               rows.append(
                   f"| {label} | {median['hz']:.1f} Hz | "
-                  f"{median['p99_ms']:.2f} ms | "
-                  f"{', '.join(f'{row['hz']:.1f}' for row in samples[label])} | "
-                  f"{', '.join(f'{row['p99_ms']:.2f}' for row in samples[label])} |"
+                  f"{median['p99_ms']:.2f} ms | {hz_samples} | {p99_samples} |"
               )
           markdown = "\n".join([
               "# Issue #49: grouped observation-write measurement",
