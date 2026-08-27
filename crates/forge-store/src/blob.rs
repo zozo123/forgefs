@@ -5,7 +5,7 @@ use lru::LruCache;
 use parking_lot::{Condvar, Mutex};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -667,20 +667,13 @@ impl LocalBlobStore {
     /// materializing its payload. This is the typed-graph trust check used by
     /// `Store::intro_walk` (I1/I15).
     pub fn verify_blob(&self, id: ObjectId) -> Result<()> {
-        let path = self.object_path(id);
-        require_regular_file(&path, id)?;
-        let mut file =
-            fs::File::open(&path).map_err(|_| Error::NotFound(format!("object {id}")))?;
-
-        let actual = hash_reader(&mut file)?;
-        let len = file.stream_position()?;
-        if actual != id {
-            self.stats.hash_failures.fetch_add(1, Ordering::Relaxed);
-            return Err(Error::Corrupt(format!("hash mismatch {id}")));
-        }
-        self.stats.get_bytes.fetch_add(len, Ordering::Relaxed);
-        verify_blob_frame(&mut file, len)?;
-        Ok(())
+        // Reuse the staged reader as a discard sink so the accepted frame and
+        // the payload are authenticated in one forward pass over one
+        // descriptor. Hashing first and seeking back to type-check would let
+        // concurrent in-place mutation combine two different file versions.
+        let mut reader = self.open_blob_payload_for_staged_output(id)?;
+        std::io::copy(&mut reader, &mut std::io::sink())?;
+        reader.finish()
     }
 
     /// Open a Blob payload for a sink that is itself staged and unpublished.
@@ -1062,15 +1055,26 @@ impl<O: crate::ObjectStore> crate::Store<O> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Deterministic regression hook for mutation after frame acceptance but
+    /// before payload hashing. It is thread-local, one-shot, and absent from
+    /// every non-test build.
+    static VERIFY_BLOB_AFTER_FRAME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Validate the complete v1 Blob frame without reading or allocating the
-/// payload. On success the descriptor is positioned at the first payload byte.
-fn verify_blob_frame(file: &mut fs::File, object_len: u64) -> Result<(Vec<u8>, u64)> {
+/// payload. The returned prefix is the exact observed byte sequence that the
+/// caller must feed into the identity hash; on success the reader is positioned
+/// at the first payload byte.
+fn verify_blob_frame(reader: &mut impl Read, object_len: u64) -> Result<(Vec<u8>, u64)> {
     if object_len < 5 {
         return Err(Error::Corrupt("object file too short".into()));
     }
-    file.seek(SeekFrom::Start(0))?;
+
     let mut frame = [0u8; 5];
-    file.read_exact(&mut frame)?;
+    reader.read_exact(&mut frame)?;
     let ty = forge_types::ObjectType::from_u8(frame[0])?;
     if ty != forge_types::ObjectType::Blob {
         return Err(Error::Corrupt("not a blob".into()));
@@ -1089,13 +1093,25 @@ fn verify_blob_frame(file: &mut fs::File, object_len: u64) -> Result<(Vec<u8>, u
         return Err(Error::Corrupt("non-canonical blob header".into()));
     }
 
-    file.seek(SeekFrom::Start(0))?;
-    let mut observed = vec![0u8; expected.len()];
-    file.read_exact(&mut observed)?;
+    // Read the canonical header once, forward only. These are both the bytes
+    // whose type/size are accepted and the bytes the caller hashes.
+    let mut observed = Vec::with_capacity(expected.len());
+    observed.extend_from_slice(&frame);
+    observed.resize(expected.len(), 0);
+    reader.read_exact(&mut observed[frame.len()..])?;
     if observed != expected {
         return Err(Error::Corrupt("invalid blob header".into()));
     }
-    Ok((expected, payload_len))
+
+    #[cfg(test)]
+    {
+        let hook = VERIFY_BLOB_AFTER_FRAME_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    Ok((observed, payload_len))
 }
 
 /// Re-prove an existing object's identity with memory independent of its size.
@@ -1271,6 +1287,34 @@ mod tests {
             std::fs::read_dir(d.path().join("objects")).unwrap().count(),
             1
         );
+    }
+
+    /// I1/I15: a mutation after frame acceptance but before payload hashing
+    /// must be detected. The former hash-then-seek implementation authenticated
+    /// the old payload and type-checked the later frame, so this exact schedule
+    /// returned success.
+    #[test]
+    fn typed_blob_verification_hashes_the_same_pass_that_validates_the_frame() {
+        let d = tempdir().unwrap();
+        let s = LocalBlobStore::new(d.path().to_path_buf()).unwrap();
+        let payload = vec![0x5a; 256 * 1024];
+        let mut encoded = blob_frame_prefix(payload.len() as u64);
+        encoded.extend_from_slice(&payload);
+        let id = s.put(&encoded).unwrap();
+        let path = s.object_path(id);
+
+        VERIFY_BLOB_AFTER_FRAME_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut bytes = fs::read(&path).unwrap();
+                *bytes.last_mut().unwrap() ^= 1;
+                fs::write(&path, bytes).unwrap();
+            }));
+        });
+
+        let err = s
+            .verify_blob(id)
+            .expect_err("payload mutation between frame and payload must fail closed");
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
     }
 
     #[test]
