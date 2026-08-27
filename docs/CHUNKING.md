@@ -84,10 +84,11 @@ because they include the caller's own copy of the payload.)
 
 **The `checkin` typed-walk payload copy is resolved without weakening the
 check.** `Store::intro_walk` now asks the object backend to verify Blob edges
-without materializing their contents. The local backend re-hashes every durable
-byte through the same fixed 64 KiB identity path, then compares the small frame
-against `blob_frame_prefix(payload_len)`, proving type, canonical header,
-declared size and file length (I1/I15). Trees still decode normally. The
+without materializing their contents. The local backend reads the canonical
+frame and payload once, forward-only, from one descriptor; the exact observed
+prefix and payload accepted as a Blob are the bytes fed to BLAKE3. This proves
+type, canonical header, declared size, file length and identity without a
+split-pass mutation window (I1/I15). Trees still decode normally. The
 allocator regression walks an 8 MiB Blob from a cold store and holds peak extra
 live memory below 0.25x the payload.
 
