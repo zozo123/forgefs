@@ -6,7 +6,9 @@ pub mod meta;
 mod metrics;
 pub mod objectstore;
 
-pub use blob::{BlobStoreStats, DirectoryBarrier, GcObjectGuard, LocalBlobStore, PublishBatch};
+pub use blob::{
+    BlobStoreStats, DirectoryBarrier, GcObjectGuard, LocalBlobStore, PublishBatch, StagedBlobReader,
+};
 pub use graph::{
     decode_graph_object, DecodedGraphObject, GraphEdge, GraphExpectation, GraphWorkQueue,
     VerifiedGraphObject, DEFAULT_MAX_GRAPH_OBJECTS, MAX_GRAPH_OBJECTS_ENV,
@@ -380,6 +382,13 @@ impl Store {
         Ok(Self::with_object_store(root.to_path_buf(), blobs, meta))
     }
 
+    /// Local staged-output adapter. Bytes read from the returned handle are not
+    /// trusted until `finish()` succeeds; therefore this API is intentionally
+    /// unavailable on generic `Store<O>` and must never back stdout directly.
+    pub fn open_blob_payload_for_staged_output(&self, id: ObjectId) -> Result<StagedBlobReader> {
+        self.blobs.open_blob_payload_for_staged_output(id)
+    }
+
     /// Detection-only open used by fsck. It is byte-for-byte read-only like
     /// `open_read_only`, but lets the catalog auditor report a damaged schema
     /// ledger rather than rejecting it before fsck can produce a finding.
@@ -563,6 +572,12 @@ impl<O: ObjectStore> Store<O> {
         oids: &mut Vec<ObjectId>,
     ) -> Result<()> {
         if old == Some(new) {
+            return Ok(());
+        }
+
+        if expected == ObjectType::Blob {
+            self.blobs.verify_blob(new)?;
+            oids.push(new);
             return Ok(());
         }
 
