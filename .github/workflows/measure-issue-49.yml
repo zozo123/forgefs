@@ -45,7 +45,7 @@ jobs:
             exit 1
           fi
 
-          major_minor="$(findmnt -n -o MAJ:MIN -T "$RUNNER_TEMP")"
+          major_minor="$(findmnt -n -o MAJ:MIN -T "$RUNNER_TEMP" | xargs)"
           device_path="$(readlink -f "/sys/dev/block/$major_minor")"
           device="$(basename "$device_path")"
           if [[ -f "/sys/class/block/$device/partition" ]]; then
