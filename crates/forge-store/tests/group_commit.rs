@@ -11,7 +11,7 @@
 //! 2. sharing a commit never lets one member's outcome contaminate another's,
 //!    and never reports a success that a cold reopen cannot find.
 
-use forge_store::Meta;
+use forge_store::{Meta, Observed};
 use forge_types::{Error, ObjectId};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -144,5 +144,60 @@ fn a_rejected_batch_member_does_not_lose_its_neighbours() {
         found.len(),
         accepted.len() + 1,
         "the catalog must hold exactly the acknowledged writes plus `a/b`"
+    );
+}
+
+/// I4/I9: independent first observations are hot catalog writes and must share
+/// synchronous=FULL commits without losing a row or acknowledging volatile data.
+#[test]
+fn concurrent_observations_share_durable_commits_and_survive_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.sqlite");
+    let meta = Arc::new(Meta::open(&path).unwrap());
+    let before = meta.stats().txn_count;
+
+    let writers = 8usize;
+    let each = 128usize;
+    let gate = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::with_capacity(writers);
+    for w in 0..writers {
+        let meta = Arc::clone(&meta);
+        let gate = Arc::clone(&gate);
+        handles.push(thread::spawn(move || {
+            gate.wait();
+            for i in 0..each {
+                meta.observe(
+                    "ns",
+                    "/",
+                    &format!("w{w}/f{i}"),
+                    Observed::Blob(ObjectId([(w + 1) as u8; 32])),
+                )
+                .unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let writes = (writers * each) as u64;
+    let commits = meta.stats().txn_count - before;
+    assert_eq!(
+        meta.observations("ns").unwrap().len(),
+        writes as usize,
+        "every acknowledged observation must be present"
+    );
+    assert!(
+        commits < writes,
+        "{writes} concurrent observations cost {commits} durable SQLite commits: \
+         observe() bypassed the group-commit lane"
+    );
+
+    drop(meta);
+    let reopened = Meta::open(&path).unwrap();
+    assert_eq!(
+        reopened.observations("ns").unwrap().len(),
+        writes as usize,
+        "an acknowledged grouped observation disappeared after cold reopen (I4)"
     );
 }
