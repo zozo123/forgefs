@@ -3898,17 +3898,28 @@ impl Meta {
     /// than report success on the strength of a row it did not record.
     pub fn observe(&self, ns_id: &str, mount: &str, path: &str, seen: Observed) -> Result<()> {
         let oid = seen.oid().map(|id| id.as_bytes().to_vec());
-        if !self.read_only && self.observation_is_current(ns_id, mount, path, seen.kind(), &oid)? {
+        let kind = seen.kind();
+        if !self.read_only && self.observation_is_current(ns_id, mount, path, kind, &oid)? {
             return Ok(());
         }
-        let conn = self.write.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO observations (ns_id, mount, path, kind, oid) \
-             VALUES (?1,?2,?3,?4,?5)",
-            params![ns_id, mount, path, seen.kind(), oid],
-        )
-        .map_err(map_sql)?;
-        Ok(())
+
+        // Owned before the job is queued: a batch leader may execute this
+        // closure on another caller's transaction. Returning from run_grouped
+        // still means the synchronous=FULL commit covering this observation
+        // has completed (I4/I9, issue #49).
+        let ns_id = ns_id.to_string();
+        let mount = mount.to_string();
+        let path = path.to_string();
+        let stats = Arc::clone(&self.stats);
+        self.run_grouped(move |tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO observations (ns_id, mount, path, kind, oid) \
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![ns_id, mount, path, kind, oid],
+            )
+            .map_err(|error| count_busy(&stats, error))?;
+            Ok(())
+        })
     }
 
     /// True when `observations` already records exactly this outcome for the

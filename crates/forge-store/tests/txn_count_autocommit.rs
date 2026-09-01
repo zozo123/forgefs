@@ -1,11 +1,10 @@
-//! Issue #311: `MetaStats::txn_count` must not be blind to autocommit writes.
+//! Issue #311/#49: observation writes must be visible in transaction metrics.
 //!
-//! Under the old counter only the four explicit `BEGIN IMMEDIATE` sites were
-//! instrumented, so a session that only *read* -- and therefore only wrote
-//! observation rows through autocommit `INSERT OR REPLACE` -- reported
-//! `"txn": 0` from `forge stats --json` while SQLite committed one write
-//! transaction per read. Every CI check or dashboard keyed on that number
-//! under-reported the catalog's write traffic by the whole read-heavy phase.
+//! #311 taught `txn_count` to see the old autocommit observation path. #49
+//! subsequently moved first/changed observations onto `run_grouped`, so they
+//! are now explicit `BEGIN IMMEDIATE` transactions as well: sequential writes
+//! cost one transaction each, while concurrent writers may share a commit.
+//! These tests pin both counters across that transition.
 
 use forge_store::{Meta, Observed};
 use forge_types::ObjectId;
@@ -17,8 +16,8 @@ fn meta() -> (tempfile::TempDir, Meta) {
     (dir, meta)
 }
 
-/// The regression itself: reads only, no explicit transaction, and the write
-/// transactions they cost must still be reported.
+/// Sequential first observations each enter the explicit group lane and every
+/// durable transaction they cost remains visible.
 #[test]
 fn a_read_heavy_phase_reports_the_write_transactions_it_ran() {
     let (_dir, meta) = meta();
@@ -41,13 +40,12 @@ fn a_read_heavy_phase_reports_the_write_transactions_it_ran() {
 
     let after = meta.stats();
     assert_eq!(
-        after.explicit_txn_count, 0,
-        "observe() is autocommit; it opens no explicit transaction"
+        after.explicit_txn_count, READS,
+        "sequential first observations each enter the explicit group-commit lane"
     );
     assert_eq!(
         after.txn_count, READS,
-        "#311: {READS} autocommit observation writes must count as {READS} write transactions, \
-         not as zero"
+        "#311/#49: {READS} sequential observation writes must count as {READS} durable transactions"
     );
     assert_eq!(
         meta.row_mutations() - rows_at_open,
@@ -122,11 +120,10 @@ fn an_explicit_transaction_counts_once_and_a_refused_one_not_at_all() {
     );
 }
 
-/// The two counters answer different questions, and the invariant between them
-/// is one-directional: every explicit transaction that committed is a write
-/// transaction, but a write transaction need not be explicit.
+/// The two counters answer different questions, but a sequential phase whose
+/// writes all use explicit transactions reports the same committed total.
 #[test]
-fn a_mixed_phase_separates_explicit_transactions_from_autocommit_writes() {
+fn a_mixed_sequential_phase_counts_grouped_observations_as_explicit() {
     let (_dir, meta) = meta();
     let a = ObjectId([1; 32]);
     let b = ObjectId([2; 32]);
@@ -141,13 +138,12 @@ fn a_mixed_phase_separates_explicit_transactions_from_autocommit_writes() {
     }
 
     let stats = meta.stats();
-    assert_eq!(stats.explicit_txn_count, 2, "insert_ref and cas_ref");
+    assert_eq!(
+        stats.explicit_txn_count, 10,
+        "insert_ref, cas_ref and eight sequential grouped observations"
+    );
     assert_eq!(
         stats.txn_count, 10,
-        "two explicit transactions plus eight autocommit observation writes"
-    );
-    assert!(
-        stats.txn_count > stats.explicit_txn_count,
-        "the autocommit writes this phase performed are exactly what #311 lost"
+        "every explicit transaction in this sequential phase committed once"
     );
 }

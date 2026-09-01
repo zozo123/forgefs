@@ -74,6 +74,25 @@ evidence of a win.
    SIGKILL evidences process-crash durability only; the power-loss half rests
    entirely on device flush counts plus a verified barrier-reach ratio.
 
+
+## Catalog write-lane classification
+
+The `self.write.lock()` census is classified by operation semantics, not by a
+blind text replacement:
+
+| Class | Paths | Decision |
+|---|---|---|
+| Hot, already grouped | `cas_ref_session`, `create_session`, `overlay_upsert` | Keep on `run_grouped`; these are checkin/session write paths with concurrent callers. |
+| Hot observation write | `observe` after its unchanged-row read guard | Route through `run_grouped`; concurrent first/changed reads can now share one WAL commit, and the caller still returns only after that commit. |
+| Lifecycle candidates | `complete_noop_session`, `update_mount_spec`, `set_pin`, `observations_clear`, `insert_mount`, `overlay_clear` | Keep direct until operation-scoped counts show material concurrency; grouping cold control-plane writes adds mechanism without evidence. |
+| Cold publication/admin | `set_cap_root`, `insert_ref{,_with_intros}`, `cas_ref{,_with_intros}`, `insert_namespace`, `intro_insert{,_many}`, `abandon_*`, `landmark`, `commit_seal` | Preserve the existing explicit transaction or autocommit path; none is the per-read hot path measured by #49. |
+| Not catalog writes / structurally exclusive | `row_mutations`, `read_conn`, `audit_catalog`, `checkpoint_truncate`, `gc_sweep` | Do not enqueue: these are statistics/read snapshots, checkpoint control, or a transaction handle whose lifetime intentionally spans the caller's GC sweep. |
+
+This classification is not a throughput claim. The observation change has a
+structural commit-sharing regression and cold-reopen durability proof; its
+performance verdict still requires the barrier-reach precondition and a
+read-heavy p99/throughput comparison on the same device.
+
 ## Cache policy
 
 Caches are hints. The Store tree/blob LRU may avoid repeated decode/I/O on ordinary reads, but verification and fsck must remain able to re-read and validate durable bytes. Cache state is never content identity, authority, provenance, or evidence that a sealed object is sound.
