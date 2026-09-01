@@ -76,7 +76,7 @@ registry/src/<index>/<name>-<version>/...
 `target/<target>/release/forge` and fails the build if the SBOM does not list
 any of them. It also fails if fewer than ten crate paths are recovered, so the
 check cannot pass by finding nothing. On `x86_64-unknown-linux-gnu` at the
-time of writing it recovers 26 crates against 112 SBOM components.
+time of writing it recovered 26 crates against 112 SBOM components. Both figures track the resolved graph rather than the check itself -- #401 alone removed four crates from it by collapsing the duplicate `digest 0.10` tree -- so read current numbers from the release's own SBOM instead of this line.
 
 To repeat the check yourself against a published release:
 
