@@ -6,11 +6,13 @@ Status: reviewed against `main` for the v0.4.x line (issue #252). This is a depe
 
 Purpose: authenticate the complete FMAC capability and every monotonic caveat in its attenuation chain (`crates/forge-cap`).
 
-- Primitive: workspace requirements `hmac 0.12.1` and `sha2 0.10.8`; the committed release lockfile resolves `hmac 0.12.1` and `sha2 0.10.9`, implementing HMAC-SHA256.
+- Primitive: workspace requirements `hmac 0.13.0` and `sha2 0.11.0`; the committed release lockfile resolves the same versions, on `digest 0.11.3` and `crypto-common 0.2.2`, implementing HMAC-SHA256.
 - Root key: exactly 32 bytes from OS `getrandom`; the workspace requirement is `0.2.15` and the committed lockfile resolves `getrandom 0.2.17`. The key is created during repository initialization and stored in `keys/root.secret` through the repository's secret-file path and permission checks.
 - Chain: the first tag is `HMAC(root, FMAC-prefix)`; every caveat replaces the key with the previous 32-byte tag and MACs the length-framed caveat. A holder can therefore attenuate from the tag it possesses without learning the root secret.
 - Verification: the final tag is checked with the MAC crate's constant-time `Mac::verify_slice` primitive. Do not convert an expected authentication tag to ordinary bytes and compare it with `==`/`!=`.
 - Encoding and HMAC-SHA256 are part of the `fmac1_` compatibility contract. Changing either requires an explicit capability-format decision, not a dependency upgrade disguised as cleanup.
+- Enforcement: `token_bytes_are_pinned_across_digest_implementations` in `crates/forge-cap/src/lib.rs` pins the exact `fmac1_` bytes of a root capability and of an attenuated one, and re-verifies both pinned tokens against the root secret. Every other test in that module signs and verifies inside a single build, so without this one a change to the HMAC construction -- or to the digest implementation beneath it -- would round-trip cleanly while invalidating every capability already issued. A deliberate format change must edit the pinned constants, which makes the decision visible in review.
+- Digest-stack migrations are byte-checked, not assumed. The `hmac 0.12`/`sha2 0.10` to `hmac 0.13`/`sha2 0.11` move (`digest` 0.10 to 0.11) changed no capability bytes: the same chained input produces `5c0eaa19af80c6e348c0bc30f03ca7215c17b4bdc2393094b6145b6cf585832b` under both dependency sets, so capabilities issued before the upgrade remain valid. The only source change it required was importing `KeyInit`, which now carries `new_from_slice` instead of `Mac`.
 
 The authorization parser is separate from authentication: verification proves the bytes were signed; `Cap::allows` intersects the authenticated caveats and must never widen them (I13/I14).
 
