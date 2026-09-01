@@ -116,11 +116,23 @@ all to distinguish them.
 
 #15 asks the conflict object to record "entry kind/mode changes, delete-vs-modify,
 rename candidates". Delete-vs-modify is representable (`a` or `b` is absent).
-Kind and mode are not. Rename candidates are not; `rename_characterisation.rs`
-documents that renames are characterised as delete+add and not detected.
+Kind and mode are not.
 
-Fixing this means adding keys to the `ConflictPath` map, which is the same
-VERSION problem as section 4.
+Exact rename *detection* does not require new fields. The merge compares the
+three immutable trees and recognizes only a one-to-one relocation of a unique
+full entry identity `(oid, kind, exec)`. Divergent exact destinations and exact
+rename-versus-delete now publish a conflict at the removed source
+(`a=- b=- base=<oid>`); matching destinations converge. Equal subtrees are
+skipped by ObjectId, and same-name directory rewrites are descended, so files
+moved across existing directories are covered. Duplicate source identities,
+multiple matching destinations, modified moves, and content-similarity guesses
+remain deliberately ambiguous rather than manufacturing trusted-core intent.
+`rename_characterisation.rs` pins both the detected cases and the rule that a
+copy whose source remains is not inferred as a move (#39).
+
+What VERSION 1 still cannot do is *label* the conflict as rename/rename versus
+rename/delete, or encode kind and mode in `ConflictPath`. Adding those keys is
+the same VERSION problem as section 4.
 
 ## 4. The decision: the binding requires FORMAT VERSION 2
 

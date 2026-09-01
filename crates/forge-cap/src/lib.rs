@@ -3,7 +3,7 @@
 //! needed only to mint and verify credentials.
 
 use forge_types::{hex_decode, hex_encode, Error, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 
@@ -617,5 +617,45 @@ mod tests {
         verify(&key, &cap).unwrap();
         cap.sig[0] ^= 1;
         assert!(verify(&key, &cap).is_err());
+    }
+
+    /// Known-answer test for the capability wire format.
+    ///
+    /// Invariant: a fixed root secret and caveat chain must always produce the
+    /// exact same token bytes. Every other test in this module signs and
+    /// verifies within a single build, so a change to the HMAC construction --
+    /// or to the digest implementation underneath it -- would round-trip
+    /// cleanly while silently invalidating every capability already issued.
+    /// Pinning the bytes turns that from an undetected break into a test
+    /// failure, and makes any deliberate format change an explicit edit here.
+    #[test]
+    fn token_bytes_are_pinned_across_digest_implementations() {
+        const ROOT_TOKEN: &str = "fmac1_464d4143010005666f7267650004726f6f7400266f70733d726561642c77726974652c6272616e63682c6d657267652c6772616e742c7365616c931478c6e832f60f352ae4e2ec8a18a521eedc8618c51836da277bba089a3409";
+        const AGENT_TOKEN: &str = "fmac1_464d4143010005666f7267650004726f6f7400266f70733d726561642c77726974652c6272616e63682c6d657267652c6772616e742c7365616c00086f70733d72656164000e7265663d68656164732f6d61696e000b6167656e743d616c696365637145f038030df57b82d9daf2ecb9a5751371ebf6af656c156efd1afb218b4b";
+
+        let key = [7u8; 32];
+
+        let root = mint_root(&key).unwrap();
+        assert_eq!(root.to_token(), ROOT_TOKEN, "root capability token drifted");
+
+        let agent = attenuate_holder(
+            &root,
+            vec![
+                "ops=read".into(),
+                "ref=heads/main".into(),
+                "agent=alice".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            agent.to_token(),
+            AGENT_TOKEN,
+            "attenuated capability token drifted"
+        );
+
+        // A pinned token must still verify against the root secret, so the test
+        // fails loudly whether the drift is in signing or in verification.
+        verify(&key, &Cap::from_token(ROOT_TOKEN).unwrap()).unwrap();
+        verify(&key, &Cap::from_token(AGENT_TOKEN).unwrap()).unwrap();
     }
 }

@@ -3,7 +3,7 @@
 use forge_core::{Conflict, ConflictPath, Tree, TreeEntry};
 use forge_store::Store;
 use forge_types::{EntryKind, Error, ObjectId, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_ANCESTRY_COMMITS: usize = 1_000_000;
 
@@ -102,14 +102,208 @@ pub enum MergeOutcome {
     Conflict(Conflict),
 }
 
+type EntryIdentity = (ObjectId, u8, bool);
+
+fn entry_identity(entry: &TreeEntry) -> EntryIdentity {
+    (entry.id, entry.kind as u8, entry.exec)
+}
+
+#[derive(Default)]
+struct TreeChanges {
+    deleted: BTreeMap<String, TreeEntry>,
+    added: BTreeMap<String, TreeEntry>,
+}
+
+/// Collect the delete/add frontier between two trees.
+///
+/// Equal subtree ObjectIds are skipped without reading their contents. Whole
+/// subtree additions and deletions stay as one frontier entry, so an exact
+/// directory move does not turn into one candidate per descendant. Same-name
+/// directory rewrites are descended so moves across existing directories are
+/// still visible.
+fn tree_changes(store: &Store, base: ObjectId, side: ObjectId) -> Result<TreeChanges> {
+    let mut changes = TreeChanges::default();
+    let mut stack = vec![(String::new(), base, side)];
+
+    while let Some((prefix, base_id, side_id)) = stack.pop() {
+        if base_id == side_id {
+            continue;
+        }
+        let base_tree = store.get_tree(base_id)?;
+        let side_tree = store.get_tree(side_id)?;
+        let base_map = base_tree.as_map();
+        let side_map = side_tree.as_map();
+        let mut names = HashSet::new();
+        names.extend(base_map.keys().cloned());
+        names.extend(side_map.keys().cloned());
+        let mut names: Vec<_> = names.into_iter().collect();
+        names.sort();
+
+        for name in names {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match (base_map.get(&name), side_map.get(&name)) {
+                (Some(before), None) => {
+                    changes.deleted.insert(path, (*before).clone());
+                }
+                (None, Some(after)) => {
+                    changes.added.insert(path, (*after).clone());
+                }
+                (Some(before), Some(after)) if same_entry(before, after) => {}
+                (Some(before), Some(after))
+                    if before.kind == EntryKind::Tree && after.kind == EntryKind::Tree =>
+                {
+                    stack.push((path, before.id, after.id));
+                }
+                (Some(_), Some(_)) => {
+                    // A same-path replacement is a modification, not a rename
+                    // candidate. The ordinary three-way merge classifies it.
+                }
+                (None, None) => unreachable!("name came from one of the two trees"),
+            }
+        }
+    }
+
+    Ok(changes)
+}
+
+fn count_base_identities(
+    store: &Store,
+    base: ObjectId,
+    wanted: &HashSet<EntryIdentity>,
+) -> Result<HashMap<EntryIdentity, usize>> {
+    let mut counts = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(counts);
+    }
+
+    let mut stack = vec![base];
+    while let Some(tree_id) = stack.pop() {
+        let tree = store.get_tree(tree_id)?;
+        for entry in &tree.entries {
+            let identity = entry_identity(entry);
+            if wanted.contains(&identity) {
+                let count = counts.entry(identity).or_insert(0usize);
+                *count = (*count + 1).min(2);
+            }
+            if entry.kind == EntryKind::Tree {
+                stack.push(entry.id);
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// Infer only one-to-one relocations of a unique full entry identity.
+///
+/// Duplicate source identities and multiple matching destinations are
+/// deliberately left ambiguous. A false negative falls back to the normal
+/// path merge; a false positive would manufacture a trusted-core conflict.
+fn infer_exact_renames(
+    changes: &TreeChanges,
+    base_counts: &HashMap<EntryIdentity, usize>,
+) -> HashMap<String, String> {
+    let mut destinations: HashMap<EntryIdentity, Vec<String>> = HashMap::new();
+    for (path, entry) in &changes.added {
+        destinations
+            .entry(entry_identity(entry))
+            .or_default()
+            .push(path.clone());
+    }
+
+    let mut renames = HashMap::new();
+    for (source, entry) in &changes.deleted {
+        let identity = entry_identity(entry);
+        if base_counts.get(&identity) != Some(&1) {
+            continue;
+        }
+        let Some(matches) = destinations.get(&identity) else {
+            continue;
+        };
+        if matches.len() == 1 {
+            renames.insert(source.clone(), matches[0].clone());
+        }
+    }
+    renames
+}
+
+/// Detect the two otherwise-silent exact-rename shapes without changing
+/// FORMAT v1: divergent destinations, and rename versus delete.
+///
+/// The source is absent from both result trees, so a v1 ConflictPath records
+/// a=-, b=-, base=<oid> at that source. The immutable ours and theirs trees
+/// retain the destinations; no provenance or heuristic guess is encoded.
+fn exact_rename_conflicts(
+    store: &Store,
+    base: ObjectId,
+    ours: ObjectId,
+    theirs: ObjectId,
+) -> Result<Vec<ConflictPath>> {
+    let ours_changes = tree_changes(store, base, ours)?;
+    let theirs_changes = tree_changes(store, base, theirs)?;
+
+    // Proving source uniqueness needs a base-tree walk, but only identities
+    // that have a same-side destination can possibly be rename candidates.
+    // Plain deletes therefore keep the normal path merge's changed-subtree cost.
+    let ours_added: HashSet<_> = ours_changes.added.values().map(entry_identity).collect();
+    let theirs_added: HashSet<_> = theirs_changes.added.values().map(entry_identity).collect();
+    let wanted: HashSet<_> = ours_changes
+        .deleted
+        .values()
+        .map(entry_identity)
+        .filter(|identity| ours_added.contains(identity))
+        .chain(
+            theirs_changes
+                .deleted
+                .values()
+                .map(entry_identity)
+                .filter(|identity| theirs_added.contains(identity)),
+        )
+        .collect();
+    let base_counts = count_base_identities(store, base, &wanted)?;
+    let ours_renames = infer_exact_renames(&ours_changes, &base_counts);
+    let theirs_renames = infer_exact_renames(&theirs_changes, &base_counts);
+
+    let mut conflicts = Vec::new();
+    for (source, base_entry) in &ours_changes.deleted {
+        if !theirs_changes.deleted.contains_key(source) {
+            continue;
+        }
+        let ours_destination = ours_renames.get(source);
+        let theirs_destination = theirs_renames.get(source);
+        if ours_destination.is_none() && theirs_destination.is_none() {
+            continue;
+        }
+        if ours_destination.is_some() && ours_destination == theirs_destination {
+            continue;
+        }
+        conflicts.push(ConflictPath {
+            path: source.clone(),
+            a: None,
+            b: None,
+            base: Some(base_entry.id),
+        });
+    }
+    Ok(conflicts)
+}
+
 pub fn three_way(
     store: &Store,
     base: Option<ObjectId>,
     ours: ObjectId,
     theirs: ObjectId,
 ) -> Result<MergeOutcome> {
-    let mut paths = Vec::new();
+    let mut paths = match base {
+        Some(base) if ours != theirs && ours != base && theirs != base => {
+            exact_rename_conflicts(store, base, ours, theirs)?
+        }
+        _ => Vec::new(),
+    };
     let tree = merge_trees(store, "", base, ours, theirs, &mut paths)?;
+    paths.sort_by(|left, right| left.path.cmp(&right.path));
     if paths.is_empty() {
         Ok(MergeOutcome::Tree(tree))
     } else {
@@ -368,6 +562,133 @@ mod tests {
             id,
             exec,
         }
+    }
+
+    fn tree(store: &Store, entries: Vec<TreeEntry>) -> ObjectId {
+        store.put_tree(&Tree::new(entries).unwrap()).unwrap()
+    }
+
+    fn exact_rename_conflict(
+        store: &Store,
+        base: ObjectId,
+        ours: ObjectId,
+        theirs: ObjectId,
+    ) -> Conflict {
+        match three_way(store, Some(base), ours, theirs).unwrap() {
+            MergeOutcome::Conflict(conflict) => conflict,
+            MergeOutcome::Tree(_) => panic!("expected an exact-rename conflict"),
+        }
+    }
+
+    #[test]
+    fn divergent_exact_renames_conflict_in_both_directions() {
+        let (_d, s) = setup();
+        let blob = s.put_blob_data(b"same object").unwrap();
+        let base = tree(&s, vec![blob_entry("x", blob, false)]);
+        let to_y = tree(&s, vec![blob_entry("y", blob, false)]);
+        let to_z = tree(&s, vec![blob_entry("z", blob, false)]);
+
+        for (ours, theirs) in [(to_y, to_z), (to_z, to_y)] {
+            let conflict = exact_rename_conflict(&s, base, ours, theirs);
+            assert_eq!(conflict.paths.len(), 1);
+            assert_eq!(conflict.paths[0].path, "x");
+            assert_eq!(conflict.paths[0].a, None);
+            assert_eq!(conflict.paths[0].b, None);
+            assert_eq!(conflict.paths[0].base, Some(blob));
+        }
+    }
+
+    #[test]
+    fn exact_rename_versus_delete_conflicts_in_both_directions() {
+        let (_d, s) = setup();
+        let blob = s.put_blob_data(b"same object").unwrap();
+        let base = tree(&s, vec![blob_entry("x", blob, false)]);
+        let renamed = tree(&s, vec![blob_entry("y", blob, false)]);
+        let deleted = tree(&s, vec![]);
+
+        for (ours, theirs) in [(renamed, deleted), (deleted, renamed)] {
+            let conflict = exact_rename_conflict(&s, base, ours, theirs);
+            assert_eq!(conflict.paths.len(), 1);
+            assert_eq!(conflict.paths[0].path, "x");
+            assert_eq!(conflict.paths[0].base, Some(blob));
+        }
+    }
+
+    #[test]
+    fn matching_exact_renames_merge_without_conflict() {
+        let (_d, s) = setup();
+        let blob = s.put_blob_data(b"same object").unwrap();
+        let base = tree(&s, vec![blob_entry("x", blob, false)]);
+        let renamed = tree(&s, vec![blob_entry("y", blob, false)]);
+
+        match three_way(&s, Some(base), renamed, renamed).unwrap() {
+            MergeOutcome::Tree(merged) => assert_eq!(merged, renamed),
+            MergeOutcome::Conflict(conflict) => panic!("unexpected {conflict:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_identity_is_not_guessed_to_be_a_rename() {
+        let (_d, s) = setup();
+        let blob = s.put_blob_data(b"duplicate").unwrap();
+        let base = tree(
+            &s,
+            vec![
+                blob_entry("keep", blob, false),
+                blob_entry("x", blob, false),
+            ],
+        );
+        let ours = tree(
+            &s,
+            vec![
+                blob_entry("keep", blob, false),
+                blob_entry("y", blob, false),
+            ],
+        );
+        let theirs = tree(&s, vec![blob_entry("keep", blob, false)]);
+
+        match three_way(&s, Some(base), ours, theirs).unwrap() {
+            MergeOutcome::Tree(merged) => {
+                let names: Vec<_> = s
+                    .get_tree(merged)
+                    .unwrap()
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect();
+                assert_eq!(names, ["keep", "y"]);
+            }
+            MergeOutcome::Conflict(conflict) => {
+                panic!("duplicate content is ambiguous, not a trusted rename: {conflict:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn exact_move_across_existing_directories_is_detected() {
+        let (_d, s) = setup();
+        let blob = s.put_blob_data(b"same object").unwrap();
+        let empty = tree(&s, vec![]);
+        let from = tree(&s, vec![blob_entry("x", blob, false)]);
+        let ours_to = tree(&s, vec![blob_entry("y", blob, false)]);
+        let theirs_to = tree(&s, vec![blob_entry("z", blob, false)]);
+        let dir_entry = |name: &str, id| TreeEntry {
+            name: name.into(),
+            kind: EntryKind::Tree,
+            id,
+            exec: false,
+        };
+        let base = tree(&s, vec![dir_entry("from", from), dir_entry("to", empty)]);
+        let ours = tree(&s, vec![dir_entry("from", empty), dir_entry("to", ours_to)]);
+        let theirs = tree(
+            &s,
+            vec![dir_entry("from", empty), dir_entry("to", theirs_to)],
+        );
+
+        let conflict = exact_rename_conflict(&s, base, ours, theirs);
+        assert_eq!(conflict.paths.len(), 1);
+        assert_eq!(conflict.paths[0].path, "from/x");
+        assert_eq!(conflict.paths[0].base, Some(blob));
     }
 
     /// I11/I12: a mode-only change on one side is a real change. It must survive

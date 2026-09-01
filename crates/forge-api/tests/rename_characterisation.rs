@@ -1,22 +1,17 @@
-//! Issue #39 characterisation: ForgeFS has no native rename.
+//! Issue #39 regression: native rename plus exact-identity conflict detection.
 //!
-//! A rename is expressed as `write(new)` + `delete(old)` inside one session
-//! overlay, so it is atomic at the *publication* point (one Contribution, one
-//! Commit, one CAS) but carries no identity linking the two paths. These tests
-//! pin what today's merge and provenance actually do, so that any future work
-//! on renames has to change a recorded outcome rather than a belief.
+//! Publication and staging are atomic through Forge::rename (I24). Merge-time
+//! detection now compares the immutable base/ours/theirs trees and infers only
+//! one-to-one relocations of a unique full entry identity (oid, kind, exec).
 //!
-//! Measured summary (see each test):
+//! Measured contract (see each test):
 //!
-//! * I11 holds for the case the issue names: a concurrent edit to a renamed
-//!   path is a Conflict object and exit-code-4 merge failure, not a silent
-//!   loss, and the losing agent's work stays reachable on its own ref (I18).
-//! * Three shapes are genuinely silent today, and every one of them needs
-//!   rename identity - i.e. a frozen-format change - to become loud:
-//!   divergent rename (duplicate), rename vs delete (deletion ignored), and
-//!   the copy-only rename the CLI can actually express (stale duplicate).
-//! * A rename receipt is byte-indistinguishable from "wrote both paths":
-//!   `Contribution.writes` is a flat path list with no add/delete/move tag.
+//! * rename-versus-edit remains a Conflict and preserves both refs;
+//! * divergent exact renames and exact rename-versus-delete are now conflicts;
+//! * two agents choosing the same destination converge without a conflict;
+//! * a copy whose source remains is not guessed to be a move;
+//! * FORMAT v1 Contribution.writes remains a flat path list. Rename conflict
+//!   detection is derived from trees and adds no new trusted metadata.
 
 use forge_api::Forge;
 use forge_cap::Cap;
@@ -57,12 +52,9 @@ fn seeded() -> (tempfile::TempDir, Forge, Cap, Cap) {
     (d, forge, root, integrator)
 }
 
-/// The rename half of a session overlay: copy the bytes to the new path and
-/// tombstone the old one. There is no other way to say it.
+/// Use the native one-transaction staging operation from I24.
 fn rename(forge: &Forge, cap: &Cap, ns: &str, from: &str, to: &str) {
-    let data = forge.read(cap, ns, from).unwrap();
-    forge.write(cap, ns, to, &data, false).unwrap();
-    forge.delete(cap, ns, from).unwrap();
+    forge.rename(cap, ns, from, to, None).unwrap();
 }
 
 /// I11/I18: agent A renames /x to /y while agent B edits /x. Integration of the
@@ -140,10 +132,9 @@ fn i12_rename_versus_concurrent_edit_conflicts_in_either_integration_order() {
     );
 }
 
-/// A rename receipt cannot be distinguished from "this agent wrote both
-/// paths". I10 receipts carry `writes` as a flat path list, so the tombstone
-/// and the new path are reported identically and the move is not provenance.
-/// A native rename would have to change this encoding, which FORMAT.md freezes.
+/// FORMAT v1 receipts still list touched paths rather than encoding a move.
+/// That no longer makes exact conflict detection impossible: the merge derives
+/// unambiguous relocations from the three immutable trees.
 #[test]
 fn i10_rename_provenance_cannot_express_the_move() {
     let (_d, forge, root, _integrator) = seeded();
@@ -173,11 +164,11 @@ fn i10_rename_provenance_cannot_express_the_move() {
     }
 }
 
-/// SILENT TODAY. Two agents rename the same file to different names. Nothing
-/// overlaps by path, so integration succeeds and the repository ends up with
-/// two copies of the same blob and no record that either was a move.
+/// Two agents move the same unique object to different destinations. Exact
+/// identity detection must make the second integration loud and retain both
+/// destination trees.
 #[test]
-fn divergent_rename_duplicates_content_with_no_conflict() {
+fn divergent_exact_renames_are_a_conflict() {
     let (_d, forge, root, integrator) = seeded();
     let a = forge.session_open(&root, "main").unwrap();
     let b = forge.session_open(&root, "main").unwrap();
@@ -185,20 +176,42 @@ fn divergent_rename_duplicates_content_with_no_conflict() {
     rename(&forge, &root, &b, "/x", "/z");
     let ra = ref_of(&forge.checkin(&root, &a, "/", "rename to /y").unwrap());
     let rb = ref_of(&forge.checkin(&root, &b, "/", "rename to /z").unwrap());
+
+    forge.merge(&integrator, "main", &ra, None).unwrap();
+    let err = forge
+        .merge(&integrator, "main", &rb, None)
+        .expect_err("divergent exact renames must conflict");
+    assert!(matches!(err, Error::MergeConflict(_)), "{err:?}");
+    assert_eq!(
+        listing(&forge, &root, "main"),
+        vec![("y".into(), "v1".into())]
+    );
+    assert_eq!(listing(&forge, &root, &rb), vec![("z".into(), "v1".into())]);
+}
+
+#[test]
+fn matching_exact_renames_converge_without_a_conflict() {
+    let (_d, forge, root, integrator) = seeded();
+    let a = forge.session_open(&root, "main").unwrap();
+    let b = forge.session_open(&root, "main").unwrap();
+    rename(&forge, &root, &a, "/x", "/y");
+    rename(&forge, &root, &b, "/x", "/y");
+    let ra = ref_of(&forge.checkin(&root, &a, "/", "rename to /y").unwrap());
+    let rb = ref_of(&forge.checkin(&root, &b, "/", "same rename").unwrap());
+
     forge.merge(&integrator, "main", &ra, None).unwrap();
     forge.merge(&integrator, "main", &rb, None).unwrap();
     assert_eq!(
         listing(&forge, &root, "main"),
-        vec![("y".into(), "v1".into()), ("z".into(), "v1".into())],
-        "path-granular merge cannot see that both sides moved the same file"
+        vec![("y".into(), "v1".into())]
     );
 }
 
-/// SILENT TODAY. A renames /x, B deletes /x. Both sides tombstone /x, so the
-/// merge sees agreement on /x and a pure addition at /y: B's deletion is
-/// dropped without a Conflict object.
+/// An exact rename versus a delete is a semantic disagreement even though both
+/// sides remove the source path. The retained destination must not make the
+/// delete disappear silently.
 #[test]
-fn rename_versus_delete_keeps_the_content_with_no_conflict() {
+fn exact_rename_versus_delete_is_a_conflict() {
     let (_d, forge, root, integrator) = seeded();
     let a = forge.session_open(&root, "main").unwrap();
     let b = forge.session_open(&root, "main").unwrap();
@@ -206,20 +219,24 @@ fn rename_versus_delete_keeps_the_content_with_no_conflict() {
     forge.delete(&root, &b, "/x").unwrap();
     let ra = ref_of(&forge.checkin(&root, &a, "/", "rename to /y").unwrap());
     let rb = ref_of(&forge.checkin(&root, &b, "/", "delete /x").unwrap());
+
     forge.merge(&integrator, "main", &ra, None).unwrap();
-    forge.merge(&integrator, "main", &rb, None).unwrap();
+    let err = forge
+        .merge(&integrator, "main", &rb, None)
+        .expect_err("rename versus delete must conflict");
+    assert!(matches!(err, Error::MergeConflict(_)), "{err:?}");
     assert_eq!(
         listing(&forge, &root, "main"),
-        vec![("y".into(), "v1".into())],
-        "B's deletion is silently ignored because the move has no identity"
+        vec![("y".into(), "v1".into())]
     );
+    assert!(listing(&forge, &root, &rb).is_empty());
 }
 
-/// SILENT TODAY, and this is the only rename the CLI can express: `forge` has
-/// no delete verb, so a CLI "rename" is a copy. The concurrent edit lands on
-/// the old path, the copy keeps stale bytes forever, and the merge is clean.
+/// A copy is deliberately not a rename candidate while its source remains.
+/// The concurrent edit lands on the old path and the copy keeps the original
+/// bytes: following copies would be a content heuristic, not exact relocation.
 #[test]
-fn copy_only_rename_leaves_stale_bytes_with_no_conflict() {
+fn copy_with_live_source_is_not_guessed_to_be_a_rename() {
     let (_d, forge, root, integrator) = seeded();
     let a = forge.session_open(&root, "main").unwrap();
     let b = forge.session_open(&root, "main").unwrap();
@@ -233,6 +250,6 @@ fn copy_only_rename_leaves_stale_bytes_with_no_conflict() {
     assert_eq!(
         listing(&forge, &root, "main"),
         vec![("x".into(), "v2".into()), ("y".into(), "v1".into())],
-        "the edit does not follow the copy; nothing reports that /y is stale"
+        "exact relocation must not turn an ordinary copy into a move"
     );
 }
