@@ -37,5 +37,7 @@ jobs:
         run: python3 .github/scripts/test-release-tooling.py
       - name: Test CI admission failures
         run: python3 .github/scripts/test-ci-admission.py
+      - name: Test fuzz evidence and failure propagation
+        run: python3 .github/scripts/test-run-fuzz.py
       - name: Enforce immutable workflow dependencies
         run: python3 .github/scripts/check-workflow-security.py

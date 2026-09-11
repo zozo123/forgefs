@@ -16,3 +16,4 @@ demo/
 /fuzz/Cargo.lock
 /abi-conformance-out
 /release-gate-out
+/fuzz/evidence
