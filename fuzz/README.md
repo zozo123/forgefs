@@ -1,8 +1,9 @@
 # Fuzzing evidence and triage
 
-The `fuzz` workflow compiles all six targets on relevant PRs. Nightly and manual
-runs install the nightly toolchain explicitly and run each target in an
-independent job for 600 seconds with a 2 GiB libFuzzer RSS limit. One failing
+The `fuzz` workflow compiles all six targets on relevant PRs and runs each for
+60 seconds. Nightly and manual runs extend that budget to 600 seconds per
+target. All runs install the nightly toolchain explicitly and use independent
+jobs with a 2 GiB libFuzzer RSS limit. One failing
 target does not cancel the others. Compilation and startup count toward the
 job's 30-minute limit, not the 600-second fuzzing budget.
 

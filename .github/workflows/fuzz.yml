@@ -49,8 +49,7 @@ jobs:
       - name: Compile every fuzz target
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
-  fuzz-sustained:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+  fuzz-run:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -75,9 +74,10 @@ jobs:
           key: fuzz-nightly-${{ matrix.target }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - name: Fuzz for ten minutes and retain the outcome
+      - name: Fuzz and retain the outcome
         env:
           FORGE_FUZZ_TARGET: ${{ matrix.target }}
+          FORGE_FUZZ_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '600' || '60' }}
         run: python3 .github/scripts/run-fuzz.py
       - name: Preserve corpus, crashes and execution evidence
         if: always()

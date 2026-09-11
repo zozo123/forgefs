@@ -48,6 +48,13 @@ class FuzzEvidenceTests(unittest.TestCase):
                 finally:
                     os.chdir(previous)
 
+    def test_invalid_budget_never_executes(self):
+        with patch.dict(os.environ, {"FORGE_FUZZ_SECONDS": "0"}):
+            with patch.object(RUNNER.subprocess, "run") as invoke:
+                with self.assertRaises(ValueError):
+                    RUNNER.run("object_decode")
+                invoke.assert_not_called()
+
     def test_unknown_target_never_executes(self):
         with patch.object(RUNNER.subprocess, "run") as invoke:
             for target in ("", "../escape", "object_decode; true"):

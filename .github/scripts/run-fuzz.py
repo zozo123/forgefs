@@ -18,10 +18,13 @@ TARGETS = frozenset({
 def run(target: str) -> int:
     if target not in TARGETS:
         raise ValueError("unknown fuzz target")
+    seconds = os.environ.get("FORGE_FUZZ_SECONDS", "600")
+    if seconds not in {"60", "600"}:
+        raise ValueError("fuzz budget must be 60 or 600 seconds")
     evidence = Path("fuzz/evidence")
     evidence.mkdir(parents=True, exist_ok=True)
     command = ["cargo", "+nightly", "fuzz", "run", target, "--",
-               "-max_total_time=600", "-rss_limit_mb=2048"]
+               f"-max_total_time={seconds}", "-rss_limit_mb=2048"]
     outcome = {
         "target": target,
         "commit": os.environ.get("GITHUB_SHA"),
