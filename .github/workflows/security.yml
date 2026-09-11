@@ -5,6 +5,7 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - deny.toml
       - 'crates/**/Cargo.toml'
       - '.github/workflows/security.yml'
   push:
@@ -13,6 +14,7 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - deny.toml
       - 'crates/**/Cargo.toml'
       - '.github/workflows/security.yml'
   schedule:
@@ -42,3 +44,7 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit committed lockfile
         run: cargo audit --deny warnings
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Enforce dependency policy
+        run: cargo deny --locked check advisories bans licenses sources

@@ -102,6 +102,8 @@ ALLOWED_RUN_COMMANDS = frozenset(
         "cargo test --workspace --all-targets --locked",
         "git diff --exit-code -- Cargo.lock",
         "python3 .github/scripts/check-workflow-security.py",
+        "python3 .github/scripts/check-ci-admission.py",
+        "python3 .github/scripts/test-ci-admission.py",
         "python3 .github/scripts/measure-issue-49.py",
         "python3 .github/scripts/prepare-release-version.py",
         "python3 .github/scripts/test-release-tooling.py",
