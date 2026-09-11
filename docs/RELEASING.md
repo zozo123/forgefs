@@ -120,7 +120,30 @@ The workflow uses the fixed `macos-15-intel` and `macos-15` labels, so neither m
 
 Configure a GitHub Environment named `release` with required reviewers and restrict deployment to release tags (`v*`). Both attestation and publication use this environment.
 
-Protect `main` with required status checks. Code can encode the gates, but repository settings are the authority that prevents bypassing them.
+Protect `main` with a required pull-request rule and the **`admission`** status
+check from GitHub Actions. Require the branch to be up to date before merging;
+retain deletion and non-fast-forward protection. `admission` always runs after
+`rust`, `msrv`, `macos-durability` (both matrix runners), `e2e-smoke`,
+`power-loss`, and `gates`. It accepts only an exact dependency set whose results
+are all `success`; missing, skipped, cancelled, and failed jobs deny admission.
+The matrix dependency succeeds only when both macOS jobs succeed.
+
+This job is an evidence aggregator, not repository protection by itself. The
+repository administrator must bind the required context to GitHub Actions and
+protect workflow/admission-policy changes with base-trusted policy or an
+explicit audited break-glass path. A PR-controlled check cannot prove its own
+policy was not weakened. Issue #51 stays open until the live ruleset and
+negative merge/direct-push tests prove this boundary.
+
+Break-glass is exceptional: record the incident, exact commit, failed or
+unavailable gates, actor and reason in an issue before using an administrator
+bypass. Restore enforcement immediately, rerun every gate on the resulting
+commit, and attach the evidence. A bypass never substitutes for the release
+workflow's green evidence or authorizes a release over a failed gate.
+
+Scheduled and dependency-change security runs execute both RustSec audit and
+`cargo deny` (advisories, bans, licenses, and sources), including changes to
+`deny.toml`. Release jobs enforce the same policy independently.
 
 Keep workflow actions SHA-pinned on trusted/release paths. A movable action tag is code execution from a mutable dependency.
 

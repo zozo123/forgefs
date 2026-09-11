@@ -154,3 +154,24 @@ jobs:
             gate-summary.json
             abi-conformance.json
           if-no-files-found: warn
+
+  admission:
+    name: admission
+    if: always()
+    needs:
+      - rust
+      - msrv
+      - macos-durability
+      - e2e-smoke
+      - power-loss
+      - gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Require every correctness gate to succeed
+        env:
+          FORGE_CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/check-ci-admission.py
