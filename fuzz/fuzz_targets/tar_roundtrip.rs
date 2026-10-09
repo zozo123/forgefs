@@ -3,7 +3,7 @@
 use forge_api::Forge;
 use forge_cap::Cap;
 use forge_core::validate_name;
-use forge_types::{hex_encode, CasResult, ObjectId};
+use forge_types::{hex_encode, CasResult, Error, ObjectId};
 use libfuzzer_sys::fuzz_target;
 use std::fs;
 use std::io::Write;
@@ -139,9 +139,17 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    fx.forge
-        .export_tar(&fx.cap, REF_A, &tar_path)
-        .expect("exporting an imported tree must succeed");
+    match fx.forge.export_tar(&fx.cap, REF_A, &tar_path) {
+        Ok(()) => {}
+        // I16: default export refuses names that collide under case folding or
+        // Unicode canonical equivalence. The tree is valid. The refusal is the
+        // contract, so it is not a round-trip failure.
+        Err(Error::Invalid(msg)) if msg.starts_with("export refused:") => {
+            cleanup();
+            return;
+        }
+        Err(e) => panic!("exporting an imported tree must succeed: {e:?}"),
+    }
 
     let file = fs::File::open(&tar_path).expect("exported archive is readable");
     let mut archive = tar::Archive::new(file);
