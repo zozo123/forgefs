@@ -500,6 +500,41 @@ class SbomTests(unittest.TestCase):
             self.assertEqual(properties["forgefs:release:version"], VERSION)
             self.assertEqual(properties["forgefs:release:target"], "fixture-triple")
 
+    def test_normalized_sbom_handles_symlinked_workspace_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            checkout = directory / "checkout"
+            checkout.mkdir()
+            alias = directory / "alias"
+            alias.symlink_to(checkout, target_is_directory=True)
+            outputs = []
+            for root in (alias, checkout):
+                document = fake_sbom(LINKED_FIXTURE, str(root))
+                document["dependencies"].append(
+                    {
+                        "ref": f"path+file://{root}#1.2.3",
+                        "dependsOn": [f"path+file://{checkout}"],
+                    }
+                )
+                outcome = normalize_sbom(document, directory, str(alias))
+                self.assertEqual(outcome.returncode, 0, outcome.stderr)
+                payload = (directory / "out.cdx.json").read_bytes()
+                self.assertNotIn(str(alias).encode(), payload)
+                self.assertNotIn(str(checkout).encode(), payload)
+                outputs.append(payload)
+            self.assertEqual(outputs[0], outputs[1])
+
+    def test_normalization_does_not_rewrite_a_workspace_prefix_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            outcome = normalize_sbom(
+                fake_sbom(LINKED_FIXTURE, f"{directory}-other"),
+                directory,
+                str(directory),
+            )
+            self.assertNotEqual(outcome.returncode, 0)
+            self.assertIn("sbom still carries builder paths", outcome.stderr)
+
     def test_serial_number_distinguishes_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

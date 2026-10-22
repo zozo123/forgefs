@@ -21,7 +21,7 @@ if [ -n "$unexpected" ]; then
   echo "::error title=Non-file release payload entry::$unexpected"
   exit 1
 fi
-find . -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort >"$actual"
+find . -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort >"$actual"
 if ! diff -u "$expected_with_manifest" "$actual"; then
   echo "::error title=Release payload mismatch::payload does not match the audited catalog"
   exit 1

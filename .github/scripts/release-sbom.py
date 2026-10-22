@@ -50,7 +50,9 @@ def deterministic_serial(version: str, commit: str, target: str) -> str:
 def rewrite_paths(node: object, prefix: str) -> object:
     if isinstance(node, str):
         if node.startswith(prefix):
-            return WORKSPACE_ROOT_REF + node[len(prefix) :]
+            suffix = node[len(prefix) :]
+            if not suffix or suffix[0] in "/#":
+                return WORKSPACE_ROOT_REF + suffix
         return node
     if isinstance(node, list):
         return [rewrite_paths(item, prefix) for item in node]
@@ -69,15 +71,19 @@ def canonical_bytes(document: object) -> bytes:
 def normalize(arguments: argparse.Namespace) -> int:
     document = json.loads(Path(arguments.input).read_text(encoding="utf-8"))
 
-    root = str(Path(arguments.workspace_root).resolve())
-    document = rewrite_paths(document, f"path+file://{root}")
+    workspace_root = Path(arguments.workspace_root)
+    # Cargo may retain the caller's symlink spelling (for example /var on
+    # macOS), while another builder emits the canonical checkout path.
+    roots = {str(workspace_root.absolute()), str(workspace_root.resolve())}
+    for root in sorted(roots, key=len, reverse=True):
+        document = rewrite_paths(document, f"path+file://{root}")
     if not isinstance(document, dict):
         raise SystemExit("sbom root is not a JSON object")
 
     leaked = [
         found
         for found in re.findall(r"file://[^\"]*", canonical_bytes(document).decode())
-        if root in found
+        if any(root in found for root in roots)
     ]
     if leaked:
         raise SystemExit(f"sbom still carries builder paths: {leaked[:3]}")
