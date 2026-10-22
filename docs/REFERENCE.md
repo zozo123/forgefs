@@ -1,8 +1,8 @@
+# ForgeFS reference
+
 > Full reference preserved from the v0.4.0-era README. Commands run from the repository root.
 > Release transcripts and statements about the packaged README describe that original document.
 > Start with the [short README](../README.md) for installation and a first run.
-
-# ForgeFS
 
 Many autonomous agents, one repository, no shared mutable checkout.
 
@@ -81,7 +81,7 @@ CycloneDX SBOM per target and a reproducibility report. It covers the four binar
 beside them — per target: a build-info file, a CycloneDX SBOM, the ABI conformance table, the
 Conflict-object record, the environment line (as both `.txt` and `.json`), the `fsck --full`
 report, the gate summary and the seal attestation, plus the double-build reproducibility evidence
-for `x86_64-unknown-linux-gnu` (see [`docs/SUPPLY-CHAIN.md`](../docs/SUPPLY-CHAIN.md)). Each release
+for `x86_64-unknown-linux-gnu` (see [`docs/SUPPLY-CHAIN.md`](SUPPLY-CHAIN.md)). Each release
 is also covered by a SLSA provenance attestation you can check without trusting this page. That
 check needs the GitHub CLI, which is not in the install list above and is not in a base image
 either: install `gh` first (<https://cli.github.com>).
@@ -1040,7 +1040,7 @@ The sleep is for the second rule, not the first.
 `abandon fork` refuses a ref that is not a fork and refuses a live session head — both are rows in
 the ABI conformance table — and `abandon session` refuses a session holding staged work unless you
 pass `--discard-staged`. `--dry-run` computes the same plan and deletes nothing.
-[`docs/GC.md`](../docs/GC.md) has the root set and the sweep-race argument.
+[`docs/GC.md`](GC.md) has the root set and the sweep-race argument.
 
 ## What it costs
 
@@ -1132,7 +1132,7 @@ are lifetime totals for identical runs, so they establish the direction, not the
 effect. The change that introduced it measured **+33% throughput at 16
 concurrent writers**, 2.82x fewer durable commits, and mutex wait down from 31.6 ms to 9.5 ms, on
 the machine where it landed. It is absent at W=1 and W=2, exactly as the mechanism predicts;
-[`docs/BENCH.md`](../docs/BENCH.md) explains why membership in a shared fsync is structural rather than
+[`docs/BENCH.md`](BENCH.md) explains why membership in a shared fsync is structural rather than
 statistical. That +33% is quoted from the run that landed the change, not re-measured here — there
 is no v0.4.0 build without group commit to compare against.
 
@@ -1155,7 +1155,7 @@ throughput. If you care about tail latency, oversubscribing the CPU is the first
 doing.
 
 **ForgeFS versus Git, stated against itself.** The checked-in comparator
-(`scripts/w7-git-comparator.sh`, protocol in [`docs/BENCH.md`](../docs/BENCH.md)) was re-run on the
+(`scripts/w7-git-comparator.sh`, protocol in [`docs/BENCH.md`](BENCH.md)) was re-run on the
 same box, 32 agents, 4 workers, 9 fresh repositories per configuration. Every row is on one
 filesystem (`/dev/vdd`, ext4), and 200 `fsync`s on it moved the device flush count by 200 before
 any figure below was taken:
@@ -1173,7 +1173,7 @@ earlier tables did not show. Those tables ran `forge bench` on `$TMPDIR` while t
 sat on the repository disk; on this box that alone was a 3.3x difference, and it flattered exactly
 the one row ForgeFS used to win. The comparator now places all four configurations on one
 filesystem and publishes the barrier-reach probe with the numbers;
-[`docs/BENCH.md`](../docs/BENCH.md) carries the correction and the paired measurement.
+[`docs/BENCH.md`](BENCH.md) carries the correction and the paired measurement.
 
 Read the deficit as lower raw throughput under this protocol rather than as a like-for-like defeat,
 because ForgeFS is doing strictly more durability work — measured, not asserted, by
@@ -1199,7 +1199,7 @@ encode + fsync_file + fsync_dir + sqlite_wait + sqlite_txn`) prints `per-checkin
 requires operation-scoped tracing; never derive it from lifetime totals`. `forge stats --json`
 carries no byte field at all, and its `note` says the same thing in prose. In both commands the
 counters are cumulative process-lifetime totals spanning init, both workloads, merge/seal, verify
-and `fsck`, and must not be divided by a checkin count. [`docs/BENCH.md`](../docs/BENCH.md) owns the
+and `fsck`, and must not be divided by a checkin count. [`docs/BENCH.md`](BENCH.md) owns the
 protocol.
 
 ## Limits
@@ -1221,7 +1221,7 @@ because they are no longer true**, and the ones that changed shape say what is l
   (`c7325398…  link.txt` and `c7325398…  real.txt`), and exporting gives back two regular files, not
   a link. Containment still holds: a target resolving outside the import root is refused even with
   the flag — `import refuses symlink /tree/escape.txt: target /etc/passwd is outside the import root /tree`.
-  Real symlinks need a VERSION 2 tree entry that does not exist. See [`docs/POSIX.md`](../docs/POSIX.md).
+  Real symlinks need a VERSION 2 tree entry that does not exist. See [`docs/POSIX.md`](POSIX.md).
 - **POSIX metadata is dropped or widened, silently.** `exec` is the only mode bit the format has.
   A directory holding `0600 a`, `0444 b` and `0755 x`, imported and exported, comes back:
 
@@ -1234,7 +1234,7 @@ because they are no longer true**, and the ones that changed shape say what is l
   `0600` and `0444` both become `0644`; only the exec bit survives; uid/gid are zeroed and mtime is
   the epoch. Setuid, setgid, sticky, xattrs and ACLs are dropped, hardlinked pairs become two
   independent files, and a sparse file is materialised in full — those four are documented in
-  [`docs/POSIX.md`](../docs/POSIX.md) and were not re-measured for this release. A `chmod` after
+  [`docs/POSIX.md`](POSIX.md) and were not re-measured for this release. A `chmod` after
   extraction recovers a mode; nothing recovers a symlink.
 - **A blob must fit in memory, and reading costs 3x.** `put`/`get` take and return whole buffers.
   Measured on the box above with a 256 MiB blob: `write` peaked at **1.03x** the payload (262144 KiB
@@ -1308,7 +1308,7 @@ because they are no longer true**, and the ones that changed shape say what is l
 - **Crash evidence is process-level, not power-loss.** A deterministic fault-injection matrix covers
   every durability transition, and real `SIGKILL` tests exist (`cli_sigkill.rs`). Neither is a
   power-loss claim; that half rests on `synchronous=FULL` staying FULL plus the device honouring
-  flushes. [`docs/RECOVERY.md`](../docs/RECOVERY.md) states the contract.
+  flushes. [`docs/RECOVERY.md`](RECOVERY.md) states the contract.
 - **Termination by signal carries no exit code.** On a filesystem that runs out of space while
   SQLite's mapped wal-index has holes, a page fault arrives as SIGBUS. ForgeFS refuses to open below
   a 32 KiB free-space threshold rather than installing a handler, but automation must still
@@ -1346,5 +1346,5 @@ step.
 
 [INVARIANTS.md](../INVARIANTS.md) is the file to read second. [FORMAT.md](../FORMAT.md) freezes the v1
 object encoding. [AGENTS.md](../AGENTS.md) has the contributor architecture and change rules.
-[`docs/`](../docs/) holds the GC, POSIX, benchmark, recovery, object-store, chunking and release
+[`docs/`](./) holds the GC, POSIX, benchmark, recovery, object-store, chunking and release
 documents. Apache-2.0.

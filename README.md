@@ -2,111 +2,132 @@
 
 Isolated, auditable workspaces for concurrent coding agents. Built in Rust.
 
-Each agent works from a pinned snapshot. Publishing uses compare-and-swap: one agent advances
-the ref; a losing agent keeps its completed work in an explicit fork. Recorded reads also let
-ForgeFS refuse a checkin when a dependency the agent observed has changed. Sealed releases can
-be verified from durable object bytes.
+For teams running several coding agents on one repository. Each agent works in a session pinned to
+one snapshot. Publishing is compare-and-swap on a named ref: one agent advances it, and a loser's
+completed work is kept in an explicit fork, not overwritten. Reads are recorded, so a checkin is
+refused when a dependency the agent read has since changed, even if its own writes touch nothing in
+common. Releases are ed25519-sealed snapshots that `forge verify` re-hashes from disk. For one agent
+and one checkout, Git is simpler.
 
-Use ForgeFS when several agents write to one repository and you need provenance, explicit
-conflicts, and evidence of exactly what shipped. For one agent and one checkout, Git is simpler.
+ForgeFS is a content-addressed (BLAKE3) store driven by the `forge` CLI or a local socket daemon
+(`forge serve`). It is not a kernel/FUSE mount and not a Git backend: `forge import` brings a tree
+in, `forge export` writes a tar out.
 
-[Install](#install) · [Try it](#try-it) · [Evidence and cost](#evidence-and-cost) ·
-[Limits](#limits) · [Full reference](docs/REFERENCE.md)
+**Status:** Pre-1.0. Security fixes land on `main` only. Docs on `main` may describe unreleased
+verbs (e.g. `forge receipt`); the [v0.4.0 tag](https://github.com/zozo123/forgefs/tree/v0.4.0) has
+the released docs. The [full reference][ref] has the detail behind this page.
 
 ## Install
 
-The current release is **v0.4.0**, with binaries for Linux and macOS on x86-64 and ARM64.
-There is no Windows build, and the source requires Unix APIs.
-
-Choose a target: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`x86_64-apple-darwin`, or `aarch64-apple-darwin`. On Linux, with `curl`, `tar`, and `sha256sum`:
+The current release is **v0.4.0**, for Linux and macOS on x86-64 and ARM64 (`x86_64-` or `aarch64-`
+followed by `unknown-linux-gnu` or `apple-darwin`). There is no Windows build. On Linux:
 
 ```bash
 V=0.4.0; T=x86_64-unknown-linux-gnu
-curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/forge-$V-$T.tar.gz
-curl -sSLO https://github.com/zozo123/forgefs/releases/download/v$V/SHA256SUMS
+curl -fsSLO https://github.com/zozo123/forgefs/releases/download/v$V/forge-$V-$T.tar.gz
+curl -fsSLO https://github.com/zozo123/forgefs/releases/download/v$V/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 tar -xzf forge-$V-$T.tar.gz
 sudo install forge-$V-$T/forge /usr/local/bin/
 forge --version
 ```
 
-On macOS, set `T` to the matching Apple target and use `shasum -a 256 --ignore-missing -c SHA256SUMS`
-in place of `sha256sum`. A bare Debian image first needs `apt-get install curl ca-certificates`.
-The final `install` needs root. For provenance verification, install and authenticate the GitHub CLI,
-then run `gh attestation verify forge-$V-$T.tar.gz -R zozo123/forgefs`.
-
-Read [upgrade and migration notes](docs/REFERENCE.md#which-build-this-page-documents) before
-opening an existing repository. The v0.2.1 catalog migration is one-way; v0.4.0 also renames
-session fork refs. [Release evidence and supply-chain details](docs/SUPPLY-CHAIN.md).
+On macOS, set `T` to the Apple target and use `shasum -a 256 --ignore-missing -c SHA256SUMS`.
+A bare Debian image first needs `apt-get install curl ca-certificates`. For provenance, run
+`gh attestation verify forge-$V-$T.tar.gz -R zozo123/forgefs` with an authenticated GitHub CLI
+([release evidence and supply chain](docs/SUPPLY-CHAIN.md)). To build `main` from source instead
+(Rust 1.89 or newer, `git`, and a C compiler), run
+`cargo install --locked --git https://github.com/zozo123/forgefs forge-cli`.
 
 ## Try it
 
-In a fresh directory, import a file, edit it in an isolated session, publish, and verify the store:
+Two agents check in to `work` from the same snapshot; then one reads a dependency that moves before
+its next checkin. In an empty directory, in bash or zsh:
 
 ```bash
-mkdir -p project
-printf 'hello\n' > project/hello.txt
+mkdir -p app dep && echo v1 > app/main.txt && echo 'API = 1' > dep/api.txt
 forge init ./demo
-export FORGE_DIR="$PWD/demo"
-ROOT="$FORGE_DIR/.forge/keys/root.cap"
-forge --cap "$ROOT" import --ref work ./project
-
-SESSION=$(forge --cap "$ROOT" session open --from=work)
-forge --cap "$ROOT" mount --ns "$SESSION" / ref:work --rw
-forge --cap "$ROOT" read --ns "$SESSION" /hello.txt
-forge --cap "$ROOT" write --ns "$SESSION" /hello.txt --text 'hello from an agent'
-forge --cap "$ROOT" checkin --ns "$SESSION" -m 'update greeting'
-forge --cap "$ROOT" fsck --full
+export FORGE_DIR="$PWD/demo" FORGE_CAP="$PWD/demo/.forge/keys/root.cap"
+forge import --ref work ./app && forge import --ref deps ./dep
+A=$(forge session open --from=work); forge mount --ns "$A" / ref:work --rw
+B=$(forge session open --from=work); forge mount --ns "$B" / ref:work --rw
+forge write --ns "$A" /a.txt --text alice; forge write --ns "$B" /b.txt --text bob
+forge checkin --ns "$A" -m alice
+forge checkin --ns "$B" -m bob; echo "exit $?"
+forge mount --ns "$A" /vendor ref:deps; forge read --ns "$A" /vendor/api.txt
+echo 'API = 2' > dep/api.txt && forge import --ref deps ./dep
+forge write --ns "$A" /a.txt --text 'alice v2'
+forge checkin --ns "$A" -m 'alice v2'; echo "exit $?"
+forge fsck --full
 ```
 
-This first run uses the root capability. For agent-scoped permissions and the interesting cases,
-follow the [two-agent walkthrough](docs/REFERENCE.md#a-worked-example): a publication race,
-a preserved fork, a stale-read refusal, and a verified seal. Both winning and forked checkins
-exit 0; inspect the result to distinguish them. Stale observations and merge conflicts exit 4.
-[CLI output and exit-code contract](CLI_ABI.md).
+What just happened: alice published (`updated work …`); bob lost the compare-and-swap and got
+`forked work -> heads/agents/anon/forks/work/…` with `exit 0`, his work kept and hers intact (check
+that line, not the status); alice's next checkin got `stale observation of /vendor:/api.txt` and
+`exit 4`, because `deps` moved after she read it, though she wrote only `/a.txt`. This uses the root
+capability. Agent-scoped capabilities, merging the fork, and sealing a release
+are in the [two-agent walkthrough][walk]. Output and exit codes: [CLI_ABI.md](CLI_ABI.md).
+
+**Upgrading?** The [v0.2.1 catalog migration][upgrade021] is one-way, and v0.4.0
+[renames session fork refs][forkref] from `forks/<ref>/<agent>/<ulid>` to
+`heads/agents/<agent>/forks/<ref>/<ulid>`. Read both before opening an older repository.
 
 ## Evidence and cost
 
-[INVARIANTS.md](INVARIANTS.md) maps 24 correctness rules to executable evidence.
-The [full reference](docs/REFERENCE.md#why-you-should-believe-any-of-this) includes gate commands
-and recorded output; [release artifacts](https://github.com/zozo123/forgefs/releases) publish
-verification evidence beside the binaries.
+[INVARIANTS.md](INVARIANTS.md) maps every numbered rule (I1–I25 on main; v0.4.0 shipped I1–I24)
+to code and tests. The [full reference][believe] includes gate commands and recorded output;
+[release artifacts](https://github.com/zozo123/forgefs/releases) publish verification evidence.
 
-ForgeFS pays for isolation, recorded reads, and durable publication. In the recorded same-filesystem
-comparison, the CLI delivered **131.4 ops/s**, Git worktrees **344.9 ops/s**, and Git with
-`core.fsync=all` **254.7 ops/s**. These are medians from nine fresh repositories per configuration
-on one shared Linux VM, with 32 agents and four workers. The durability barriers differ, so these
-are protocol-specific throughput observations, not equivalent-durability speed ratios.
-See the [environment and results](docs/REFERENCE.md#what-it-costs) and
-[benchmark protocol](docs/BENCH.md) before quoting them.
+ForgeFS pays for isolation, recorded reads, and durable publication; on the measured box it is
+slower than Git. In the recorded same-filesystem comparison (32 agents, four workers, medians of
+nine fresh repositories per configuration, one shared Linux VM), the `forge` CLI delivered
+**131.4 ops/s**, Git worktrees **344.9 ops/s**, and Git with `core.fsync=all` **254.7 ops/s**.
+Before quoting them:
+
+- Even in-process ForgeFS (`forge bench`, no execs) reached only **245.8 ops/s**, below stock Git.
+- The CLI row costs 3 execs per agent operation; Git's rows cost 2.
+- Repetitions within one configuration varied by up to 1.8× ([raw runs](docs/bench-results/w7-5a7017a/)).
+- The durability barriers differ, so these are protocol-specific throughput observations, not
+  equivalent-durability speed ratios. See the [environment and results][cost] and
+  [benchmark protocol](docs/BENCH.md).
 
 ## Limits
 
 - **Single node, Unix only.** No replication, remote transport, or multi-host consensus.
 - **Not a POSIX filesystem.** Symlinks are refused by default; following them copies their targets.
-  Only the executable bit survives import/export. Permissions, ownership, and timestamps are lost
-  or widened. See [POSIX boundaries](docs/POSIX.md).
+  Only the executable bit survives import/export. Permissions, ownership, and timestamps are
+  dropped or widened silently. See [POSIX boundaries](docs/POSIX.md).
 - **Whole blobs must fit in memory.** A measured 256 MiB read peaked at about 3× payload RSS.
   There is no chunked-file representation; see [chunking](docs/CHUNKING.md).
-- **Graph walks are bounded.** The default ceiling is one million objects; larger reachable sets
-  need an explicit limit increase and matching RAM. Object files also consume filesystem inodes.
-- **Crash evidence is process-level.** Fault injection and real SIGKILL tests do not establish
-  power-loss behavior; see the [recovery contract](docs/RECOVERY.md).
+- **One object is one file.** On a 30 GB ext4 volume, importing a 1M-file tree ran out of inodes at
+  685,044 objects with 45% of bytes free (exit 5; repository intact). Size by inodes. fsck, gc and
+  seal verification hold the whole reachable graph in memory, capped at 1,000,000 objects by default
+  (exit 1; raise with `FORGEFS_MAX_GRAPH_OBJECTS`, about 100 B RAM per object). The walk is not
+  resumable.
+- **Power loss is modelled, not proven.** A Linux-only libc write/fsync replay, added on `main` after
+  v0.4.0 (CI `power-loss` job, [docs/DURABILITY.md](docs/DURABILITY.md)), drops un-fsynced bytes at
+  sampled cut points. It does not model drive caches, sector tearing or filesystem bugs; see the
+  [recovery contract](docs/RECOVERY.md).
 
-The [complete limits](docs/REFERENCE.md#limits) also document staged-directory listing gaps,
-checkin/abandon inconsistencies, daemon coverage, and upgrade edge cases.
+The [complete limits][limits] also document: no W6 results (do not infer tree scaling from the
+32-agent numbers); death by signal (SIGBUS on a full disk) carries no exit code; the gate scripts'
+undeclared-command backstop needs bash ≥ 4; staged-directory listing gaps; checkin/abandon
+inconsistencies; daemon coverage; and upgrade edge cases.
 
 ## Code and documentation
 
-| Area | Crates |
-|---|---|
-| Immutable objects and storage | `forge-types`, `forge-core`, `forge-store` |
-| Authority and isolated sessions | `forge-cap`, `forge-ns` |
-| Integration and process boundaries | `forge-merge`, `forge-protocol`, `forge-api`, `forge-cli` |
+Objects and storage: `forge-types`, `forge-core`, `forge-store`. Authority and sessions: `forge-cap`,
+`forge-ns`. Integration and boundaries: `forge-merge`, `forge-protocol`, `forge-api`, `forge-cli`.
 
-[Full crate map](docs/REFERENCE.md#layout) · [Object format](FORMAT.md) ·
-[Recovery](docs/RECOVERY.md) · [Conflicts](docs/CONFLICTS.md) · [Garbage collection](docs/GC.md) ·
-[Security](SECURITY.md) · [Contributor rules](AGENTS.md)
+[Full crate map][layout] · [Object format](FORMAT.md) · [Conflicts](docs/CONFLICTS.md) ·
+[Garbage collection](docs/GC.md) · [Security](SECURITY.md) · [Contributor rules](AGENTS.md) ·
+Apache-2.0, see [LICENSE](LICENSE).
 
-Apache-2.0. See [LICENSE](LICENSE).
+[ref]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md
+[walk]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#a-worked-example
+[upgrade021]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#upgrading-a-v021-repository
+[forkref]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#the-fork-ref-rename--the-one-breaking-change
+[believe]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#why-you-should-believe-any-of-this
+[cost]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#what-it-costs
+[limits]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#limits
+[layout]: https://github.com/zozo123/forgefs/blob/main/docs/REFERENCE.md#layout

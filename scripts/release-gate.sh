@@ -394,7 +394,7 @@ done
 phase gate/grant "three attenuated agent caps minted (alice, bob, carol)"
 
 # ---------------------------------------------------------------------------
-# Phase 3 - the README two-agent path
+# Phase 3 - the docs/REFERENCE.md two-agent path
 #   two sessions, disjoint writes, two checkins, two merges
 # ---------------------------------------------------------------------------
 must gate/session-alice --dir "$DEMO" --cap "$ALICE" session open --from=main

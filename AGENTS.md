@@ -13,13 +13,21 @@ Each fact has one owner. Link to it instead of copying it:
 | `INVARIANTS.md` | Normative correctness rules and executable evidence |
 | `FORMAT.md` | Frozen VERSION 1 object framing and canonical encodings |
 | `CLI_ABI.md` | Stable CLI output, error, and exit-code contract |
+| `docs/REFERENCE.md` | Full user reference: install and upgrade detail, worked two-agent example, recorded costs, complete limits, crate layout |
 | `docs/RECOVERY.md` | Crash-durability and recovery contract |
+| `docs/DURABILITY.md` | Power-loss replay evidence for I4, and what it does not prove |
 | `docs/OBJECTSTORE.md` | The `ObjectStore` seam and the durability a backend must prove itself |
+| `docs/GC.md` | Reclamation: `abandon`, `gc`, and the I23 collection rule |
+| `docs/POSIX.md` | Which POSIX metadata import/export preserves, converts, drops, or refuses |
+| `docs/PORTABILITY.md` | Path-name portability at the archive (`export`) boundary |
 | `docs/BENCH.md` | Reproducible benchmark protocol and claim boundaries |
+| `docs/COST.md` | Cost model: how to read `forge bench` and which costs may motivate architecture |
 | `docs/CHUNKING.md` | Measured object-size ceiling and the chunked-file design decision |
 | `docs/CONFLICTS.md` | Conflict lifecycle, resolution decision, and merge drivers |
 | `docs/REPLICATION.md` | Object-plane / ref-plane replication decision |
+| `docs/CRYPTO.md` | Cryptographic dependency and usage review |
 | `docs/RELEASING.md` | Release, artifact, and verification procedure |
+| `docs/SUPPLY-CHAIN.md` | SBOM, reproducible-build, and dependency-policy evidence |
 | `SECURITY.md` | Threat model, supported reporting path, and non-goals |
 
 The code is authoritative when documentation and implementation disagree. Fix
