@@ -94,6 +94,17 @@ class ContractTests(unittest.TestCase):
         self.edit(CONTRACT.CI_WORKFLOW, "  msrv:\n", "  msrv:\n    if: false\n")
         self.assertDrift("'msrv' must not be conditional")
 
+    def test_skipped_or_soft_failing_gate_step_is_drift(self) -> None:
+        self.edit(CONTRACT.CI_WORKFLOW, "      - name: Clippy\n", "      - name: Clippy\n        if: false\n")
+        self.assertDrift("'rust' has a conditional step")
+        self.edit(CONTRACT.CI_WORKFLOW, "      - name: CLI ABI conformance\n", "      - name: CLI ABI conformance\n        continue-on-error: true\n")
+        self.assertDrift("'gates' uses continue-on-error")
+
+    def test_evidence_upload_after_failure_is_allowed(self) -> None:
+        jobs = CONTRACT.parse_jobs((ROOT / CONTRACT.CI_WORKFLOW).read_text(encoding="utf-8"))
+        self.assertIn("if: always()", jobs["gates"]["body"])
+        self.assertEqual(CONTRACT.check_required_steps("gates", jobs["gates"]), [])
+
     def test_replaced_admission_command_is_drift(self) -> None:
         self.edit(CONTRACT.CI_WORKFLOW, "run: python3 .github/scripts/check-ci-admission.py", "run: python3 .github/scripts/test-ci-admission.py")
         self.assertDrift("must run check-ci-admission.py")
@@ -111,6 +122,7 @@ class ContractTests(unittest.TestCase):
             "missing non_fast_forward rule": lambda d: d.update(rules=[r for r in d["rules"] if r["type"] != "non_fast_forward"]),
             "missing required_status_checks rule": lambda d: d.update(rules=[r for r in d["rules"] if r["type"] != "required_status_checks"]),
             "~DEFAULT_BRANCH": lambda d: d["conditions"]["ref_name"].update(include=[]),
+            "excluding nothing": lambda d: d["conditions"]["ref_name"].update(exclude=["refs/heads/main"]),
         }
         original = self.ruleset()
         for fragment, mutate in cases.items():
@@ -143,10 +155,20 @@ class ContractTests(unittest.TestCase):
         document["rules"] = [r for r in document["rules"] if r["type"] != "update"]
         self.write_ruleset(document, CONTRACT.TAG_RULESET)
         self.assertDrift("tags must be immutable")
+        document["conditions"]["ref_name"]["exclude"] = ["refs/tags/v1*"]
+        self.write_ruleset(document, CONTRACT.TAG_RULESET)
+        self.assertDrift("release-tags: must target exactly refs/tags/v*, excluding nothing")
 
     def test_unowned_trust_root_is_drift(self) -> None:
-        (self.tree / CONTRACT.CODEOWNERS).write_text("# nobody\n", encoding="utf-8")
-        self.assertDrift("must have an owner")
+        for text in (
+            "# nobody\n",
+            "/.github/\n",
+            "/.github/ @zozo123\n/.github/\n",
+            "/.github/ @zozo123\n/.github/workflows/ @someone-else\n",
+        ):
+            with self.subTest(text=text):
+                (self.tree / CONTRACT.CODEOWNERS).write_text(text, encoding="utf-8")
+                self.assertDrift("must be the last rule")
 
     def test_unreadable_contract_fails_closed(self) -> None:
         (self.tree / CONTRACT.RULESET).write_text("{", encoding="utf-8")

@@ -36,6 +36,8 @@ JOB_KEY = re.compile(r"^  (?P<id>[A-Za-z0-9_-]+):\s*$")
 FIELD = re.compile(r"^    (?P<key>[A-Za-z0-9_-]+):\s*(?P<value>.*)$")
 LIST_ITEM = re.compile(r"^\s+-\s+(?P<value>\S.*?)\s*$")
 MATRIX_OS = "${{ matrix.os }}"
+STEP_IF = re.compile(r"^(?:-\s+)?if:\s*(?P<value>.*)$")
+CONTINUE_ON_ERROR = re.compile(r"^(?:-\s+)?continue-on-error:")
 
 
 def load_required() -> frozenset[str]:
@@ -115,6 +117,22 @@ def expected_contexts(jobs: dict[str, dict], required: frozenset[str]) -> set[st
     return contexts
 
 
+def check_required_steps(job_id: str, job: dict) -> list[str]:
+    """A green job must mean every step ran: no skipped or soft-failing steps.
+
+    `if: always()` is the one allowed step condition; it only widens when a
+    step runs (evidence upload after a failure).
+    """
+    errors = []
+    for line in job["body"]:
+        condition = STEP_IF.match(line)
+        if condition and unquote(condition.group("value")) != "always()":
+            errors.append(f"ci.yml: required job {job_id!r} has a conditional step")
+        if CONTINUE_ON_ERROR.match(line):
+            errors.append(f"ci.yml: required job {job_id!r} uses continue-on-error")
+    return errors
+
+
 def check_ci(jobs: dict[str, dict], required: frozenset[str]) -> list[str]:
     errors = []
     for job_id in sorted(required):
@@ -122,6 +140,8 @@ def check_ci(jobs: dict[str, dict], required: frozenset[str]) -> list[str]:
             errors.append(f"ci.yml: required correctness job {job_id!r} is missing")
         elif jobs[job_id]["if"] is not None:
             errors.append(f"ci.yml: required job {job_id!r} must not be conditional")
+        else:
+            errors += check_required_steps(job_id, jobs[job_id])
     admission = jobs.get(ADMISSION_JOB)
     if admission is None:
         return errors + ["ci.yml: the admission job is missing"]
@@ -150,6 +170,14 @@ def rules_by_type(ruleset: dict) -> dict[str, dict]:
     }
 
 
+def ref_condition(ruleset: dict) -> tuple[object, object]:
+    conditions = ruleset.get("conditions")
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if not isinstance(ref_name, dict):
+        return None, None
+    return ref_name.get("include"), ref_name.get("exclude")
+
+
 def check_common(ruleset: object, label: str) -> list[str]:
     if not isinstance(ruleset, dict):
         return [f"{label}: ruleset must be a JSON object"]
@@ -167,9 +195,8 @@ def check_ruleset(ruleset: object, contexts: set[str]) -> list[str]:
         return errors
     if ruleset.get("target") != "branch":
         errors.append("protect-main: target must be branch")
-    include = ruleset.get("conditions", {}).get("ref_name", {}).get("include")
-    if include != ["~DEFAULT_BRANCH"]:
-        errors.append("protect-main: must target exactly ~DEFAULT_BRANCH")
+    if ref_condition(ruleset) != (["~DEFAULT_BRANCH"], []):
+        errors.append("protect-main: must target exactly ~DEFAULT_BRANCH, excluding nothing")
     rules = rules_by_type(ruleset)
     for kind in ("deletion", "non_fast_forward", "pull_request", "required_status_checks"):
         if kind not in rules:
@@ -205,9 +232,8 @@ def check_tag_ruleset(ruleset: object) -> list[str]:
         return errors
     if ruleset.get("target") != "tag":
         errors.append("release-tags: target must be tag")
-    include = ruleset.get("conditions", {}).get("ref_name", {}).get("include")
-    if include != ["refs/tags/v*"]:
-        errors.append("release-tags: must target exactly refs/tags/v*")
+    if ref_condition(ruleset) != (["refs/tags/v*"], []):
+        errors.append("release-tags: must target exactly refs/tags/v*, excluding nothing")
     rules = rules_by_type(ruleset)
     for kind in ("update", "deletion"):
         if kind not in rules:
@@ -216,11 +242,18 @@ def check_tag_ruleset(ruleset: object) -> list[str]:
 
 
 def check_codeowners(text: str) -> list[str]:
-    for line in text.splitlines():
-        fields = line.split("#", 1)[0].split()
-        if fields and fields[0] == TRUST_ROOT_OWNER_PATH and len(fields) > 1:
-            return []
-    return [f"CODEOWNERS: {TRUST_ROOT_OWNER_PATH} must have an owner"]
+    """The last matching CODEOWNERS rule wins, so the trust-root rule must be
+    the final rule: any later rule could re-own or un-own part of .github/."""
+    rules = [
+        line.split("#", 1)[0].split()
+        for line in text.splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+    if rules and rules[-1][0] == TRUST_ROOT_OWNER_PATH and len(rules[-1]) > 1:
+        return []
+    return [
+        f"CODEOWNERS: {TRUST_ROOT_OWNER_PATH} with an owner must be the last rule"
+    ]
 
 
 def validate(root: Path) -> list[str]:
