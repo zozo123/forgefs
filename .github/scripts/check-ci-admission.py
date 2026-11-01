@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """R1: a missing, skipped, cancelled or failed correctness job denies admission.
 
-This aggregates evidence, not authority. A protected GitHub ruleset must require
-this context, and changes to this script/workflow need base-trusted enforcement.
+This aggregates evidence, not authority. The protect-main ruleset
+(.github/rulesets/protect-main.json) requires this context and every job it
+aggregates by name; CODEOWNERS makes changes here trust-root changes.
+check-admission-contract.py keeps REQUIRED, ci.yml and the ruleset in step.
 """
 
 import json

@@ -43,7 +43,8 @@ The generated PR contains only the version/lockfile transition. Review and merge
 
 ## Publish
 
-After the release-preparation PR is merged, tag the exact merged commit:
+After the release-preparation PR is merged and `main`'s `ci` run for that
+exact commit is green (including `admission`), tag that commit:
 
 ```bash
 git switch main
@@ -60,6 +61,7 @@ The workflow refuses publication unless all of the following are true:
 - `scripts/verify-tag-version.sh` says the tag equals the workspace version;
 - every workspace member inherits the workspace version;
 - the tagged commit is already an ancestor of `origin/main`;
+- every context `protect-main` requires has a latest GitHub Actions check run on the tagged commit that concluded `success` (mainline admission evidence, R1);
 - `cargo fmt`, `check`, `clippy -D warnings`, and all workspace tests pass on Linux and macOS;
 - Rust 1.89 MSRV check/tests pass;
 - `cargo audit` and `cargo deny` pass against the committed lockfile;
@@ -120,26 +122,117 @@ The workflow uses the fixed `macos-15-intel` and `macos-15` labels, so neither m
 
 Configure a GitHub Environment named `release` with required reviewers and restrict deployment to release tags (`v*`). Both attestation and publication use this environment.
 
-Protect `main` with a required pull-request rule and the **`admission`** status
-check from GitHub Actions. Require the branch to be up to date before merging;
-retain deletion and non-fast-forward protection. `admission` always runs after
-`rust`, `msrv`, `macos-durability` (both matrix runners), `e2e-smoke`,
-`power-loss`, and `gates`. It accepts only an exact dependency set whose results
-are all `success`; missing, skipped, cancelled, and failed jobs deny admission.
-The matrix dependency succeeds only when both macOS jobs succeed.
+### Mainline admission (R1, issue #51)
 
-This job is an evidence aggregator, not repository protection by itself. The
-repository administrator must bind the required context to GitHub Actions and
-protect workflow/admission-policy changes with base-trusted policy or an
-explicit audited break-glass path. A PR-controlled check cannot prove its own
-policy was not weakened. Issue #51 stays open until the live ruleset and
-negative merge/direct-push tests prove this boundary.
+**Invariant R1.** No ordinary actor can make a commit the published `main`
+head, or publish a release, unless the executable correctness contract
+succeeded for that exact commit.
 
-Break-glass is exceptional: record the incident, exact commit, failed or
-unavailable gates, actor and reason in an issue before using an administrator
-bypass. Restore enforcement immediately, rerun every gate on the resulting
-commit, and attach the evidence. A bypass never substitutes for the release
-workflow's green evidence or authorizes a release over a failed gate.
+The binding control is the `protect-main` repository ruleset. Its reviewed
+source is [`.github/rulesets/protect-main.json`](../.github/rulesets/protect-main.json);
+the live ruleset must equal it. It keeps deletion and non-fast-forward
+protection, requires a pull request, has no bypass actors, and requires these
+**authoritative checks**, each pinned to the GitHub Actions app
+(`integration_id` 15368) and required to be up to date with `main`:
+
+| Required context | Job in `.github/workflows/ci.yml` |
+|---|---|
+| `rust` | fmt, check, clippy, tests on the release toolchain |
+| `msrv` | check and tests on Rust 1.89 |
+| `macOS durability (macos-15)` | `macos-durability`, Apple silicon `F_FULLFSYNC` path |
+| `macOS durability (macos-15-intel)` | `macos-durability`, Intel `F_FULLFSYNC` path |
+| `e2e-smoke` | 32-agent concurrent smoke benchmark |
+| `power-loss durability (I4)` | `power-loss` page-cache-drop gate |
+| `gates` | CLI ABI conformance and the end-to-end release gate |
+| `admission` | aggregate: exactly the jobs above, all `success` |
+
+Every gate is required by name, not only through `admission`. `admission`
+lives in PR-controlled YAML, so a pull request could rewrite it to depend on
+nothing and pass. The per-job contexts close that hole: a pull request that
+renames, removes or skips a gate leaves a required context unreported, and
+GitHub will not merge it, whatever its replacement reports.
+
+**Trust root.** `.github/` (workflows, admission and release scripts, the
+ruleset files and `CODEOWNERS`) is owned by `@zozo123` in
+[`.github/CODEOWNERS`](../.github/CODEOWNERS), and the ruleset requires
+code-owner review. GitHub reads `CODEOWNERS` from the base branch, so a pull
+request cannot remove its own owner. A trust-root change from anyone else
+(Dependabot action bumps included) needs the owner's approval. GitHub does not
+let an author approve their own pull request, so the owner's own trust-root
+changes go through break-glass (below). That is the explicit, auditable path
+the invariant asks for, and it applies only to `.github/`. Ordinary source
+changes need no review, only green checks.
+
+**Drift lint.** `workflow-security` runs
+`.github/scripts/check-admission-contract.py`. It fails when `ci.yml`, the
+`REQUIRED` set in `check-ci-admission.py`, the ruleset files and `CODEOWNERS`
+disagree: a renamed or conditional gate, an `admission` job with a different
+dependency set, a context the ruleset does not require (or requires but CI
+never reports), a check not pinned to GitHub Actions, a bypass actor, or a
+missing rule. This lint is defense-in-depth only. The live ruleset is the
+control.
+
+**Release tags.** [`.github/rulesets/release-tags.json`](../.github/rulesets/release-tags.json)
+makes `v*` tags immutable: no update, no deletion, no bypass. A failed release
+attempt is fixed by cutting a new version, never by moving a tag. The tag
+workflow's `identity` job runs `.github/scripts/release-require-admission.py`,
+which reads the required contexts from `protect-main.json` and refuses the
+release unless the latest GitHub Actions check run of every one of them on the
+tagged commit concluded `success`. A commit that reached `main` without a CI
+run cannot be released. Tag only a `main` commit whose `ci` run is green. If
+`main`'s head never ran CI, run `gh workflow run ci.yml --ref main`, wait for
+`admission`, then re-run the release. This check comes before release.yml's
+own gates, which still run in full on the tagged commit.
+
+#### Apply and verify the rulesets
+
+Changing the rulesets is an administrator action. CI never does it.
+
+```bash
+# protect-main already exists (id 21234278); replace it with the reviewed file.
+gh api -X PUT repos/zozo123/forgefs/rulesets/21234278 \
+  --input .github/rulesets/protect-main.json
+# The release-tag ruleset is new.
+gh api -X POST repos/zozo123/forgefs/rulesets \
+  --input .github/rulesets/release-tags.json
+
+# Evidence: the rules GitHub enforces on main right now.
+gh api repos/zozo123/forgefs/rules/branches/main \
+  --jq '.[] | [.type, (.parameters.required_status_checks // [] | map(.context) | join(", "))] | @tsv'
+```
+
+Acceptance checks, run once after applying:
+
+1. A pull request with a deliberately failing test cannot merge.
+2. A pull request that renames `gates` (or deletes it from `admission.needs`)
+   cannot merge, even when its renamed job passes.
+3. `git push origin <commit>:main` without a pull request is rejected.
+4. A `v*` tag on a commit lacking green admission fails `release identity`.
+
+#### Break-glass
+
+Break-glass is the only way around R1, and it is never part of normal work.
+
+1. Open an issue that records the reason, the exact commit, which gates failed
+   or were unavailable, and who is acting.
+2. Disable the ruleset for the shortest possible window, and log it in that
+   issue:
+
+   ```bash
+   gh api -X PUT repos/zozo123/forgefs/rulesets/21234278 -f enforcement=disabled
+   # ... the single merge or push the issue describes ...
+   gh api -X PUT repos/zozo123/forgefs/rulesets/21234278 -f enforcement=active
+   ```
+
+   Rule-suite insights and the ruleset history record both changes.
+3. Re-apply `.github/rulesets/protect-main.json` and confirm with the
+   `rules/branches/main` query above.
+4. Run every gate on the resulting `main` commit
+   (`gh workflow run ci.yml --ref main`) and attach the evidence to the issue.
+
+A bypass never replaces the release workflow's green evidence. It never
+authorizes a release over a failed gate, and the release path rejects a commit
+without green admission evidence whatever happened on `main`.
 
 Scheduled and dependency-change security runs execute both RustSec audit and
 `cargo deny` (advisories, bans, licenses, and sources), including changes to

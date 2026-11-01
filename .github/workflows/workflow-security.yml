@@ -1,19 +1,24 @@
 name: workflow-security
 
-# Defense-in-depth candidate lint. This PR-controlled job is not the merge
-# trust root; issue #51 tracks binding policy from a protected ruleset/app.
+# Defense-in-depth lint. This PR-controlled job is not the merge trust root:
+# the protect-main ruleset (.github/rulesets/protect-main.json) and the
+# base-branch CODEOWNERS are. See docs/RELEASING.md and issue #51.
 
 on:
   pull_request:
     paths:
       - '.github/workflows/**'
       - '.github/scripts/**'
+      - '.github/rulesets/**'
+      - '.github/CODEOWNERS'
   push:
     branches:
       - main
     paths:
       - '.github/workflows/**'
       - '.github/scripts/**'
+      - '.github/rulesets/**'
+      - '.github/CODEOWNERS'
   workflow_dispatch:
 
 permissions:
@@ -37,6 +42,10 @@ jobs:
         run: python3 .github/scripts/test-release-tooling.py
       - name: Test CI admission failures
         run: python3 .github/scripts/test-ci-admission.py
+      - name: Test admission contract drift detection
+        run: python3 .github/scripts/test-admission-contract.py
+      - name: Enforce one admission contract across CI, rulesets and CODEOWNERS
+        run: python3 .github/scripts/check-admission-contract.py
       - name: Test fuzz evidence and failure propagation
         run: python3 .github/scripts/test-run-fuzz.py
       - name: Enforce immutable workflow dependencies

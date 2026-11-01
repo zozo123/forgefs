@@ -34,7 +34,7 @@ DOWNLOAD_COMMAND = re.compile(r"\b(?:curl|wget)\b", re.IGNORECASE)
 BLOCK_SCALAR = re.compile(r"^[|>](?:[-+]?[1-9]?|[1-9][-+]?)$")
 ALLOWED_REMOTE_ACTIONS = frozenset(
     {
-        "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+        "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
         "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
@@ -97,6 +97,9 @@ ALLOWED_RUN_COMMANDS = frozenset(
         "git diff --exit-code -- Cargo.lock",
         "python3 .github/scripts/check-workflow-security.py",
         "python3 .github/scripts/check-ci-admission.py",
+        "python3 .github/scripts/check-admission-contract.py",
+        "python3 .github/scripts/release-require-admission.py",
+        "python3 .github/scripts/test-admission-contract.py",
         "python3 .github/scripts/run-fuzz.py",
         "python3 .github/scripts/test-run-fuzz.py",
         "python3 .github/scripts/test-ci-admission.py",
