@@ -1804,7 +1804,7 @@ fn audit_table_shape(
 /// A failure to install is propagated rather than ignored. A catalog whose
 /// counter is wired up is the only kind this code knows how to describe, and
 /// silently opening one that reports `0` forever is the exact failure #311 was.
-fn install_write_txn_counter(conn: &Connection, stats: &MetaCounters) -> Result<()> {
+fn install_write_txn_counter(conn: &mut Connection, stats: &MetaCounters) -> Result<()> {
     let counter = Arc::clone(&stats.committed_write_txns);
     conn.commit_hook(Some(move || {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -2915,7 +2915,7 @@ impl Meta {
         )
         .map_err(map_sql)?;
         let stats = Arc::new(MetaCounters::default());
-        install_write_txn_counter(&conn, &stats)?;
+        install_write_txn_counter(&mut conn, &stats)?;
         Ok(Self {
             write: TimedMutex::new(conn),
             // Safe to build now and not before: the writable open has created
