@@ -1,0 +1,6 @@
+# Trust root (#51). GitHub reads this file from the base branch, so a pull
+# request cannot remove its own owner. With the protect-main ruleset's
+# require_code_owner_review, a change to workflows, admission policy, rulesets
+# or this file needs the owner's approval or the documented break-glass path
+# in docs/RELEASING.md.
+/.github/ @zozo123
