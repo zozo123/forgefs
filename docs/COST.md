@@ -102,3 +102,16 @@ Caches are hints. The Store tree/blob LRU may avoid repeated decode/I/O on ordin
 For a serial workload, compare wall time against storage durability time, SQLite transaction time, and local lock wait to identify the dominant class. For a concurrent workload, those counters overlap across workers: use them to locate amplification/convoys, not to manufacture an additive critical path. If accounted components differ materially from wall time, profile the unexplained remainder before redesigning the system.
 
 This is the gate behind #37, #49, #140 and #177: measure first; change the smallest mechanism that moves the dominant cost; keep the immutable object format and correctness invariants stable unless the evidence requires otherwise.
+
+## Decision on the single write lane (#37)
+
+ForgeFS keeps one process-local SQLite write connection. That is intentional, not a leftover.
+
+What the measurements on #37 showed, once barrier reach and core count were controlled:
+
+1. Extra workers first recover **barrier wait**, not write-mutex wait. On barriered storage, throughput rose about 3.5x from `W=1` to `W=8` while barrier counts stayed flat and device flushes got cheaper under concurrency. On tmpfs (barriers free) the same sweep inverted: more workers got slower.
+2. After that recovery, throughput plateaus against the **serialized catalog section**: every checkin takes the write mutex several times, and `synchronous=FULL` WAL fsyncs run inside that section. That ceiling is real, and it is why group-commit (#338 / #49) was the right next change: one WAL flush for N waiting writers, with `synchronous=FULL` untouched.
+3. Process-lifetime `lock_wait_us` is a queueing meter. It can grow by orders of magnitude while wall time stays flat or improves. Do not treat it as proof that the write connection is the bottleneck.
+4. A read pool (#308 / #315) already keeps SELECT traffic off the write connection. The issue's own gate named that split as the second candidate and reserved further writer redesign for evidence after it.
+
+**Decision:** do not replace or shard the single write connection for v1. Keep the explicit writer lane, the read pool, and group-commit. Reopen a writer-lane redesign only with a barriered-device run where cores ≥ agents, `W=1` vs `W=N` wall time still shows the write connection serialising available parallelism after those landings, and the write/read lock split (not the summed `lock_wait_us`) is what attributes the cost.
