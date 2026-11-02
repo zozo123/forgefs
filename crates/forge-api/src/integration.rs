@@ -6,10 +6,24 @@ use forge_cap::{Cap, Op};
 use forge_core::{
     hash_bytes, now_ms, Blob, Commit, Conflict, Contribution, ProvenanceManifest, Snapshot,
 };
-use forge_merge::{merge_bases, three_way, MergeOutcome};
+use forge_merge::{
+    auto_merge_tree, changed_paths, merge_bases, path_in_conflict_scope, three_way, MergeOutcome,
+};
+use forge_store::PublishedResolution;
 use forge_types::{CasResult, Error, ObjectId, ObjectType, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
+
+/// How a conflict is resolved without a FORMAT VERSION bump (#15 PR1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveChoice {
+    /// Take the conflict's `ours` tree (the `--into` side at conflict time).
+    Ours,
+    /// Take the conflict's `theirs` tree (the `--from` side at conflict time).
+    Theirs,
+    /// Supply a tree that may differ from the auto-merge only on conflict paths.
+    Tree(ObjectId),
+}
 
 impl Forge {
     pub fn merge(
@@ -116,6 +130,146 @@ impl Forge {
         )?;
         self.stats.merge_applied.fetch_add(1, Ordering::Relaxed);
         Ok(result)
+    }
+
+    /// Resolve a published `Conflict` into `--into` without a FORMAT bump.
+    ///
+    /// The durable binding is the catalog ref `resolutions/<conflict-ulid>`
+    /// naming the resolution commit. That is local auditability, not sealed
+    /// provenance (`docs/CONFLICTS.md`). `merge --resolved` stays refused.
+    pub fn resolve(
+        &self,
+        cap: &Cap,
+        conflict_oid: ObjectId,
+        into: &str,
+        choice: ResolveChoice,
+    ) -> Result<PublishedResolution> {
+        let into_row = self
+            .store
+            .meta
+            .get_ref(into)?
+            .ok_or_else(|| Error::NotFound(format!("ref {into}")))?;
+        if into_row.protected {
+            self.check(cap, Op::Merge, Some(into))?;
+        } else {
+            self.check(cap, Op::Write, Some(into))?;
+        }
+
+        let conflict = self.store.get_conflict(conflict_oid)?;
+
+        let conflict_prefix = format!("conflicts/{into}/");
+        let conflict_ref = self
+            .store
+            .meta
+            .list_refs()?
+            .into_iter()
+            .find(|row| {
+                row.kind == "conflict"
+                    && row.oid == conflict_oid
+                    && row.name.starts_with(&conflict_prefix)
+            })
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "conflict {conflict_oid} is not published under {conflict_prefix}"
+                ))
+            })?;
+        // Conflict belongs to this into prefix. A tip that left the causal set
+        // is a moved head (exit 4), not a foreign conflict (exit 1).
+        if !conflict.causal.contains(&into_row.oid) {
+            let expected = conflict.causal.first().copied().unwrap_or(ObjectId::ZERO);
+            return Err(Error::StaleObservation {
+                path: into.to_string(),
+                expected: expected.hex(),
+                found: into_row.oid.hex(),
+            });
+        }
+        let ulid = conflict_ref
+            .name
+            .rsplit('/')
+            .next()
+            .filter(|leaf| ulid::Ulid::from_string(leaf).is_ok())
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "conflict ref {} has no ULID leaf",
+                    conflict_ref.name
+                ))
+            })?;
+        let resolution_ref = format!("resolutions/{ulid}");
+
+        let tree = match choice {
+            ResolveChoice::Ours => conflict.ours,
+            ResolveChoice::Theirs => conflict.theirs,
+            ResolveChoice::Tree(oid) => {
+                if self.store.object_type(oid)? != ObjectType::Tree {
+                    return Err(Error::Invalid(format!(
+                        "resolve --tree {oid} is not a tree"
+                    )));
+                }
+                if conflict.paths.is_empty() {
+                    // Multi-base conflicts carry no path scope. Only the two
+                    // recorded side trees are admissible without a format bump.
+                    if oid != conflict.ours && oid != conflict.theirs {
+                        return Err(Error::Invalid(
+                            "multi-base conflict resolution accepts only --ours or --theirs".into(),
+                        ));
+                    }
+                    oid
+                } else {
+                    let base = match conflict.bases.as_slice() {
+                        [] => None,
+                        [one] => Some(*one),
+                        _ => {
+                            return Err(Error::Invalid(
+                                "conflict with multiple bases cannot take a scoped --tree".into(),
+                            ));
+                        }
+                    };
+                    let (auto, _) =
+                        auto_merge_tree(&self.store, base, conflict.ours, conflict.theirs)?;
+                    let changed = changed_paths(&self.store, auto, oid)?;
+                    if let Some(path) = changed
+                        .iter()
+                        .find(|path| !path_in_conflict_scope(path, &conflict.paths))
+                    {
+                        return Err(Error::Invalid(format!(
+                            "resolve --tree escapes conflict scope at {path}"
+                        )));
+                    }
+                    oid
+                }
+            }
+        };
+
+        if conflict.causal.len() != 2 {
+            return Err(Error::Corrupt(format!(
+                "conflict {conflict_oid} causal must name exactly two commits"
+            )));
+        }
+        let commit = Commit {
+            tree,
+            parents: conflict.causal.clone(),
+            agent: cap.agent_id().into(),
+            msg: format!("resolve {conflict_oid}"),
+            ts: now_ms(),
+            landmark: false,
+            contrib: None,
+        };
+        let cid = self.store.put_commit(&commit)?;
+        let into_commit = self.store.get_commit(into_row.oid)?;
+        let intro_oids = self.store.collect_intros(Some(into_commit.tree), tree)?;
+        let published = self.store.meta.publish_resolution(
+            into,
+            into_row.oid,
+            cid,
+            &conflict_ref.name,
+            conflict_oid,
+            &resolution_ref,
+            cap.agent_id(),
+            into_row.protected,
+            &intro_oids,
+        )?;
+        self.stats.merge_applied.fetch_add(1, Ordering::Relaxed);
+        Ok(published)
     }
 
     pub fn seal(&self, cap: &Cap, r#ref: &str, tag: &str) -> Result<ObjectId> {

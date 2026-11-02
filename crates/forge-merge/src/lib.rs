@@ -3,7 +3,7 @@
 use forge_core::{Conflict, ConflictPath, Tree, TreeEntry};
 use forge_store::Store;
 use forge_types::{EntryKind, Error, ObjectId, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const MAX_ANCESTRY_COMMITS: usize = 1_000_000;
 
@@ -296,14 +296,7 @@ pub fn three_way(
     ours: ObjectId,
     theirs: ObjectId,
 ) -> Result<MergeOutcome> {
-    let mut paths = match base {
-        Some(base) if ours != theirs && ours != base && theirs != base => {
-            exact_rename_conflicts(store, base, ours, theirs)?
-        }
-        _ => Vec::new(),
-    };
-    let tree = merge_trees(store, "", base, ours, theirs, &mut paths)?;
-    paths.sort_by(|left, right| left.path.cmp(&right.path));
+    let (tree, paths) = auto_merge_tree(store, base, ours, theirs)?;
     if paths.is_empty() {
         Ok(MergeOutcome::Tree(tree))
     } else {
@@ -315,6 +308,77 @@ pub fn three_way(
             causal: vec![],
         }))
     }
+}
+
+/// Build the partial merge tree and the conflict paths it left unresolved.
+///
+/// On a clean merge `paths` is empty and `tree` is the result. On a conflict
+/// `tree` still holds the auto-merged entries (ours on every unresolved leaf),
+/// which is the baseline a scoped `--tree` resolution must stay within.
+pub fn auto_merge_tree(
+    store: &Store,
+    base: Option<ObjectId>,
+    ours: ObjectId,
+    theirs: ObjectId,
+) -> Result<(ObjectId, Vec<ConflictPath>)> {
+    let mut paths = match base {
+        Some(base) if ours != theirs && ours != base && theirs != base => {
+            exact_rename_conflicts(store, base, ours, theirs)?
+        }
+        _ => Vec::new(),
+    };
+    let tree = merge_trees(store, "", base, ours, theirs, &mut paths)?;
+    paths.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((tree, paths))
+}
+
+/// Every path whose entry identity `(id, kind, exec)` differs between `left`
+/// and `right`. Used by conflict resolution to prove a `--tree` only touches
+/// paths the conflict named.
+pub fn changed_paths(store: &Store, left: ObjectId, right: ObjectId) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![(String::new(), left, right)];
+    while let Some((prefix, left_id, right_id)) = stack.pop() {
+        if left_id == right_id {
+            continue;
+        }
+        let left_tree = store.get_tree(left_id)?;
+        let right_tree = store.get_tree(right_id)?;
+        let left_map = left_tree.as_map();
+        let right_map = right_tree.as_map();
+        let mut names: Vec<_> = left_map
+            .keys()
+            .chain(right_map.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        names.sort();
+        for name in names {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match (left_map.get(&name), right_map.get(&name)) {
+                (Some(a), Some(b)) if same_entry(a, b) => {}
+                (Some(a), Some(b)) if a.kind == EntryKind::Tree && b.kind == EntryKind::Tree => {
+                    stack.push((path, a.id, b.id));
+                }
+                _ => {
+                    out.insert(path);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// True when `path` is one of the conflict paths, or a descendant of one.
+pub fn path_in_conflict_scope(path: &str, conflict_paths: &[ConflictPath]) -> bool {
+    conflict_paths
+        .iter()
+        .any(|c| path == c.path || path.starts_with(&format!("{}/", c.path)))
 }
 
 /// Full tree-entry identity for three-way resolution: two entries are the
@@ -530,6 +594,59 @@ mod tests {
             }
             MergeOutcome::Conflict(c) => panic!("unexpected {c:?}"),
         }
+    }
+
+    #[test]
+    fn changed_paths_reports_replacements_and_ignores_equal_trees() {
+        let (_d, s) = setup();
+        let a = s.put_blob_data(b"a").unwrap();
+        let b = s.put_blob_data(b"b").unwrap();
+        let left = s
+            .put_tree(
+                &Tree::new(vec![TreeEntry {
+                    name: "same.txt".into(),
+                    kind: EntryKind::Blob,
+                    id: a,
+                    exec: false,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let right = s
+            .put_tree(
+                &Tree::new(vec![TreeEntry {
+                    name: "same.txt".into(),
+                    kind: EntryKind::Blob,
+                    id: b,
+                    exec: false,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let changed = changed_paths(&s, left, right).unwrap();
+        assert_eq!(
+            changed.into_iter().collect::<Vec<_>>(),
+            vec!["same.txt".to_string()]
+        );
+        assert!(changed_paths(&s, left, left).unwrap().is_empty());
+        assert!(path_in_conflict_scope(
+            "same.txt",
+            &[ConflictPath {
+                path: "same.txt".into(),
+                a: Some(a),
+                b: Some(b),
+                base: None,
+            }]
+        ));
+        assert!(!path_in_conflict_scope(
+            "other.txt",
+            &[ConflictPath {
+                path: "same.txt".into(),
+                a: Some(a),
+                b: Some(b),
+                base: None,
+            }]
+        ));
     }
 
     #[test]

@@ -48,6 +48,17 @@ pub struct RetiredRef {
     pub ts_ms: i64,
 }
 
+/// What `publish_resolution` wrote in one transaction: the advanced `--into`
+/// tip, the local `resolutions/<ulid>` binding, and the retired conflict ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedResolution {
+    pub into: String,
+    pub commit: ObjectId,
+    pub resolution_ref: String,
+    pub retired_conflict: String,
+    pub retired_conflict_oid: ObjectId,
+}
+
 /// What `abandon_session` removed from the root set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbandonedSession {
@@ -1610,6 +1621,10 @@ pub fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
         Some("commit")
     } else if name.starts_with("conflicts/") {
         Some("conflict")
+    } else if name.starts_with("resolutions/") {
+        // Local conflict-resolution binding (#15 PR1). A ref, not sealed
+        // provenance: see docs/CONFLICTS.md. Kind is the resolution commit.
+        Some("commit")
     } else if name.starts_with("tags/") || name.starts_with("inbox/") {
         Some("snapshot")
     } else {
@@ -4497,6 +4512,247 @@ impl Meta {
             kind,
             agent_id: agent_id.to_string(),
             ts_ms: ts,
+        })
+    }
+
+    /// Advance `--into` to a resolution commit, publish `resolutions/<ulid>`,
+    /// and retire the matching `conflicts/...` ref in one immediate transaction.
+    ///
+    /// Lost expected tip is `StaleObservation` (exit 4), never a fork: a
+    /// resolution that races the head must be retried against the new conflict,
+    /// not parked as a competing tip (#15).
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_resolution(
+        &self,
+        into: &str,
+        expected: ObjectId,
+        commit: ObjectId,
+        conflict_ref: &str,
+        conflict_oid: ObjectId,
+        resolution_ref: &str,
+        agent_id: &str,
+        allow_protected: bool,
+        intro_oids: &[ObjectId],
+    ) -> Result<PublishedResolution> {
+        validate_ref_kind(into, "commit")?;
+        validate_ref_kind(resolution_ref, "commit")?;
+        validate_ref_kind(conflict_ref, "conflict")?;
+        if !conflict_ref.starts_with("conflicts/") {
+            return Err(Error::Invalid(format!(
+                "only conflict refs may be retired by resolve, not {conflict_ref}"
+            )));
+        }
+        if !resolution_ref.starts_with("resolutions/") {
+            return Err(Error::Invalid(format!(
+                "resolution binding must live under resolutions/, not {resolution_ref}"
+            )));
+        }
+        if into.starts_with("tags/") || resolution_ref.starts_with("tags/") {
+            return Err(Error::Denied(
+                "sealed tags cannot be updated through resolve".into(),
+            ));
+        }
+
+        let mut conn = self.write.lock();
+        let txn_timer = self.txn_timer();
+        let tx = self.begin_tx(&mut conn)?;
+        let ts = now_ms() as i64;
+
+        let into_row = tx
+            .query_row(
+                "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
+                [into],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| self.map_sql_counted(error))?;
+        let Some((into_oid_b, into_kind, into_prot, into_sealed)) = into_row else {
+            return Err(Error::NotFound(format!("ref {into}")));
+        };
+        if into_kind != "commit" {
+            return Err(Error::Invalid(format!(
+                "ref {into} kind is immutable: {into_kind} != commit"
+            )));
+        }
+        if into_sealed != 0 {
+            return Err(Error::Sealed(into.to_string()));
+        }
+        if into_prot != 0 && !allow_protected {
+            self.stats.cas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Denied(format!(
+                "ref {into} is protected; only merge/seal/resolve may advance it"
+            )));
+        }
+        let found = oid_from_blob(into_oid_b)?;
+        if found != expected {
+            return Err(Error::StaleObservation {
+                path: into.to_string(),
+                expected: expected.hex(),
+                found: found.hex(),
+            });
+        }
+
+        let conflict_row = tx
+            .query_row(
+                "SELECT oid, kind, protected, sealed FROM refs WHERE name=?1",
+                [conflict_ref],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| self.map_sql_counted(error))?;
+        let Some((conflict_oid_b, conflict_kind, conflict_prot, conflict_sealed)) = conflict_row
+        else {
+            if ref_retired(&tx, conflict_ref)? {
+                return Err(Error::Invalid(format!(
+                    "conflict ref {conflict_ref} is already retired"
+                )));
+            }
+            return Err(Error::NotFound(format!("ref {conflict_ref}")));
+        };
+        if conflict_kind != "conflict" {
+            return Err(Error::Invalid(format!(
+                "ref {conflict_ref} is {conflict_kind}, not conflict"
+            )));
+        }
+        if conflict_sealed != 0 {
+            return Err(Error::Sealed(conflict_ref.to_string()));
+        }
+        if conflict_prot != 0 {
+            return Err(Error::Denied(format!("ref {conflict_ref} is protected")));
+        }
+        let found_conflict = oid_from_blob(conflict_oid_b)?;
+        if found_conflict != conflict_oid {
+            return Err(Error::Invalid(format!(
+                "conflict ref {conflict_ref} no longer names {conflict_oid}"
+            )));
+        }
+        let conflict_live: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM namespaces WHERE live_ref=?1",
+                [conflict_ref],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if conflict_live != 0 {
+            return Err(Error::Invalid(format!(
+                "ref {conflict_ref} is the live head of an open session"
+            )));
+        }
+        let conflict_mounted: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM mounts WHERE spec=?1 OR spec=?2",
+                params![conflict_ref, format!("ref:{conflict_ref}")],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if conflict_mounted != 0 {
+            return Err(Error::Invalid(format!(
+                "ref {conflict_ref} is still mounted by an open session"
+            )));
+        }
+
+        if ref_exists(&tx, resolution_ref)? {
+            return Err(Error::Invalid(format!(
+                "ref {resolution_ref} already exists"
+            )));
+        }
+        deny_retired(&tx, resolution_ref)?;
+
+        let n = tx
+            .execute(
+                "UPDATE refs SET oid=?1, kind='commit', updated_ms=?2 WHERE name=?3 AND oid=?4 AND sealed=0",
+                params![
+                    commit.as_bytes().as_slice(),
+                    ts,
+                    into,
+                    expected.as_bytes().as_slice()
+                ],
+            )
+            .map_err(|error| self.map_sql_counted(error))?;
+        if n != 1 {
+            let found = tx
+                .query_row("SELECT oid FROM refs WHERE name=?1", [into], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .optional()
+                .map_err(|error| self.map_sql_counted(error))?
+                .map(oid_from_blob)
+                .transpose()?;
+            let found = found.ok_or_else(|| Error::NotFound(format!("ref {into}")))?;
+            return Err(Error::StaleObservation {
+                path: into.to_string(),
+                expected: expected.hex(),
+                found: found.hex(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,'resolve',?5)",
+            params![
+                into,
+                expected.as_bytes().as_slice(),
+                commit.as_bytes().as_slice(),
+                agent_id,
+                ts
+            ],
+        )
+        .map_err(|error| self.map_sql_counted(error))?;
+
+        tx.execute(
+            "INSERT INTO refs (name, oid, kind, protected, sealed, updated_ms) VALUES (?1,?2,'commit',0,0,?3)",
+            params![resolution_ref, commit.as_bytes().as_slice(), ts],
+        )
+        .map_err(|error| self.map_sql_counted(error))?;
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,NULL,?2,?3,'resolve',?4)",
+            params![resolution_ref, commit.as_bytes().as_slice(), agent_id, ts],
+        )
+        .map_err(|error| self.map_sql_counted(error))?;
+
+        tx.execute(
+            "INSERT INTO reflog (name, old_oid, new_oid, agent_id, reason, ts_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                conflict_ref,
+                conflict_oid.as_bytes().as_slice(),
+                conflict_oid.as_bytes().as_slice(),
+                agent_id,
+                REFLOG_ABANDON,
+                ts
+            ],
+        )
+        .map_err(|error| self.map_sql_counted(error))?;
+        let removed = tx
+            .execute("DELETE FROM refs WHERE name=?1", [conflict_ref])
+            .map_err(|error| self.map_sql_counted(error))?;
+        if removed != 1 {
+            return Err(Error::Internal(format!(
+                "resolve removed {removed} rows for conflict ref {conflict_ref}"
+            )));
+        }
+
+        Self::insert_intros_tx(&tx, intro_oids, commit, agent_id, ts)?;
+        self.commit_ref_tx(tx)?;
+        txn_timer.finish();
+        self.stats.cas_updated.fetch_add(1, Ordering::Relaxed);
+        Ok(PublishedResolution {
+            into: into.to_string(),
+            commit,
+            resolution_ref: resolution_ref.to_string(),
+            retired_conflict: conflict_ref.to_string(),
+            retired_conflict_oid: conflict_oid,
         })
     }
 
