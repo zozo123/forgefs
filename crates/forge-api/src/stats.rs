@@ -69,6 +69,8 @@ pub struct StoreCounterReport {
     /// Durable object bytes that did not rehash to the id naming them. Every
     /// one is a refused read (I1, I3, I15).
     pub hash_failures: u64,
+    pub hash_us: u64,
+    pub encode_us: u64,
 }
 
 /// Hit and miss counts for the two hot in-process caches.
@@ -182,6 +184,8 @@ impl StoreCounterReport {
             dedup_bytes: store.dedup_bytes,
             get_bytes: store.get_bytes,
             hash_failures: store.hash_failures,
+            hash_us: store.hash_us,
+            encode_us: store.encode_us,
         }
     }
 }
@@ -375,6 +379,8 @@ mod tests {
                 dedup_bytes: 32,
                 get_bytes: 128,
                 hash_failures: 0,
+                hash_us: 0,
+                encode_us: 0,
             },
             StoreCacheStats {
                 object_cache_hits: 6,

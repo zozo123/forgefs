@@ -31,6 +31,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Stable names for durability transitions exercised by the debug-only fault
 /// injector. The enum is present in release builds so the real barrier calls
@@ -272,6 +273,7 @@ pub struct Store<O: ObjectStore = LocalBlobStore> {
     trees: Mutex<LruCache<ObjectId, Arc<Tree>>>,
     blob_cache: Mutex<ObjectCache>,
     cache: CacheCounters,
+    encode_us: AtomicU64,
 }
 
 /// Hit and miss counts for the two hot LRU caches a `Store` keeps.
@@ -304,11 +306,16 @@ pub struct StorePublishBatch<'a, O: ObjectStore = LocalBlobStore> {
 
 impl<O: ObjectStore> StorePublishBatch<'_, O> {
     pub fn put_commit(&self, commit: &Commit) -> Result<ObjectId> {
-        self.objects.lock().put(&commit.encode())
+        let t0 = Instant::now();
+        let bytes = commit.encode();
+        self.store.record_encode_us(t0.elapsed());
+        self.objects.lock().put(&bytes)
     }
 
     pub fn put_contribution(&self, contribution: &Contribution) -> Result<ObjectId> {
+        let t0 = Instant::now();
         let bytes = contribution.encode()?;
+        self.store.record_encode_us(t0.elapsed());
         self.objects.lock().put(&bytes)
     }
 
@@ -323,7 +330,9 @@ impl<O: ObjectStore> TreeStore for StorePublishBatch<'_, O> {
     }
 
     fn put_tree(&self, tree: &Tree) -> Result<ObjectId> {
+        let t0 = Instant::now();
         let bytes = tree.encode()?;
+        self.store.record_encode_us(t0.elapsed());
         let id = self.objects.lock().put(&bytes)?;
         self.store.trees.lock().put(id, Arc::new(tree.clone()));
         Ok(id)
@@ -344,6 +353,7 @@ impl<O: ObjectStore> Store<O> {
             trees: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
             blob_cache: Mutex::new(ObjectCache::new()),
             cache: CacheCounters::default(),
+            encode_us: AtomicU64::new(0),
         }
     }
 
@@ -363,6 +373,15 @@ impl<O: ObjectStore> Store<O> {
             store: self,
             objects: Mutex::new(self.blobs.begin_batch()),
         }
+    }
+
+    pub(crate) fn record_encode_us(&self, elapsed: std::time::Duration) {
+        let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        let _ = self
+            .encode_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(us))
+            });
     }
 }
 
