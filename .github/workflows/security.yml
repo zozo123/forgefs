@@ -2,21 +2,9 @@ name: security
 
 on:
   pull_request:
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - deny.toml
-      - 'crates/**/Cargo.toml'
-      - '.github/workflows/security.yml'
   push:
     branches:
       - main
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - deny.toml
-      - 'crates/**/Cargo.toml'
-      - '.github/workflows/security.yml'
   schedule:
     - cron: '23 4 * * 1'
   workflow_dispatch:
@@ -48,3 +36,7 @@ jobs:
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Enforce dependency policy
         run: cargo deny --locked check advisories bans licenses sources
+      - name: Refuse an unlocked Cargo.lock rewrite
+        run: git diff --exit-code -- Cargo.lock
+      - name: Resolve the committed lockfile graph
+        run: cargo metadata --locked --format-version 1 >/dev/null
