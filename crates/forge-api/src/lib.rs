@@ -13,6 +13,7 @@ mod serve;
 mod soak;
 mod stats;
 mod test_hooks;
+mod tree_bench;
 mod workspace;
 
 pub use bench::{
@@ -37,6 +38,9 @@ pub use soak::{
 pub use stats::{
     ApiCounterReport, CacheCounterReport, DurabilityReport, MetaCounterReport, StatsReport,
     StoreCounterReport, STATS_SCHEMA_VERSION, STATS_SCOPE,
+};
+pub use tree_bench::{
+    run_tree_bench, w6_path, w6_seed_payload, w6_update_payload, TreeBenchReport,
 };
 // `counter_report` is gone: sections construct themselves through
 // `StoreCounterReport::of` and friends, so `forge bench` can render the

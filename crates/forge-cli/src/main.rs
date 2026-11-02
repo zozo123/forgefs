@@ -259,6 +259,11 @@ enum Cmd {
         /// Maximum OS workers driving logical agents.
         #[arg(long, default_value_t = 64)]
         workers: usize,
+        /// W6 large-tree walk/update entry count. When non-zero, runs only the
+        /// W6 harness (not W1/W2/W8). Use 10000 for published scaling; CI uses
+        /// smaller values (for example 1000).
+        #[arg(long, default_value_t = 0)]
+        tree_entries: usize,
     },
 }
 
@@ -381,6 +386,7 @@ fn run(cli: Cli) -> forge_types::Result<()> {
             readers,
             reads,
             workers,
+            tree_entries,
         } => {
             if cli.dir.is_some() {
                 return Err(Error::Invalid(
@@ -409,12 +415,18 @@ fn run(cli: Cli) -> forge_types::Result<()> {
                 }
             };
             eprintln!(
-                "forge bench dir={} agents={agents} shared={shared} readers={readers} reads={reads} workers={workers}",
+                "forge bench dir={} agents={agents} shared={shared} readers={readers} reads={reads} workers={workers} tree_entries={tree_entries}",
                 dir.display()
             );
-            let report =
-                forge_api::run_bench_with_workers(&dir, agents, shared, readers, reads, workers)?;
-            print!("{}", report.render());
+            if tree_entries > 0 {
+                let report = forge_api::run_tree_bench(&dir, tree_entries)?;
+                print!("{}", report.render());
+            } else {
+                let report = forge_api::run_bench_with_workers(
+                    &dir, agents, shared, readers, reads, workers,
+                )?;
+                print!("{}", report.render());
+            }
             Ok(())
         }
         Cmd::Init { path } => {
