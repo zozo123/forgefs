@@ -60,9 +60,81 @@ impl Percentiles {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckinMix {
+    pub hash_us: u64,
+    pub encode_us: u64,
+    pub fsync_file_us: u64,
+    pub fsync_dir_us: u64,
+    pub sqlite_wait_us: u64,
+    pub sqlite_txn_us: u64,
+}
+
+impl CheckinMix {
+    pub fn from_deltas(store: BlobStoreStats, meta: MetaStats) -> Self {
+        Self {
+            hash_us: store.hash_us,
+            encode_us: store.encode_us,
+            fsync_file_us: store.fsync_file_us,
+            fsync_dir_us: store.fsync_dir_us.saturating_add(store.barrier_fs_us),
+            sqlite_wait_us: meta.lock_wait_us,
+            sqlite_txn_us: meta.txn_us,
+        }
+    }
+
+    pub fn accounted_us(&self) -> u64 {
+        self.hash_us
+            .saturating_add(self.encode_us)
+            .saturating_add(self.fsync_file_us)
+            .saturating_add(self.fsync_dir_us)
+            .saturating_add(self.sqlite_wait_us)
+            .saturating_add(self.sqlite_txn_us)
+    }
+
+    pub fn median(samples: &[Self]) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+        let mut hash = samples.iter().map(|s| s.hash_us).collect::<Vec<_>>();
+        let mut encode = samples.iter().map(|s| s.encode_us).collect::<Vec<_>>();
+        let mut fsync_file = samples.iter().map(|s| s.fsync_file_us).collect::<Vec<_>>();
+        let mut fsync_dir = samples.iter().map(|s| s.fsync_dir_us).collect::<Vec<_>>();
+        let mut sqlite_wait = samples.iter().map(|s| s.sqlite_wait_us).collect::<Vec<_>>();
+        let mut sqlite_txn = samples.iter().map(|s| s.sqlite_txn_us).collect::<Vec<_>>();
+        let med = |v: &mut [u64]| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        Self {
+            hash_us: med(&mut hash),
+            encode_us: med(&mut encode),
+            fsync_file_us: med(&mut fsync_file),
+            fsync_dir_us: med(&mut fsync_dir),
+            sqlite_wait_us: med(&mut sqlite_wait),
+            sqlite_txn_us: med(&mut sqlite_txn),
+        }
+    }
+
+    pub fn render_line(&self, p50_wall_us: u128) -> String {
+        format!(
+            "per-checkin mix = serial p50 hash_us={} encode_us={} fsync_file_us={} fsync_dir_us={} sqlite_wait_us={} sqlite_txn_us={} accounted_us={} ~= p50_wall_us={}\n",
+            self.hash_us,
+            self.encode_us,
+            self.fsync_file_us,
+            self.fsync_dir_us,
+            self.sqlite_wait_us,
+            self.sqlite_txn_us,
+            self.accounted_us(),
+            p50_wall_us,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BenchReport {
     pub serial: Option<Percentiles>,
+    /// Median operation-scoped mix from the serial checkin loop only.
+    pub serial_mix: Option<CheckinMix>,
     pub private: Option<(Percentiles, Duration, usize)>,
     pub shared: Option<(Percentiles, Duration, usize, usize)>,
     /// Per-READ latencies, wall time, and how many logical readers produced
@@ -93,9 +165,15 @@ impl BenchReport {
              counter scope = cumulative whole-run process lifetime, never per-checkin.\n\
              lock split = write connection mutex vs read-pool slot mutexes; lock_acquires/lock_wait_us are their SUM and attribute nothing.\n\
              counter start = storage at blob-store construction; sqlite/api post-open.\n\
-             counter end   = after init + all workloads + merge/seal + verify (+ worker fsck).\n\
-             per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals.\n",
+             counter end   = after init + all workloads + merge/seal + verify (+ worker fsck).\n",
         );
+        if let (Some(p), Some(mix)) = (&self.serial, &self.serial_mix) {
+            s.push_str(&mix.render_line(p.p50_us));
+        } else {
+            s.push_str(
+                "per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals.\n",
+            );
+        }
         if let Some(p) = &self.serial {
             s.push_str(&format!(
                 "serial checkin   n={}  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms\n",
@@ -261,9 +339,12 @@ fn one_private(forge: &Forge, root: &Cap, i: usize) -> Result<CasResult> {
 }
 
 /// Sequential baseline: true single-agent checkin latency (grant+session+write+CAS).
-pub fn serial_checkins(forge: &Forge, root: &Cap, n: usize) -> Result<Percentiles> {
+pub fn serial_checkins(forge: &Forge, root: &Cap, n: usize) -> Result<(Percentiles, CheckinMix)> {
     let mut samples = Vec::with_capacity(n);
+    let mut mixes = Vec::with_capacity(n);
     for i in 0..n {
+        let store_before = forge.store.stats();
+        let meta_before = forge.store.meta.stats();
         let t0 = Instant::now();
         let r = one_private(forge, root, i)?;
         if !matches!(r, CasResult::Updated { .. }) {
@@ -272,8 +353,12 @@ pub fn serial_checkins(forge: &Forge, root: &Cap, n: usize) -> Result<Percentile
             )));
         }
         samples.push(us(t0.elapsed()));
+        let store_delta = forge.store.stats().saturating_sub(store_before);
+        let meta_delta = forge.store.meta.stats().saturating_sub(meta_before);
+        mixes.push(CheckinMix::from_deltas(store_delta, meta_delta));
     }
-    Ok(Percentiles::from_us(samples))
+    let latency = Percentiles::from_us(samples);
+    Ok((latency, CheckinMix::median(&mixes)))
 }
 
 /// N agents, private live refs, unique files. All checkins should `Updated`.
@@ -404,7 +489,7 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
     let forge = Arc::new(Forge::init(dir)?);
     let root = forge.root_cap()?;
     let integ = forge.integrator_cap()?;
-    let serial = serial_checkins(&forge, &root, 8.min(agents))?;
+    let (serial, serial_mix) = serial_checkins(&forge, &root, 8.min(agents))?;
     let private = private_checkins(forge.clone(), &root, agents)?;
     let shared_r = shared_stampede(forge.clone(), &root, shared)?;
     let merge_seal = merge_all_and_seal(&forge, &root, &integ, "bench")?;
@@ -414,6 +499,7 @@ pub fn run(dir: &std::path::Path, agents: usize, shared: usize) -> Result<BenchR
     let store = forge.store.stats();
     Ok(BenchReport {
         serial: Some(serial),
+        serial_mix: Some(serial_mix),
         private: Some(private),
         shared: Some(shared_r),
         // The in-process API entry point stays write-only: the read-heavy
@@ -458,6 +544,8 @@ mod tests {
             dedup_bytes: 32,
             get_bytes: 128,
             hash_failures: 0,
+            hash_us: 0,
+            encode_us: 0,
         };
         let cache = StoreCacheStats {
             object_cache_hits: 6,
@@ -503,6 +591,7 @@ mod tests {
         };
         let report = BenchReport {
             serial: None,
+            serial_mix: None,
             private: None,
             shared: None,
             read_fanout: None,
@@ -529,9 +618,7 @@ mod tests {
         assert!(rendered.contains(
             "fsync_file_us=11 + fsync_dir_us=13 + barrier_fs_us=31 + sqlite_lock_wait_us=19 + sqlite_txn_us=17 = cumulative_phase_us=91"
         ));
-        assert!(rendered.contains(
-            "per-checkin mix = unavailable; requires operation-scoped tracing; never derive it from lifetime totals"
-        ));
+        assert!(!rendered.contains("per-checkin mix = serial p50"));
         // #324: the split is rendered beside the sum, and the sum is still
         // there -- a reader must be able to check 20+3=23 and 15+4=19 by eye.
         assert!(rendered.contains(
@@ -581,6 +668,7 @@ mod tests {
     fn only_meta(meta: MetaStats) -> BenchReport {
         BenchReport {
             serial: None,
+            serial_mix: None,
             private: None,
             shared: None,
             read_fanout: None,

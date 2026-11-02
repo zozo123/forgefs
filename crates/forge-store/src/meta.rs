@@ -740,6 +740,36 @@ impl MetaStats {
     pub fn sqlite_accounted_us(&self) -> u64 {
         self.lock_wait_us.saturating_add(self.txn_us)
     }
+
+    /// Per-field saturating difference between two process-lifetime snapshots.
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            txn_us: self.txn_us.saturating_sub(earlier.txn_us),
+            txn_count: self.txn_count.saturating_sub(earlier.txn_count),
+            explicit_txn_count: self
+                .explicit_txn_count
+                .saturating_sub(earlier.explicit_txn_count),
+            lock_wait_us: self.lock_wait_us.saturating_sub(earlier.lock_wait_us),
+            lock_acquires: self.lock_acquires.saturating_sub(earlier.lock_acquires),
+            write_lock_acquires: self
+                .write_lock_acquires
+                .saturating_sub(earlier.write_lock_acquires),
+            write_lock_wait_us: self
+                .write_lock_wait_us
+                .saturating_sub(earlier.write_lock_wait_us),
+            read_lock_acquires: self
+                .read_lock_acquires
+                .saturating_sub(earlier.read_lock_acquires),
+            read_lock_wait_us: self
+                .read_lock_wait_us
+                .saturating_sub(earlier.read_lock_wait_us),
+            busy: self.busy.saturating_sub(earlier.busy),
+            cas_updated: self.cas_updated.saturating_sub(earlier.cas_updated),
+            cas_forked: self.cas_forked.saturating_sub(earlier.cas_forked),
+            cas_denied: self.cas_denied.saturating_sub(earlier.cas_denied),
+            cas_noop: self.cas_noop.saturating_sub(earlier.cas_noop),
+        }
+    }
 }
 
 /// Effective SQLite settings that define the mutable catalog's durability

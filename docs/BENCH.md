@@ -430,24 +430,24 @@ boundary: those totals are cumulative for one process and never a per-checkin
 measurement. It is a counter surface, not a benchmark protocol -- a claim
 about ForgeFS performance still comes from this document, not from that one.
 
-## Per-checkin cost mix: unavailable
+## Per-checkin cost mix (serial phase)
 
-A true checkin mix remains follow-up instrumentation. It requires
-operation-scoped counter snapshots or tracing that begins and ends with the
-same checkin and excludes initialization, other workloads, merge/seal,
-verification, and `fsck`. Hashing, canonical encoding, and SQLite autocommit
-work also remain uninstrumented.
-
-Until that attribution exists, every run reports the per-checkin mix as
-`unavailable`. Do not estimate it by dividing the process-lifetime totals. The
-target future decomposition remains:
+The serial checkin loop snapshots store and SQLite counters immediately before
+and after each `one_private` iteration (grant, session, write, checkin) and
+takes a saturating difference. The reported line is the **median** of those
+per-iteration deltas across the serial samples only; concurrent phases still
+use whole-run lifetime totals above.
 
 ```text
 hash_us + encode_us + fsync_file_us + fsync_dir_us + sqlite_wait_us + sqlite_txn_us ~= checkin_wall_us
 ```
 
-Any unavailable component must be named. Do not redesign the storage or
-concurrency architecture based on an incomplete attribution.
+`hash_us` covers BLAKE3 in the blob publication path; `encode_us` covers
+canonical encoding in [`StorePublishBatch`]. Directory attribution folds
+`fsync_dir_us + barrier_fs_us` into the `fsync_dir_us` term. Do not estimate
+the mix by dividing lifetime totals by a checkin count.
+
+When the serial phase did not run, the mix stays `unavailable`.
 
 ## Raw results
 

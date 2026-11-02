@@ -484,7 +484,7 @@ scope            "process-lifetime"
 note             prose restating scope
 durability       journal_mode, synchronous, fullfsync, read_only
 store            puts, put_bytes, dedup_hits, dedup_bytes, get_bytes,
-                 hash_failures, fsync_file, fsync_file_us,
+                 hash_failures, hash_us, encode_us, fsync_file, fsync_file_us,
                  fsync_dir, fsync_dir_us, barrier_fs, barrier_fs_us,
                  barrier_fs_batches, barrier_us
 cache            object_cache_hits, object_cache_misses,
