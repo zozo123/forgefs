@@ -2,6 +2,10 @@
 
 pub mod blob;
 mod graph;
+/// Deterministic schedule explorer for concurrency primitives (#23). Used by
+/// integration tests and `cfg(test)` unit tests; pure logic with no I/O.
+#[doc(hidden)]
+pub mod interleave;
 pub mod meta;
 mod metrics;
 pub mod objectstore;
