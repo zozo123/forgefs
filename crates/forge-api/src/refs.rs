@@ -105,7 +105,17 @@ impl Forge {
 
     /// Publish a sealed snapshot to a recipient-owned inbox ref.
     /// ForgeFS stores only the durable pointer; scheduling stays above the core.
-    pub fn inbox_push(&self, cap: &Cap, to: &str, snapshot: &str) -> Result<CasResult> {
+    ///
+    /// `task` is the inbox leaf (#71). When omitted, a ULID is minted so older
+    /// callers keep working. When set, the leaf is that task id and a second
+    /// push of the same task forks rather than overwriting (I5).
+    pub fn inbox_push(
+        &self,
+        cap: &Cap,
+        to: &str,
+        snapshot: &str,
+        task: Option<&str>,
+    ) -> Result<CasResult> {
         let recipient = sanitize_agent(to);
         if recipient != to || recipient == "anon" {
             return Err(Error::Invalid(format!("invalid inbox recipient {to:?}")));
@@ -117,7 +127,11 @@ impl Forge {
                 "inbox payload must be a sealed snapshot".into(),
             ));
         }
-        let name = format!("inbox/{recipient}/{}", ulid::Ulid::new());
+        let leaf = match task {
+            Some(task) => forge_store::validate_inbox_task(task)?.to_string(),
+            None => ulid::Ulid::new().to_string(),
+        };
+        let name = format!("inbox/{recipient}/{leaf}");
         self.check(cap, Op::Write, Some(&name))?;
         self.store.meta.cas_ref(
             &name,
@@ -147,6 +161,21 @@ impl Forge {
             }
         }
         Ok(out)
+    }
+
+    /// Read one concrete inbox task for the calling capability's agent (#71).
+    pub fn inbox_get(&self, cap: &Cap, task: &str) -> Result<RefRow> {
+        let task = forge_store::validate_inbox_task(task)?;
+        let agent = cap.agent_id();
+        if sanitize_agent(agent) != agent || agent == "anon" {
+            return Err(Error::Invalid(format!("invalid inbox agent {agent:?}")));
+        }
+        let name = format!("inbox/{agent}/{task}");
+        self.check(cap, Op::Read, Some(&name))?;
+        self.store
+            .meta
+            .get_ref(&name)?
+            .ok_or_else(|| Error::NotFound(format!("ref {name}")))
     }
 
     /// One verified ContributionReceipt (#71, I25).

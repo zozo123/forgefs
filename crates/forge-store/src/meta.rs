@@ -1567,7 +1567,7 @@ pub fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
         if parts.next().is_some()
             || agent.is_empty()
             || sanitize_agent(agent) != agent
-            || ulid::Ulid::from_string(id).is_err()
+            || validate_inbox_task(id).is_err()
         {
             return Err(Error::Invalid(format!("invalid inbox ref {name:?}")));
         }
@@ -4804,6 +4804,21 @@ pub fn sanitize_agent(s: &str) -> String {
     } else {
         t
     }
+}
+
+/// Inbox leaf: a caller-chosen task id, or a ULID mint when the caller omits one.
+///
+/// Same character class as [`sanitize_agent`], length-capped, and never `anon`
+/// (that token is reserved for unsigned work, not handoff identity). #71 puts
+/// the task id in the ref leaf so VERSION 1 needs no Contribution header key.
+pub fn validate_inbox_task(task: &str) -> Result<&str> {
+    if task.is_empty() || task.len() > 64 {
+        return Err(Error::Invalid(format!("invalid inbox task {task:?}")));
+    }
+    if sanitize_agent(task) != task || task == "anon" {
+        return Err(Error::Invalid(format!("invalid inbox task {task:?}")));
+    }
+    Ok(task)
 }
 
 #[cfg(test)]
