@@ -109,7 +109,8 @@ Before quoting them:
   sampled cut points. It does not model drive caches, sector tearing or filesystem bugs; see the
   [recovery contract](docs/RECOVERY.md).
 
-The [complete limits][limits] also document: no W6 results (do not infer tree scaling from the
+The [complete limits][limits] also document: no published W6 numbers yet (harness:
+`forge bench --tree-entries N`; do not infer tree scaling from the
 32-agent numbers); death by signal (SIGBUS on a full disk) carries no exit code; the gate scripts'
 undeclared-command backstop needs bash ≥ 4; staged-directory listing gaps; checkin/abandon
 inconsistencies; daemon coverage; and upgrade edge cases.

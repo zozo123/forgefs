@@ -1303,8 +1303,9 @@ because they are no longer true**, and the ones that changed shape say what is l
 - **The undeclared-command backstop in the gate scripts needs bash ≥ 4.** On macOS's bash 3.2.57 it
   is absent — measured, and detailed under [the gates](#the-gates-need-nothing-but-bash-coreutils-sed-and-awk).
   The declared-list check works everywhere.
-- **No published W6.** Large tree walk/update (10k/100k/1M entries) has no results. Do not infer
-  tree scaling from the 32-agent numbers above.
+- **No published W6 numbers yet.** The executable harness is
+  `forge bench --tree-entries N` / `scripts/w6-tree-bench.sh`; do not infer tree
+  scaling from W1/W2.
 - **Crash evidence is process-level, not power-loss.** A deterministic fault-injection matrix covers
   every durability transition, and real `SIGKILL` tests exist (`cli_sigkill.rs`). Neither is a
   power-loss claim; that half rests on `synchronous=FULL` staying FULL plus the device honouring

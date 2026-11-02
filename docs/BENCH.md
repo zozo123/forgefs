@@ -11,13 +11,56 @@ Performance claims must name a workload ID, hardware, durability policy, harness
 | W3 | Stale observation | two agents | checkin returns `StaleObservation`; destination ref does not advance | `e2e_stale_read_is_not_a_silent_success` |
 | W4 | Same-path overlap | two agents | merge returns `MergeConflict`; conflict object preserves both immutable inputs | CLI/API merge-conflict e2e tests |
 | W5 | Crash and reopen | one declared publish/checkpoint phase | after reopen, every committed ref resolves and `fsck --full` succeeds; otherwise the harness must exit non-zero with corruption | bootstrap/durability crash tests; real SIGKILL remains #147 |
-| W6 | Large tree walk/update | entries: 10k, 100k, 1M | output tree is byte-for-byte identical; report lookup/update scaling | dedicated tree benchmark; do not infer W6 from W1/W2 |
+| W6 | Large tree walk/update | entries: 10k, 100k, 1M | output tree is byte-for-byte identical; report lookup/update scaling | `forge bench --tree-entries N` / `run_tree_bench` / `scripts/w6-tree-bench.sh` |
 | W7 | Git worktree comparison | W1 only | identical logical edit/checkin count and demonstrated durability-equivalence; otherwise mark `non-comparable` | `scripts/w7-git-comparator.sh` (#24) |
 | W8 | Read fanout: N readers re-reading a fixed path set through their own sessions | readers x reads | every read returns the seeded payload; catalog traffic lands mostly on the read pool | `forge bench --readers` / `read_fanout_bounded` |
 
-`forge bench` covers W1, W2 and (with `--readers`) W8. W3-W5 are correctness/crash harnesses, not throughput substitutes. W6 is a scaling study. W7 is the external comparator; run it with
+`forge bench` covers W1, W2 and (with `--readers`) W8. W3-W5 are correctness/crash harnesses, not throughput substitutes. W6 is a scaling study driven by `--tree-entries` (when non-zero, W1/W2/W8 are skipped). W7 is the external comparator; run it with
 `scripts/w7-git-comparator.sh` and read its verdict before quoting any
 ForgeFS/Git number.
+
+### v1 comparator and workload scope (#24)
+
+- **W7 Git** remains the shipped cross-system comparator for agent-shaped edit/checkin
+  workloads (`scripts/w7-git-comparator.sh`).
+- **Turso AgentFS** and **plain overlayfs COW** comparators are **deferred for v1**:
+  AgentFS depends on an external product and deployment model this repository does
+  not ship; overlayfs benchmarking requires privileged mounts and a host kernel
+  configuration outside ForgeFS's portable contract.
+- Remaining benchmark-table rows for **tiny-files**, **large-binary**, and
+  **mixed-trace** shapes stay **future workloads**, not v1 blockers. They do not
+  excuse inferring W6 from W1/W2.
+
+## W6 large-tree walk/update
+
+The harness is checked in as `forge bench --tree-entries N` (API:
+`forge_api::run_tree_bench`) and a thin wrapper `scripts/w6-tree-bench.sh`.
+
+Canonical command shape:
+
+```bash
+cargo run --release --locked -p forge-cli -- bench --tree-entries 10000
+# or
+cargo build --release --locked -p forge-cli
+scripts/w6-tree-bench.sh 10000
+```
+
+Each run:
+
+1. seeds `main` with `N` small files under a two-level directory layout
+   (`/dXXXX/fYYYY.txt`, 1000 files per directory so trees stay under
+   `MAX_TREE_ENTRIES` up to 1M entries);
+2. times a full **lookup** pass (one `read` per entry);
+3. times a full **update** pass (one `write` per entry) followed by one checkin;
+4. verifies every payload, exports the committed tree to tar, records the export
+   BLAKE3 (deterministic across fresh repositories at the same `N`), and runs
+   `fsck --full`.
+
+Report **lookup** and **update** throughput and p50/p95/p99/max separately. Do
+not infer W6 from W1/W2 private checkins or read fanout.
+
+CI runs the same harness at smaller `N` (for example 1000) via
+`crates/forge-api/tests/w6_tree_bench.rs`.
 
 ## Fixed W1/W2 operation shape
 
