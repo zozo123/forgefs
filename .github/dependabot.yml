@@ -4,10 +4,31 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    groups:
+      cargo-patch:
+        update-types:
+          - patch
+      cargo-minor:
+        update-types:
+          - minor
+    # Majors stay one crate at a time (#98); Dependabot opens them ungrouped.
+    ignore: []
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"

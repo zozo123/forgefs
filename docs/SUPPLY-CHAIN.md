@@ -166,18 +166,31 @@ so no `date(1)` dialect is involved), members are listed in a fixed order with
 ## Dependency policy
 
 Enforced by the `supply-chain` job, on which `assemble`, `attest` and
-`publish` all depend:
+`publish` all depend, and by `security.yml` on every pull request, every push
+to `main`, and a weekly schedule:
 
-- `cargo audit --deny warnings` against the committed lockfile (RustSec), also
-  scheduled weekly in `security.yml`;
+- `cargo audit --deny warnings` against the committed lockfile (RustSec);
 - `cargo deny --locked check advisories bans licenses sources` against
   `deny.toml`: `yanked = "deny"` with an empty ignore list, a licence
   allow-list with no exceptions, and `unknown-registry`/`unknown-git` denied
   with an empty `allow-git`;
-- `git diff --exit-code -- Cargo.lock`, so nothing in the release path may
-  silently move the resolved graph;
+- `git diff --exit-code -- Cargo.lock` plus `cargo metadata --locked`, so
+  nothing in the release or PR path may silently move the resolved graph;
 - every release/security tool installed by exact version with `--locked`:
   `cargo-audit 0.22.2`, `cargo-deny 0.20.2`, `cargo-cyclonedx 0.5.9`.
 
+Dependabot watches `cargo` and `github-actions` weekly. Patch and minor cargo
+updates group into two PRs; majors stay one crate at a time (issue #98).
+Actions bumps group into one PR so SHA pins can be reviewed together with
+`.github/scripts/check-workflow-security.py`.
+
 Note the two deliberate non-gates, which carry their justification in
 `deny.toml`: `[bans] wildcards` and `multiple-versions` are warnings.
+
+## Live ruleset apply (owner)
+
+The reviewed source of truth is `.github/rulesets/protect-main.json`. CI
+checks that file against `ci.yml`, `check-ci-admission.py`, and
+`CODEOWNERS`. Applying it to the live repository is an administrator action
+and is tracked by issue #431. Until that lands, the machine-checked PR
+contract can still be bypassed at the repository-settings layer.
