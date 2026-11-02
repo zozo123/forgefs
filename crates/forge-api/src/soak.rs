@@ -324,7 +324,7 @@ pub fn run_bench_with_workers(
     let forge = Arc::new(Forge::init(dir)?);
     let root = forge.root_cap()?;
     let integ = forge.integrator_cap()?;
-    let serial = serial_checkins(&forge, &root, 8.min(agents))?;
+    let (serial, serial_mix) = serial_checkins(&forge, &root, 8.min(agents))?;
     let private = private_checkins_bounded(forge.clone(), &root, agents, workers)?;
     let shared_result = shared_stampede_bounded(forge.clone(), &root, shared, workers)?;
     validate_bounded_outcomes(agents, private.2, shared, shared_result.2, shared_result.3)?;
@@ -343,6 +343,7 @@ pub fn run_bench_with_workers(
     let store = forge.store.stats();
     Ok(BenchReport {
         serial: Some(serial),
+        serial_mix: Some(serial_mix),
         private: Some(private),
         shared: Some(shared_result),
         read_fanout: (readers > 0 && reads > 0).then_some(read_fanout),

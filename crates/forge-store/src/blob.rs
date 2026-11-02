@@ -363,9 +363,39 @@ pub struct BlobStoreStats {
     /// Every one is a refused read (I1, I3, I15); the counter exists so a
     /// corrupt store is visible as a rate and not only as one error string.
     pub hash_failures: u64,
+    /// Cumulative BLAKE3 time in the blob publication path (`hash_parts` and
+    /// rehash-at-trust-boundary reads). Not a per-checkin measurement until
+    /// differenced by a scoped snapshot.
+    pub hash_us: u64,
+    /// Cumulative canonical encode time recorded by [`crate::StorePublishBatch`].
+    /// Merged from the enclosing `Store` at snapshot time.
+    pub encode_us: u64,
 }
 
 impl BlobStoreStats {
+    /// Per-field saturating difference between two process-lifetime snapshots.
+    /// Intended for operation-scoped bench attribution, not lifetime totals.
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            puts: self.puts.saturating_sub(earlier.puts),
+            dedup_hits: self.dedup_hits.saturating_sub(earlier.dedup_hits),
+            fsync_file: self.fsync_file.saturating_sub(earlier.fsync_file),
+            fsync_file_us: self.fsync_file_us.saturating_sub(earlier.fsync_file_us),
+            fsync_dir: self.fsync_dir.saturating_sub(earlier.fsync_dir),
+            fsync_dir_us: self.fsync_dir_us.saturating_sub(earlier.fsync_dir_us),
+            barrier_fs: self.barrier_fs.saturating_sub(earlier.barrier_fs),
+            barrier_fs_us: self.barrier_fs_us.saturating_sub(earlier.barrier_fs_us),
+            barrier_fs_batches: self
+                .barrier_fs_batches
+                .saturating_sub(earlier.barrier_fs_batches),
+            put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
+            dedup_bytes: self.dedup_bytes.saturating_sub(earlier.dedup_bytes),
+            get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
+            hash_failures: self.hash_failures.saturating_sub(earlier.hash_failures),
+            hash_us: self.hash_us.saturating_sub(earlier.hash_us),
+            encode_us: self.encode_us.saturating_sub(earlier.encode_us),
+        }
+    }
     /// Saturating sum over this process-lifetime snapshot. It is not a
     /// per-publication or per-checkin measurement.
     pub fn barrier_us(&self) -> u64 {
@@ -394,6 +424,7 @@ struct BlobStoreCounters {
     fsync_dir: TimingCounter,
     barrier_fs: TimingCounter,
     barrier_fs_batches: AtomicU64,
+    hash: TimingCounter,
 }
 
 #[derive(Clone, Debug)]
@@ -623,7 +654,7 @@ impl LocalBlobStore {
     fn verify_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
         require_regular_file(path, id)?;
         let mut file = fs::File::open(path)?;
-        verify_object_stream(id, &mut file)
+        verify_object_stream(id, &mut file, &self.stats)
     }
 
     fn verify_and_sync_existing(&self, id: ObjectId, path: &Path) -> Result<()> {
@@ -633,7 +664,7 @@ impl LocalBlobStore {
         // Opening writable is intentional: macOS F_FULLFSYNC is a fail-closed
         // durability contract, not a best-effort read hint.
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        verify_object_stream(id, &mut file)?;
+        verify_object_stream(id, &mut file, &self.stats)?;
         sync_file_counted(
             &file,
             &self.stats,
@@ -735,8 +766,27 @@ impl LocalBlobStore {
             dedup_bytes: self.stats.dedup_bytes.load(Ordering::Relaxed),
             get_bytes: self.stats.get_bytes.load(Ordering::Relaxed),
             hash_failures: self.stats.hash_failures.load(Ordering::Relaxed),
+            hash_us: self.stats.hash.snapshot().total_us,
+            encode_us: 0,
         }
     }
+}
+
+fn hash_parts_timed(stats: &BlobStoreCounters, parts: &[&[u8]]) -> ObjectId {
+    let t0 = Instant::now();
+    let id = hash_parts(parts);
+    stats.hash.observe(t0.elapsed());
+    id
+}
+
+fn hash_reader_timed(
+    stats: &BlobStoreCounters,
+    reader: &mut impl Read,
+) -> std::io::Result<ObjectId> {
+    let t0 = Instant::now();
+    let id = hash_reader(reader)?;
+    stats.hash.observe(t0.elapsed());
+    Ok(id)
 }
 
 impl PublishBatch<'_> {
@@ -807,7 +857,7 @@ impl PublishBatch<'_> {
             ));
         }
         let payload_bytes: u64 = parts.iter().map(|p| p.len() as u64).sum();
-        let id = hash_parts(parts);
+        let id = hash_parts_timed(&self.store.stats, parts);
         let dest = self.store.object_path(id);
         let (a, b) = id.shard_dirs();
         let objects = self.store.root.join("objects");
@@ -1051,7 +1101,11 @@ impl crate::ObjectStore for LocalBlobStore {
 
 impl<O: crate::ObjectStore> crate::Store<O> {
     pub fn stats(&self) -> BlobStoreStats {
-        crate::ObjectStore::stats(&self.blobs)
+        let mut stats = crate::ObjectStore::stats(&self.blobs);
+        stats.encode_us = stats
+            .encode_us
+            .saturating_add(self.encode_us.load(Ordering::Relaxed));
+        stats
     }
 }
 
@@ -1118,8 +1172,12 @@ fn verify_blob_frame(reader: &mut impl Read, object_len: u64) -> Result<(Vec<u8>
 /// The caller owns descriptor choice: the durability path passes the exact
 /// descriptor it will subsequently force, so verified bytes and synced bytes
 /// cannot diverge through a pathname reopen.
-fn verify_object_stream(id: ObjectId, reader: &mut impl Read) -> Result<()> {
-    let actual = hash_reader(reader)?;
+fn verify_object_stream(
+    id: ObjectId,
+    reader: &mut impl Read,
+    stats: &BlobStoreCounters,
+) -> Result<()> {
+    let actual = hash_reader_timed(stats, reader)?;
     if actual != id {
         return Err(Error::Corrupt(format!(
             "existing object does not match its id: {id}"
@@ -1373,15 +1431,17 @@ mod tests {
         // A dedup hit republishes nothing and performs no new barrier, so the
         // dedup PAIR is all that may move: the outcome and the bytes it did not
         // have to write. Every put field and every barrier field must be
-        // untouched, which is what the struct update below states.
+        // untouched. Rehash-at-trust-boundary work is counted in `hash_us`.
         assert_eq!(
             after_dedup,
             BlobStoreStats {
                 dedup_hits: after.dedup_hits + 1,
                 dedup_bytes: after.dedup_bytes + b"measured".len() as u64,
+                hash_us: after_dedup.hash_us,
                 ..after
             }
         );
+        assert!(after_dedup.hash_us > after.hash_us);
         assert_eq!(s.get(id).unwrap(), b"measured");
     }
 

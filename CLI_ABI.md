@@ -374,8 +374,8 @@ standing for CLI arguments must be JSON strings; a flag is present or absent, so
 
 Every CLI verb absent from that table -- `import`, `merge`, `resolve`, `branch`,
 `grant`, `gc`, `abandon`, `fsck`, `verify`, `export`, `log`, `show`, `stats`,
-`inbox`, `landmark`, `init` -- is **not served**, and asking for it is an input
-error.
+`inbox`, `handoff`, `landmark`, `init` -- is **not served**, and asking for it is
+an input error.
 Two response details are CLI-only and have no daemon equivalent: the count of
 refs suppressed by authority, which `forge refs` writes to stderr, and the
 human rendering of `stats`.
@@ -444,6 +444,22 @@ resolved <into> <commit> resolutions/<ulid> retired conflicts/<into>/<ulid>
 binding is the catalog `resolutions/<ulid>` ref, not sealed object provenance.
 See `docs/CONFLICTS.md`.
 
+## Handoffs: `forge handoff` and `forge inbox`
+
+`forge handoff send --to <agent> --task <id> --snapshot <spec>` publishes a
+sealed snapshot to `inbox/<agent>/<task>`. A second send of the same task forks
+(exit 0 with a `forked` line); it never overwrites. `forge handoff accept
+<task>` prints the calling agent's `inbox/<me>/<task>` ref.
+
+`forge inbox push` accepts optional `--task` (ULID leaf when omitted).
+`forge inbox get <task>` reads one leaf. `forge inbox list` is unchanged.
+
+| Outcome | Exit |
+|---|---:|
+| pushed / sent / listed / accepted | 0 |
+| invalid recipient or task / missing snapshot / wrong type | 1 |
+| capability cannot write or read the inbox name | 1 |
+
 ## Reclamation: `forge abandon` and `forge gc`
 
 Neither verb introduces an exit code. Both map onto the table above:
@@ -508,7 +524,7 @@ scope            "process-lifetime"
 note             prose restating scope
 durability       journal_mode, synchronous, fullfsync, read_only
 store            puts, put_bytes, dedup_hits, dedup_bytes, get_bytes,
-                 hash_failures, fsync_file, fsync_file_us,
+                 hash_failures, hash_us, encode_us, fsync_file, fsync_file_us,
                  fsync_dir, fsync_dir_us, barrier_fs, barrier_fs_us,
                  barrier_fs_batches, barrier_us
 cache            object_cache_hits, object_cache_misses,

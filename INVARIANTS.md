@@ -56,7 +56,7 @@ not diluted into a mock:
 | Invariants | Production owner | Primary evidence |
 |---|---|---|
 | I1, I2, I10, I17 | `forge-core`, `forge-store/graph.rs`, `forge-store/meta.rs`, `forge-api/import.rs`, `integration.rs`, `repository.rs` | `golden_object_ids.rs`, `adversarial_canonical.rs`, `provenance.rs`, `checkin_contribution.rs`, `contribution_join.rs`, `typed_graph.rs`, `api_contract.rs`, `bootstrap_contract.rs`, `schema_migrations.rs`, `schema_migration_fixtures.rs`, `schema_migration_objects.rs`, `testdata/schema/README.md`, `property_canonical.rs`, `large_blob_memory.rs`, `fanout_input_vs_corruption.rs`, `import_fanout_is_input.rs`, `fuzz/tree_name` |
-| I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `group_commit.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `forge-store/objectstore/conformance.rs`, `docs/RECOVERY.md`, `docs/OBJECTSTORE.md` |
+| I3, I4, I6 | `forge-store`, `repository.rs` | `meta_invariants.rs`, `group_commit.rs`, `session_atomicity.rs`, `barrier_fault_injection.rs`, `cross_process_put.rs`, `cli_sigkill.rs`, `forge-store/tests/interleave_schedules.rs` (deterministic BFS schedule explorer over `BarrierGate`, `ReadPool::acquire`, and group-commit election; issue #23, no Loom), `forge-store/objectstore/conformance.rs`, `docs/RECOVERY.md`, `docs/OBJECTSTORE.md` |
 | I4 under POWER LOSS | `forge-store/blob.rs` (`ensure_path_dir`, `PublishBatch::finish`), `meta.rs` (WAL commit ordering) | `scripts/powerloss/` + `crates/forge-api/examples/powerloss_multibatch.rs`, `docs/DURABILITY.md`. The `kill -9` suite above leaves the PAGE CACHE intact, so it cannot see a ref published over bytes or edges no barrier forced; this replays the interposed write/fsync stream to a cut point, DROPS everything no completed fsync covered, and rechecks every committed ref. Validated by mutation: it fails on a build the SIGKILL suite passes. Blind spots are measured by `pl-interpose-audit.sh`, not assumed. |
 | I5, I7, I8 | `forge-store/meta.rs` (`cas_ref*`, `commit_seal`), `forge-api/workspace.rs`, `refs.rs`, `integration.rs` (`seal`) | `api_contract.rs`, `pinned_rw_session_reads.rs`, `cli_shared_stampede.rs`, `fsck_concurrent_fork.rs`, `multi_mount_shape.rs`, `model_composition.rs`, `cli_seal_head_moves.rs`, `fuzz/ref_name` |
 | I9 | `forge-api/workspace.rs` | `api_contract.rs`, `e2e_concurrent.rs`, `multi_mount_shape.rs`, `model_composition.rs` |
@@ -189,3 +189,11 @@ decoders (`object_decode`), the capability parser (`cap_token`), daemon framing
 and dispatch (`protocol_frame`), the tree-name and ref-name grammars
 (`tree_name`, `ref_name`), and the tar export/import round trip
 (`tar_roundtrip`). CI compiles every target and smokes each for 60 seconds.
+
+Issue #23 asked for Loom-style exhaustive interleaving; rusqlite and
+`parking_lot` make Loom CI-hostile, so `forge-store/src/interleave/` holds pure
+models of the three in-process primitives named there and
+`interleave_schedules.rs` BFS-explores small schedules over them. That is not a
+substitute for the model-based composition harness (operation sequences on real
+SQLite) and not a substitute for process-level proofs under #139; it covers the
+memory-ordering blind spot between them.

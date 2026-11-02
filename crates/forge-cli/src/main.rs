@@ -151,6 +151,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: InboxCmd,
     },
+    /// Agent-to-agent handoffs over inbox refs (#71).
+    Handoff {
+        #[command(subcommand)]
+        cmd: HandoffCmd,
+    },
     Landmark {
         oid: String,
     },
@@ -304,9 +309,29 @@ enum InboxCmd {
         to: String,
         #[arg(long)]
         snapshot: String,
+        /// Stable task leaf under inbox/<to>/<task>. Omit to mint a ULID.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// List inbox refs owned by the calling capability's agent.
     List,
+    /// Show one inbox task owned by the calling capability's agent.
+    Get { task: String },
+}
+
+#[derive(Subcommand)]
+enum HandoffCmd {
+    /// Publish a sealed snapshot to a recipient inbox under a task id (#71).
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// Accept one inbox task for the calling agent (prints the inbox ref).
+    Accept { task: String },
 }
 
 fn main() -> ExitCode {
@@ -598,8 +623,8 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             println!("{}", c.to_token());
         }
         Cmd::Inbox {
-            cmd: InboxCmd::Push { to, snapshot },
-        } => match f.inbox_push(cap, &to, &snapshot)? {
+            cmd: InboxCmd::Push { to, snapshot, task },
+        } => match f.inbox_push(cap, &to, &snapshot, task.as_deref())? {
             CasResult::Updated { name, oid } => println!("pushed {name} {oid}"),
             CasResult::Forked {
                 requested,
@@ -615,6 +640,30 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
             for row in f.inbox_list(cap)? {
                 println!("{} {}", row.name, row.oid);
             }
+        }
+        Cmd::Inbox {
+            cmd: InboxCmd::Get { task },
+        } => {
+            let row = f.inbox_get(cap, &task)?;
+            println!("{} {}", row.name, row.oid);
+        }
+        Cmd::Handoff {
+            cmd: HandoffCmd::Send { to, task, snapshot },
+        } => match f.inbox_push(cap, &to, &snapshot, Some(&task))? {
+            CasResult::Updated { name, oid } => println!("sent {name} {oid}"),
+            CasResult::Forked {
+                requested,
+                fork,
+                ours,
+                theirs,
+            } => println!("forked {requested} -> {fork} ours={ours} theirs={theirs}"),
+            CasResult::Noop { name, oid } => println!("noop {name} {oid}"),
+        },
+        Cmd::Handoff {
+            cmd: HandoffCmd::Accept { task },
+        } => {
+            let row = f.inbox_get(cap, &task)?;
+            println!("accepted {} {}", row.name, row.oid);
         }
         Cmd::Abandon {
             cmd: AbandonCmd::Fork { r#ref },

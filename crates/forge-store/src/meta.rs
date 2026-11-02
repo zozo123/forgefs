@@ -751,6 +751,36 @@ impl MetaStats {
     pub fn sqlite_accounted_us(&self) -> u64 {
         self.lock_wait_us.saturating_add(self.txn_us)
     }
+
+    /// Per-field saturating difference between two process-lifetime snapshots.
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            txn_us: self.txn_us.saturating_sub(earlier.txn_us),
+            txn_count: self.txn_count.saturating_sub(earlier.txn_count),
+            explicit_txn_count: self
+                .explicit_txn_count
+                .saturating_sub(earlier.explicit_txn_count),
+            lock_wait_us: self.lock_wait_us.saturating_sub(earlier.lock_wait_us),
+            lock_acquires: self.lock_acquires.saturating_sub(earlier.lock_acquires),
+            write_lock_acquires: self
+                .write_lock_acquires
+                .saturating_sub(earlier.write_lock_acquires),
+            write_lock_wait_us: self
+                .write_lock_wait_us
+                .saturating_sub(earlier.write_lock_wait_us),
+            read_lock_acquires: self
+                .read_lock_acquires
+                .saturating_sub(earlier.read_lock_acquires),
+            read_lock_wait_us: self
+                .read_lock_wait_us
+                .saturating_sub(earlier.read_lock_wait_us),
+            busy: self.busy.saturating_sub(earlier.busy),
+            cas_updated: self.cas_updated.saturating_sub(earlier.cas_updated),
+            cas_forked: self.cas_forked.saturating_sub(earlier.cas_forked),
+            cas_denied: self.cas_denied.saturating_sub(earlier.cas_denied),
+            cas_noop: self.cas_noop.saturating_sub(earlier.cas_noop),
+        }
+    }
 }
 
 /// Effective SQLite settings that define the mutable catalog's durability
@@ -1578,7 +1608,7 @@ pub fn validate_ref_kind(name: &str, kind: &str) -> Result<()> {
         if parts.next().is_some()
             || agent.is_empty()
             || sanitize_agent(agent) != agent
-            || ulid::Ulid::from_string(id).is_err()
+            || validate_inbox_task(id).is_err()
         {
             return Err(Error::Invalid(format!("invalid inbox ref {name:?}")));
         }
@@ -5060,6 +5090,21 @@ pub fn sanitize_agent(s: &str) -> String {
     } else {
         t
     }
+}
+
+/// Inbox leaf: a caller-chosen task id, or a ULID mint when the caller omits one.
+///
+/// Same character class as [`sanitize_agent`], length-capped, and never `anon`
+/// (that token is reserved for unsigned work, not handoff identity). #71 puts
+/// the task id in the ref leaf so VERSION 1 needs no Contribution header key.
+pub fn validate_inbox_task(task: &str) -> Result<&str> {
+    if task.is_empty() || task.len() > 64 {
+        return Err(Error::Invalid(format!("invalid inbox task {task:?}")));
+    }
+    if sanitize_agent(task) != task || task == "anon" {
+        return Err(Error::Invalid(format!("invalid inbox task {task:?}")));
+    }
+    Ok(task)
 }
 
 #[cfg(test)]
