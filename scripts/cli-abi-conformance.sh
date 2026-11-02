@@ -43,7 +43,7 @@
 #   1  denied/capability/input/not-found
 #   2  corruption or sealed-state violation
 #   3  transient busy/contention
-#   4  stale observation or merge conflict
+#   4  stale observation, merge conflict, or resolve against a moved head
 #   5  I/O, SQLite, or internal failure
 #
 # Rows whose contract value ForgeFS does not yet honour live in the
@@ -504,6 +504,22 @@ declare_unexercised abi/3-busy 3 \
 # --- exit 4: stale observation or merge conflict --------------------------
 check abi/4-merge-conflict blocking 4 "" -- \
 	--dir "$B" --cap "$B_INT" merge --into=main --from "heads/agents/anon/$B_B"
+# The conflict published above is the input to resolve (#15). Find it by the
+# typed conflicts/main/* ref rather than by scraping stderr wording.
+B_CONFLICT_OID="$(
+	capture --dir "$B" --cap "$B_ROOT" refs |
+		awk '/conflicts\/main\// { print $NF; exit }'
+)"
+[ "${#B_CONFLICT_OID}" -eq 64 ] || die "expected a conflicts/main/* oid after merge conflict"
+check abi/1-resolve-foreign-into blocking 1 \
+	"a conflict published under conflicts/main/ cannot resolve heads/agents/anon/$B_A" -- \
+	--dir "$B" --cap "$B_INT" resolve --conflict "$B_CONFLICT_OID" --into "heads/agents/anon/$B_A" --ours
+check abi/0-resolve-ours blocking 0 \
+	"resolve --ours advances main, publishes resolutions/<ulid>, retires the conflict ref" -- \
+	--dir "$B" --cap "$B_INT" resolve --conflict "$B_CONFLICT_OID" --into=main --ours
+check abi/1-resolve-already-retired blocking 1 \
+	"a conflict ref retired by resolve cannot be resolved again" -- \
+	--dir "$B" --cap "$B_INT" resolve --conflict "$B_CONFLICT_OID" --into=main --ours
 check abi/4-stale-observation blocking 4 "" -- \
 	--dir "$C" --cap "$C_BOB" checkin --ns "$C_BOBNS" -m 'stale notes'
 # I24: --expect-oid is an assumption about the source, and a wrong one is the

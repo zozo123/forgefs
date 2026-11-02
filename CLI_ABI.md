@@ -8,7 +8,7 @@ Automation must key on exit codes, not stderr wording.
 | 1 | denied/capability/input/not-found |
 | 2 | corruption or sealed-state violation |
 | 3 | transient busy/contention |
-| 4 | stale observation or merge conflict |
+| 4 | stale observation, merge conflict, or resolve against a moved head |
 | 5 | I/O, SQLite, or internal failure |
 
 `--cap PATH|TOKEN` or `FORGE_CAP` is required for normal commands; ForgeFS has no ambient root authority.
@@ -372,9 +372,10 @@ Fields standing for CLI flags (`rw`, `attest`) must be JSON booleans and fields
 standing for CLI arguments must be JSON strings; a flag is present or absent, so
 `"rw": "true"` is an input error rather than `false`.
 
-Every CLI verb absent from that table -- `import`, `merge`, `branch`, `grant`,
-`gc`, `abandon`, `fsck`, `verify`, `export`, `log`, `show`, `stats`, `inbox`,
-`landmark`, `init` -- is **not served**, and asking for it is an input error.
+Every CLI verb absent from that table -- `import`, `merge`, `resolve`, `branch`,
+`grant`, `gc`, `abandon`, `fsck`, `verify`, `export`, `log`, `show`, `stats`,
+`inbox`, `landmark`, `init` -- is **not served**, and asking for it is an input
+error.
 Two response details are CLI-only and have no daemon equivalent: the count of
 refs suppressed by authority, which `forge refs` writes to stderr, and the
 human rendering of `stats`.
@@ -419,6 +420,29 @@ cell ownership (`Forge::open_for_serve`); a daemon and a direct CLI client never
 share a repository, and `serve` refuses with `busy` (exit 3) if one is already
 there. Transport limits -- frame size, worker pool, admission and read deadlines
 -- are in `crates/forge-api/src/serve.rs` and are not part of this contract.
+
+## Conflict resolution: `forge resolve`
+
+`forge resolve --conflict <oid> --into <ref> (--ours | --theirs | --tree <oid>)`
+consumes a published Conflict. Exactly one choice flag is required. Success
+prints one line:
+
+```
+resolved <into> <commit> resolutions/<ulid> retired conflicts/<into>/<ulid>
+```
+
+| Outcome | Exit |
+|---|---:|
+| resolved; into advanced; resolution ref published; conflict ref retired | 0 |
+| conflict oid missing / not a Conflict / not under `conflicts/<into>/` / into not in causal | 1 |
+| `--tree` not a Tree / escapes conflict path scope / multi-base policy refusal | 1 |
+| capability cannot merge/write `--into` | 1 |
+| `--into` moved since the conflict (expected causal tip lost) | 4 |
+| sealed / corrupt object graph | 2 |
+
+`forge merge --resolved` remains exit 1 (`RAW_MERGE_RESOLUTION_DISABLED`). The
+binding is the catalog `resolutions/<ulid>` ref, not sealed object provenance.
+See `docs/CONFLICTS.md`.
 
 ## Reclamation: `forge abandon` and `forge gc`
 

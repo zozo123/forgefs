@@ -16,8 +16,8 @@ pub use graph::{
 pub use meta::{
     sanitize_agent, validate_ref_kind, validate_ref_name, AbandonedSession, CatalogAudit,
     CatalogObjectExpectation, CheckpointResult, DurabilityPolicy, GcCatalogRoots, GcSweepTxn,
-    LedgerStanding, Meta, MetaStats, MountRow, NsRow, Observed, OverlayRow, RetiredRef,
-    ABANDONABLE_PREFIX, CURRENT_SCHEMA_VERSION, REFLOG_ABANDON,
+    LedgerStanding, Meta, MetaStats, MountRow, NsRow, Observed, OverlayRow, PublishedResolution,
+    RetiredRef, ABANDONABLE_PREFIX, CURRENT_SCHEMA_VERSION, REFLOG_ABANDON,
 };
 pub use objectstore::{DurabilityClass, ObjectBatch, ObjectStore};
 

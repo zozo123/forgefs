@@ -4,10 +4,12 @@ Owns the conflict lifecycle contract and the decisions on issues #15 and #16.
 `INVARIANTS.md` owns I11 and I12 themselves; this document owns what is built on
 top of them, what is deliberately absent, and what it would cost to add.
 
-Status: **detection is complete; resolution does not exist.** That is not a
-partial implementation. Resolution is refused at the API boundary on purpose,
-and the reason it has not been built is recorded in section 4: a durable
-conflict-to-resolution binding is a repository VERSION 2 change.
+Status: **detection is complete; PR1 local resolution ships; sealed
+object-plane binding still needs FORMAT VERSION 2.** `forge resolve` advances
+`--into`, publishes `resolutions/<conflict-ulid>`, and retires the conflict
+ref. `merge --resolved` stays refused. A durable conflict OID inside Commit or
+Contribution provenance remains a VERSION 2 change (section 4); #361 closed
+that bump as not planned for v1.
 
 ## 1. What exists today
 
@@ -50,7 +52,7 @@ its own decoder would call `Corrupt` (#355).
 So most of what #15 asks for on the detection side is already true. What follows
 is the rest.
 
-## 2. Gap A: there is no resolution path at all
+## 2. Gap A: raw `--resolved` stays refused; `forge resolve` is the verb
 
 `Forge::merge` takes a `resolved: Option<ObjectId>` argument and rejects every
 value of it:
@@ -68,31 +70,25 @@ if resolved.is_some() {
 compatibility only.
 
 Observed: `--resolved` is refused for a tree OID **and** for the conflict OID
-itself, both exit 1. `forge --help` has no `resolve`, `accept`, `--ours` or
-`--theirs` anywhere. There is no verb that consumes a `Conflict`.
+itself, both exit 1. That fail-closed posture stays: a raw tree on `merge` is
+still not a resolution.
 
-This is the correct fail-closed posture -- #15 asks that a conflict never be
-resolvable by an unrelated tree, and refusing every tree satisfies that
-literally -- but it means the conflict half of the system has no exit.
+`forge resolve --conflict <oid> --into <ref> (--ours | --theirs | --tree <oid>)`
+is the consuming verb. It checks that `<oid>` is a published Conflict under
+`conflicts/<into>/`, that `--into` still holds one of the conflict's causal
+commits, and that a `--tree` differs from the auto-merge only on paths the
+conflict names. It publishes a merge commit whose parents are the causal tips,
+writes `resolutions/<conflict-ulid>` at that commit, and retires the conflict
+ref in the same transaction. A moved head is exit 4 (`StaleObservation`), never
+a fork. Tests live in `crates/forge-api/tests/resolve_conflict.rs`.
 
-What agents do instead: mount the ref, write the merged bytes by hand, check in,
-and have an integrator merge that branch. Observed working, exit 0. Nothing in
-the resulting commit, contribution, or reflog names the conflict it settled.
-That is precisely the auditability hole #15 was opened to close, and it is open
-today in the "silently fine" direction rather than the "denied" direction.
+### Gap A2: conflict refs are retired by resolve
 
-### Gap A2: a conflict ref is a permanent GC root
-
-`conflicts/<into>/<ULID>` is an ordinary ref, so `gc` counts it among its roots
-(`gc --dry-run` reports it under `roots: N refs`), and `crates/forge-api/src/gc.rs`
-has no special case for kind `conflict`. `forge abandon` has exactly two
-subcommands, `fork` and `session`; neither accepts a conflict ref.
-
-So every conflict a repository ever produced pins its `ours`, `theirs` and
-`base` trees forever, and no verb can retire it. For a swarm that conflicts
-routinely this is unbounded retention, and it is a direct consequence of Gap A:
-`abandon fork` exists because I18 required a way to retire a fork once resolved,
-and conflicts never got the equivalent because resolution never shipped.
+`conflicts/<into>/<ULID>` remains a GC root while the conflict is open.
+`forge resolve` retires it (same reflog abandon shape as `abandon fork`, but
+only for `conflicts/` names and only as part of a successful resolve).
+`forge abandon` still takes only `fork` and `session`; conflict retirement is
+not a free-standing abandon verb.
 
 ## 3. Gap B: `ConflictPath` cannot say what differs
 
@@ -181,30 +177,19 @@ once the gate is open, and so does the `File` object type.
 That is the decision this document records. It was not visible from either issue
 alone.
 
-## 5. Proposed shape, if it is built
+## 5. Shipped shape (PR1) and the VERSION 2 remainder
 
-Recommended split, smallest first:
+**PR 1 (shipped, no format change).** See section 2. The scope check is what
+makes "resolve" different from "merge with a tree I made up", and it is
+checkable in v1 because it compares trees, not provenance. The
+`resolutions/<ulid>` ref is catalog state: it is not sealed provenance and does
+not survive `verify` of a sealed snapshot on another host.
 
-**PR 1 (no format change).** `forge resolve --conflict <oid> --into <ref>
-(--ours | --theirs | --tree <oid>)`. Validates that `<oid>` decodes as a
-`Conflict`, that `--into` currently holds one of the conflict's `causal`
-commits, and that a `--tree` argument is a Tree whose differences from the merge
-result lie only on paths the conflict names. Publishes a merge commit with both
-causal commits as parents, plus a typed ref `resolutions/<conflict-ulid>`.
-Retires the conflict ref, which also closes Gap A2. Exit 1 if the conflict does
-not belong to this ref; exit 4 if the head moved.
-
-The scope check is the whole point: it is what makes "resolve" different from
-"merge with a tree I made up", and it is checkable in v1 because it compares
-trees, not provenance.
-
-**PR 2 (VERSION 2, only alongside #11).** Move the binding into the object
-plane, add `kind`/`exec` to `ConflictPath`, and extend the seal manifest walk so
-`verify` proves the resolution named its conflict.
-
-Tests should follow #15's own list; note that its test 5 (identical inputs
-produce identical bytes) requires the resolution record to exclude wall-clock
-fields, or the test cannot pass -- `Commit.ts` and `Contribution.ts` are both
+**PR 2 (VERSION 2, not planned for v1 with #361).** Move the binding into the
+object plane, add `kind`/`exec` to `ConflictPath`, and extend the seal manifest
+walk so `verify` proves the resolution named its conflict. Test 5 from #15
+(identical inputs produce identical bytes) still requires any resolution record
+to exclude wall-clock fields -- `Commit.ts` and `Contribution.ts` are both
 present today.
 
 ## 6. Semantic merge drivers (#16)
@@ -228,9 +213,8 @@ and needs no format change. It is the honest first step for #16.
 
 ## 7. Scale
 
-Not small. PR 1 is roughly a week: a new verb, capability wiring, the scope
-check, conflict-ref retirement, CLI ABI rows, and tests. PR 2 is a repository
+PR 1 shipped as the local catalog binding above. PR 2 remains a repository
 VERSION transition -- the `.forge/VERSION` gate, every decoder, export, mount,
 merge, diff, canonical fixtures, GC reachability, `verify`, and the sealed
-release path, where a v1 binary cannot verify a v2 snapshot at all. That is
-multi-week and should be planned once for #11, #15 and #16 together.
+release path, where a v1 binary cannot verify a v2 snapshot at all. With #361
+closed as not planned for v1, that work stays post-v1.

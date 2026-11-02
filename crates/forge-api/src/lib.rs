@@ -24,6 +24,7 @@ pub use gc::{
     GcReport, GcRootCounts, DEFAULT_MIN_AGE_SECS, GC_COLLECT_MIN_AGE_FLOOR, GC_SAMPLE_LIMIT,
 };
 pub use import::ImportOptions;
+pub use integration::ResolveChoice;
 pub use refs::Receipt;
 pub use repository::find_forge;
 pub use serve::{

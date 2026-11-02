@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
-use forge_api::{ExportOptions, Forge, ImportOptions};
+use clap::{ArgGroup, Parser, Subcommand};
+use forge_api::{ExportOptions, Forge, ImportOptions, ResolveChoice};
 use forge_cap::Cap;
 use forge_types::{CasResult, Error, ObjectId};
 use std::path::{Path, PathBuf};
@@ -122,6 +122,22 @@ enum Cmd {
         /// Reserved for conflict-bound resolution; raw tree OIDs are rejected.
         #[arg(long)]
         resolved: Option<String>,
+    },
+    /// Resolve a published Conflict into a ref (#15). Exactly one of
+    /// --ours, --theirs, or --tree is required. The binding is the local
+    /// catalog ref resolutions/<conflict-ulid>, not a FORMAT change.
+    #[command(group(ArgGroup::new("resolve_choice").required(true)))]
+    Resolve {
+        #[arg(long)]
+        conflict: String,
+        #[arg(long)]
+        into: String,
+        #[arg(long, group = "resolve_choice")]
+        ours: bool,
+        #[arg(long, group = "resolve_choice")]
+        theirs: bool,
+        #[arg(long, group = "resolve_choice")]
+        tree: Option<String>,
     },
     Grant {
         #[arg(long)]
@@ -541,6 +557,34 @@ fn dispatch(f: &Forge, cap: &Cap, cmd: Cmd) -> forge_types::Result<()> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        Cmd::Resolve {
+            conflict,
+            into,
+            ours,
+            theirs,
+            tree,
+        } => {
+            let conflict_oid = ObjectId::from_hex(&conflict)?;
+            let choice = if ours {
+                ResolveChoice::Ours
+            } else if theirs {
+                ResolveChoice::Theirs
+            } else if let Some(tree) = tree.as_deref() {
+                ResolveChoice::Tree(ObjectId::from_hex(tree)?)
+            } else {
+                return Err(Error::Invalid(
+                    "resolve requires exactly one of --ours, --theirs, or --tree".into(),
+                ));
+            };
+            let published = f.resolve(cap, conflict_oid, &into, choice)?;
+            println!(
+                "resolved {} {} {} retired {}",
+                published.into,
+                published.commit,
+                published.resolution_ref,
+                published.retired_conflict
+            );
         }
         Cmd::Grant { ops, r#ref, agent } => {
             let mut extra = vec![format!("ops={ops}")];
