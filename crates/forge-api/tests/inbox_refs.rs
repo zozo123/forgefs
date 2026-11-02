@@ -29,7 +29,7 @@ fn sealed_snapshot_can_be_published_to_recipient_inbox() {
             ],
         )
         .unwrap();
-    let result = forge.inbox_push(&alice, "bob", "tags/v1.0").unwrap();
+    let result = forge.inbox_push(&alice, "bob", "tags/v1.0", None).unwrap();
     let CasResult::Updated { name, oid } = result else {
         panic!("new inbox ref must publish directly");
     };
@@ -58,7 +58,7 @@ fn inbox_write_requires_concrete_prefix_authority() {
             ],
         )
         .unwrap();
-    assert!(forge.inbox_push(&alice, "bob", "tags/v1.0").is_err());
+    assert!(forge.inbox_push(&alice, "bob", "tags/v1.0", None).is_err());
 }
 
 #[test]
@@ -67,7 +67,57 @@ fn invalid_inbox_recipient_fails_closed() {
     let forge = Forge::init(d.path()).unwrap();
     let root = forge.root_cap().unwrap();
     forge.seal(&root, "main", "v1.0").unwrap();
-    assert!(forge.inbox_push(&root, "../bob", "tags/v1.0").is_err());
+    assert!(forge
+        .inbox_push(&root, "../bob", "tags/v1.0", None)
+        .is_err());
+}
+
+#[test]
+fn task_id_leaf_is_stable_and_second_push_forks() {
+    let d = tempdir().unwrap();
+    let forge = Forge::init(d.path()).unwrap();
+    let root = forge.root_cap().unwrap();
+    let snap = forge.seal(&root, "main", "v1.0").unwrap();
+    let alice = forge
+        .grant(
+            &root,
+            vec![
+                "ops=read,write".into(),
+                "agent=alice".into(),
+                "ref=tags/v1.0,inbox/bob/*".into(),
+            ],
+        )
+        .unwrap();
+    let bob = forge
+        .grant(
+            &root,
+            vec![
+                "ops=read".into(),
+                "agent=bob".into(),
+                "ref=inbox/bob/*".into(),
+            ],
+        )
+        .unwrap();
+
+    let first_push = forge
+        .inbox_push(&alice, "bob", "tags/v1.0", Some("parser-hardening"))
+        .unwrap();
+    let CasResult::Updated { name, oid } = first_push else {
+        panic!("first task push must create the leaf");
+    };
+    assert_eq!(name, "inbox/bob/parser-hardening");
+    assert_eq!(oid, snap);
+    assert_eq!(forge.inbox_get(&bob, "parser-hardening").unwrap().oid, snap);
+
+    // expected=ZERO CAS against an existing leaf forks; the task tip stays.
+    let again = forge
+        .inbox_push(&alice, "bob", "tags/v1.0", Some("parser-hardening"))
+        .unwrap();
+    assert!(
+        matches!(again, CasResult::Forked { .. }),
+        "same task must fork, never overwrite: {again:?}"
+    );
+    assert_eq!(forge.inbox_get(&bob, "parser-hardening").unwrap().oid, snap);
 }
 
 #[test]
