@@ -508,7 +508,7 @@ check abi/4-merge-conflict blocking 4 "" -- \
 # typed conflicts/main/* ref rather than by scraping stderr wording.
 B_CONFLICT_OID="$(
 	capture --dir "$B" --cap "$B_ROOT" refs |
-		awk '/conflicts\/main\// { print $NF; exit }'
+		awk '/conflicts\/main\// && !seen++ { oid=$NF } END { print oid }'
 )"
 [ "${#B_CONFLICT_OID}" -eq 64 ] || die "expected a conflicts/main/* oid after merge conflict"
 check abi/1-resolve-foreign-into blocking 1 \
