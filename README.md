@@ -17,6 +17,8 @@ in, `forge export` writes a tar out.
 verbs (e.g. `forge receipt`); the [v0.4.0 tag](https://github.com/zozo123/forgefs/tree/v0.4.0) has
 the released docs. The [full reference][ref] has the detail behind this page.
 
+[Install](#install) · [Try it](#try-it) · [Evidence and cost](#evidence-and-cost) · [Limits](#limits) · [Code and documentation](#code-and-documentation)
+
 ## Install
 
 The current release is **v0.4.0**, for Linux and macOS on x86-64 and ARM64 (`x86_64-` or `aarch64-`
@@ -90,6 +92,9 @@ Before quoting them:
 - The durability barriers differ, so these are protocol-specific throughput observations, not
   equivalent-durability speed ratios. See the [environment and results][cost] and
   [benchmark protocol](docs/BENCH.md).
+- These published runs establish single-host microbenchmark throughput and the conflict/stale-read
+  properties tested in CI; a multi-agent team workload study with full task transcripts, cost, and
+  recovery outcomes is not published yet.
 
 ## Limits
 
